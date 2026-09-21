@@ -147,10 +147,17 @@ object NativeLib {
     // while paused -- for example if a game thread happens to be blocked waiting on
     // a semaphore/mutex/event flag right now -- in which case retrying a moment
     // later (or after stepping a frame) usually succeeds.
-    /** Saves the running app's state to the given numbered slot. Requires the session to be paused. */
-    external fun saveState(slot: Int): Boolean
-    /** Loads a previously saved state from the given numbered slot. Requires the session to be paused. */
-    external fun loadState(slot: Int): Boolean
+    /**
+     * Saves the running app's state to the given numbered slot. Requires the session to be
+     * paused. Returns an empty string on success, or a human-readable failure reason
+     * (e.g. "A thread is currently waiting on a kernel object; try again in a moment").
+     */
+    external fun saveState(slot: Int): String
+    /**
+     * Loads a previously saved state from the given numbered slot. Requires the session to be
+     * paused. Returns an empty string on success, or a human-readable failure reason.
+     */
+    external fun loadState(slot: Int): String
     /** Returns true if a savestate exists for the given numbered slot of the running app. */
     external fun hasSaveState(slot: Int): Boolean
     /** Returns the title of the currently running app session, or an empty string when unavailable. */

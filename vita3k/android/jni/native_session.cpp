@@ -177,36 +177,53 @@ Java_org_vita3k_emulator_NativeLib_submitIme(JNIEnv *, jclass) {
 // large comment at the top of app/src/savestate.cpp for why these functions do
 // not pause the session themselves, and for the "not any guest thread may be
 // mid-syscall" limitation that saveState() below can fail on.
-JNIEXPORT jboolean JNICALL
-Java_org_vita3k_emulator_NativeLib_saveState(JNIEnv *, jclass, jint slot) {
+//
+// Both return an empty string on success, or a human-readable reason on
+// failure (from app::save_state_result_to_string(), plus a couple of cases
+// -- like the emulator/session not being ready -- that never reach that
+// function). Surfacing the *specific* reason in the UI, rather than a single
+// generic "failed" message, is what lets a report from someone without
+// developer tools (no logcat access) actually be diagnosable.
+JNIEXPORT jstring JNICALL
+Java_org_vita3k_emulator_NativeLib_saveState(JNIEnv *env, jclass, jint slot) {
     auto *emuenv = get_emuenv();
     auto *controller = get_app_session_controller();
-    if (!emuenv || !controller || !controller->is_running() || !controller->is_paused())
-        return JNI_FALSE;
+    if (!emuenv)
+        return env->NewStringUTF("No running session (emuenv is null)");
+    if (!controller || !controller->is_running())
+        return env->NewStringUTF("No running session (controller not running)");
+    if (!controller->is_paused())
+        return env->NewStringUTF("Session is not paused");
 
     const auto path = app::get_savestate_path(*emuenv, static_cast<int>(slot));
     const auto result = app::save_state(*emuenv, path);
     if (result != app::SaveStateResult::Success) {
-        LOG_ERROR("saveState(slot={}) failed: {}", slot, app::save_state_result_to_string(result));
-        return JNI_FALSE;
+        const char *msg = app::save_state_result_to_string(result);
+        LOG_ERROR("saveState(slot={}) failed: {}", slot, msg);
+        return env->NewStringUTF(msg);
     }
-    return JNI_TRUE;
+    return env->NewStringUTF("");
 }
 
-JNIEXPORT jboolean JNICALL
-Java_org_vita3k_emulator_NativeLib_loadState(JNIEnv *, jclass, jint slot) {
+JNIEXPORT jstring JNICALL
+Java_org_vita3k_emulator_NativeLib_loadState(JNIEnv *env, jclass, jint slot) {
     auto *emuenv = get_emuenv();
     auto *controller = get_app_session_controller();
-    if (!emuenv || !controller || !controller->is_running() || !controller->is_paused())
-        return JNI_FALSE;
+    if (!emuenv)
+        return env->NewStringUTF("No running session (emuenv is null)");
+    if (!controller || !controller->is_running())
+        return env->NewStringUTF("No running session (controller not running)");
+    if (!controller->is_paused())
+        return env->NewStringUTF("Session is not paused");
 
     const auto path = app::get_savestate_path(*emuenv, static_cast<int>(slot));
     const auto result = app::load_state(*emuenv, path);
     if (result != app::SaveStateResult::Success) {
-        LOG_ERROR("loadState(slot={}) failed: {}", slot, app::save_state_result_to_string(result));
-        return JNI_FALSE;
+        const char *msg = app::save_state_result_to_string(result);
+        LOG_ERROR("loadState(slot={}) failed: {}", slot, msg);
+        return env->NewStringUTF(msg);
     }
-    return JNI_TRUE;
+    return env->NewStringUTF("");
 }
 
 JNIEXPORT jboolean JNICALL

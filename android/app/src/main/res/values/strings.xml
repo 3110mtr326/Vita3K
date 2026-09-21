@@ -208,9 +208,9 @@
     <string name="emulation_save_state">Save State</string>
     <string name="emulation_load_state">Load State</string>
     <string name="emulation_state_saved">State saved to slot %1$d.</string>
-    <string name="emulation_state_save_failed">Couldn\'t save state (try again in a moment).</string>
+    <string name="emulation_state_save_failed">Couldn\'t save state: %1$s</string>
     <string name="emulation_state_loaded">State loaded from slot %1$d.</string>
-    <string name="emulation_state_load_failed">Couldn\'t load state (try again in a moment).</string>
+    <string name="emulation_state_load_failed">Couldn\'t load state: %1$s</string>
     <string name="emulation_custom_config">Custom Config</string>
     <string name="emulation_custom_config_active">This game has a saved custom config.</string>
     <string name="emulation_custom_config_inactive">This game is using global settings.</string>

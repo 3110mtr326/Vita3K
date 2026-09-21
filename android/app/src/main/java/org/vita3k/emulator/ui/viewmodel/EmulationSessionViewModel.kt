@@ -281,12 +281,16 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
         if (!uiState.isPaused) {
             return
         }
-        val success = runCatching { NativeLib.saveState(slot) }.getOrDefault(false)
+        // Empty string means success; anything else is the specific failure reason from the
+        // native side (see NativeLib.saveState's doc comment) -- shown as-is rather than a
+        // single generic message, since the exact reason (paused? busy thread? disk error?)
+        // is otherwise only visible in logcat.
+        val error = runCatching { NativeLib.saveState(slot) }.getOrDefault("saveState() threw an exception")
         showStatusMessage(
-            if (success) {
+            if (error.isEmpty()) {
                 context.getString(R.string.emulation_state_saved, slot + 1)
             } else {
-                context.getString(R.string.emulation_state_save_failed)
+                context.getString(R.string.emulation_state_save_failed, error)
             }
         )
     }
@@ -296,12 +300,12 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
         if (!uiState.isPaused) {
             return
         }
-        val success = runCatching { NativeLib.loadState(slot) }.getOrDefault(false)
+        val error = runCatching { NativeLib.loadState(slot) }.getOrDefault("loadState() threw an exception")
         showStatusMessage(
-            if (success) {
+            if (error.isEmpty()) {
                 context.getString(R.string.emulation_state_loaded, slot + 1)
             } else {
-                context.getString(R.string.emulation_state_load_failed)
+                context.getString(R.string.emulation_state_load_failed, error)
             }
         )
     }
