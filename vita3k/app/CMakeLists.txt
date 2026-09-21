@@ -3,6 +3,7 @@ add_library(
 	STATIC
 	include/app/functions.h
 	include/app/session_controller.h
+	include/app/savestate.h
 	include/app/discord.h
 	include/app/state.h
 	src/app_init.cpp
@@ -10,6 +11,7 @@ add_library(
 	src/apps_list.cpp
 	src/discord.cpp
 	src/session_controller.cpp
+	src/savestate.cpp
 	src/user.cpp
 )
 

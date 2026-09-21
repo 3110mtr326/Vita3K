@@ -568,6 +568,7 @@ private fun SessionTab(
 ) {
     val uiState = sessionViewModel.uiState
     val settingsLoaded = uiState.titleId.isNotBlank() && settingsViewModel.isLoaded(uiState.titleId)
+    val context = LocalContext.current
 
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(
@@ -595,6 +596,37 @@ private fun SessionTab(
                     text = stringResource(R.string.emulation_exit),
                     color = MaterialTheme.colorScheme.error
                 )
+            }
+        }
+
+        // Savestates require the session to already be paused -- see the doc comment on
+        // EmulationSessionViewModel.saveState()/loadState() for why, and why either call
+        // can still occasionally fail (a game thread mid-syscall) even while paused.
+        // Slot 0 only for now; multiple slots would just mean a slot picker here, the
+        // native side (NativeLib.saveState/loadState(slot)) already supports it.
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            OutlinedButton(
+                onClick = { sessionViewModel.saveState(context, slot = 0) },
+                enabled = uiState.isPaused,
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(Icons.Default.Save, contentDescription = null)
+                Spacer(modifier = Modifier.padding(horizontal = 4.dp))
+                Text(stringResource(R.string.emulation_save_state))
+            }
+            OutlinedButton(
+                onClick = { sessionViewModel.loadState(context, slot = 0) },
+                enabled = uiState.isPaused && remember(uiState.showMenu, uiState.statusMessage) {
+                    sessionViewModel.hasSaveState(slot = 0)
+                },
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(Icons.Default.Restore, contentDescription = null)
+                Spacer(modifier = Modifier.padding(horizontal = 4.dp))
+                Text(stringResource(R.string.emulation_load_state))
             }
         }
 

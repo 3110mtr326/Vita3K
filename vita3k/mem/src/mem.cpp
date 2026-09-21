@@ -556,6 +556,42 @@ const char *mem_name(Address address, MemState &state) {
     return "";
 }
 
+std::vector<std::pair<Address, uint32_t>> get_allocated_regions(const MemState &state) {
+    std::vector<std::pair<Address, uint32_t>> regions;
+
+    const std::lock_guard<std::mutex> lock(const_cast<std::mutex &>(state.generation_mutex));
+
+    const auto &words = state.allocator.words;
+    const size_t total_pages = state.allocator.max_offset;
+
+    bool in_region = false;
+    uint32_t region_start_page = 0;
+
+    auto close_region = [&](uint32_t end_page) {
+        if (in_region) {
+            regions.emplace_back(region_start_page * STANDARD_PAGE_SIZE, (end_page - region_start_page) * STANDARD_PAGE_SIZE);
+            in_region = false;
+        }
+    };
+
+    for (size_t page = 0; page < total_pages; page++) {
+        // BitmapAllocator: a set bit means the page is FREE, and bits are numbered
+        // MSB-first within each word (see BitmapAllocator::allocate_from), i.e. bit
+        // (31 - page % 32) of words[page / 32] corresponds to `page`.
+        const bool free_page = (words[page / 32] >> (31 - (page % 32))) & 1;
+        const bool allocated = !free_page;
+        if (allocated && !in_region) {
+            in_region = true;
+            region_start_page = static_cast<uint32_t>(page);
+        } else if (!allocated && in_region) {
+            close_region(static_cast<uint32_t>(page));
+        }
+    }
+    close_region(static_cast<uint32_t>(total_pages));
+
+    return regions;
+}
+
 void deinit_mem(MemState &state) {
     const std::lock_guard<std::mutex> gen_lock(state.generation_mutex);
 

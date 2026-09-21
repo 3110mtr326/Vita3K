@@ -140,6 +140,19 @@ object NativeLib {
     ): Boolean
     /** Returns true when the currently running app session is paused. */
     external fun isAppPaused(): Boolean
+
+    // --- Savestates ---
+    // These require the session to already be paused (e.g. call from the pause menu,
+    // with PAUSE_REASON_MENU active via setPauseReasonEnabled). They can fail even
+    // while paused -- for example if a game thread happens to be blocked waiting on
+    // a semaphore/mutex/event flag right now -- in which case retrying a moment
+    // later (or after stepping a frame) usually succeeds.
+    /** Saves the running app's state to the given numbered slot. Requires the session to be paused. */
+    external fun saveState(slot: Int): Boolean
+    /** Loads a previously saved state from the given numbered slot. Requires the session to be paused. */
+    external fun loadState(slot: Int): Boolean
+    /** Returns true if a savestate exists for the given numbered slot of the running app. */
+    external fun hasSaveState(slot: Int): Boolean
     /** Returns the title of the currently running app session, or an empty string when unavailable. */
     external fun getRunningAppTitle(): String
     /** Returns true while either SceIme or CommonDialog IME is active. */

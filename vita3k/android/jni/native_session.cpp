@@ -9,9 +9,11 @@
 #include "android_state.h"
 
 #include <app/functions.h>
+#include <app/savestate.h>
 #include <ime/keyboard.h>
 #include <io/state.h>
 #include <motion/functions.h>
+#include <util/log.h>
 
 #include <SDL3/SDL_events.h>
 #include <jni.h>
@@ -168,6 +170,54 @@ Java_org_vita3k_emulator_NativeLib_submitIme(JNIEnv *, jclass) {
     if (submitted)
         ime::notify_ime_state_changed();
     return submitted ? JNI_TRUE : JNI_FALSE;
+}
+
+// Save/load state requires the session to already be paused (i.e. called while
+// the pause menu, which sets AppSessionPauseReason::Menu, is showing). See the
+// large comment at the top of app/src/savestate.cpp for why these functions do
+// not pause the session themselves, and for the "not any guest thread may be
+// mid-syscall" limitation that saveState() below can fail on.
+JNIEXPORT jboolean JNICALL
+Java_org_vita3k_emulator_NativeLib_saveState(JNIEnv *, jclass, jint slot) {
+    auto *emuenv = get_emuenv();
+    auto *controller = get_app_session_controller();
+    if (!emuenv || !controller || !controller->is_running() || !controller->is_paused())
+        return JNI_FALSE;
+
+    const auto path = app::get_savestate_path(*emuenv, static_cast<int>(slot));
+    const auto result = app::save_state(*emuenv, path);
+    if (result != app::SaveStateResult::Success) {
+        LOG_ERROR("saveState(slot={}) failed: {}", slot, app::save_state_result_to_string(result));
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_org_vita3k_emulator_NativeLib_loadState(JNIEnv *, jclass, jint slot) {
+    auto *emuenv = get_emuenv();
+    auto *controller = get_app_session_controller();
+    if (!emuenv || !controller || !controller->is_running() || !controller->is_paused())
+        return JNI_FALSE;
+
+    const auto path = app::get_savestate_path(*emuenv, static_cast<int>(slot));
+    const auto result = app::load_state(*emuenv, path);
+    if (result != app::SaveStateResult::Success) {
+        LOG_ERROR("loadState(slot={}) failed: {}", slot, app::save_state_result_to_string(result));
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_org_vita3k_emulator_NativeLib_hasSaveState(JNIEnv *, jclass, jint slot) {
+    auto *emuenv = get_emuenv();
+    if (!emuenv)
+        return JNI_FALSE;
+
+    boost::system::error_code ec;
+    const bool exists = fs::exists(app::get_savestate_path(*emuenv, static_cast<int>(slot)), ec);
+    return (exists && !ec) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL

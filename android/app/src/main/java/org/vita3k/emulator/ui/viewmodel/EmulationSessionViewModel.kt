@@ -7,6 +7,7 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import org.vita3k.emulator.Emulator
 import org.vita3k.emulator.NativeLib
+import org.vita3k.emulator.R
 import org.vita3k.emulator.data.NativeImeState
 import org.vita3k.emulator.overlay.DEFAULT_OVERLAY_MASK
 import org.vita3k.emulator.overlay.OverlayConfig
@@ -267,6 +268,47 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
 
     fun showStatusMessage(message: String) {
         uiState = uiState.copy(statusMessage = message)
+    }
+
+    /**
+     * Saves the running app's state to the given numbered slot. Requires the session to
+     * already be paused (i.e. the caller should only offer this while [uiState.isPaused]
+     * is true). Can fail even while paused, e.g. if a game thread happens to be blocked
+     * on a semaphore/mutex/event flag right now -- in that case, retrying a moment later
+     * usually succeeds.
+     */
+    fun saveState(context: android.content.Context, slot: Int) {
+        if (!uiState.isPaused) {
+            return
+        }
+        val success = runCatching { NativeLib.saveState(slot) }.getOrDefault(false)
+        showStatusMessage(
+            if (success) {
+                context.getString(R.string.emulation_state_saved, slot + 1)
+            } else {
+                context.getString(R.string.emulation_state_save_failed)
+            }
+        )
+    }
+
+    /** Loads a previously saved state from the given numbered slot. Requires the session to already be paused. */
+    fun loadState(context: android.content.Context, slot: Int) {
+        if (!uiState.isPaused) {
+            return
+        }
+        val success = runCatching { NativeLib.loadState(slot) }.getOrDefault(false)
+        showStatusMessage(
+            if (success) {
+                context.getString(R.string.emulation_state_loaded, slot + 1)
+            } else {
+                context.getString(R.string.emulation_state_load_failed)
+            }
+        )
+    }
+
+    /** Returns true if a savestate exists for the given numbered slot of the running app. */
+    fun hasSaveState(slot: Int): Boolean {
+        return runCatching { NativeLib.hasSaveState(slot) }.getOrDefault(false)
     }
 
     fun updateImeState(state: NativeImeState?) {

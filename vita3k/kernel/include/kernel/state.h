@@ -189,6 +189,17 @@ struct KernelState {
     bool is_threads_paused() { return !paused_threads_status.empty(); }
     void pause_threads();
     void resume_threads();
+    // Updates the status a thread will be restored to by the next resume_threads()
+    // call, without waking it immediately. Must only be called while paused (i.e.
+    // between pause_threads() and resume_threads()). No-op for a thread_id that
+    // wasn't running when pause_threads() was called (e.g. one created since).
+    //
+    // Used by the savestate system: it may transition a thread's live status
+    // directly (via ThreadState::update_status) while the session is paused, and
+    // needs the "status to restore on resume" bookkeeping updated to match, or a
+    // later resume_threads() would incorrectly force the thread back to whatever
+    // status it had when the pause began.
+    void set_pending_resume_status(SceUID thread_id, ThreadStatus status);
 
     // Kill all guest threads and block until they have exited. Must only be called from a host thread.
     void process_exit();

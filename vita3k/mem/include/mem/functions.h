@@ -21,6 +21,8 @@
 #include <mem/util.h>
 
 #include <functional>
+#include <utility>
+#include <vector>
 
 struct MemState;
 
@@ -68,3 +70,8 @@ Address try_alloc_at(MemState &state, Address address, uint32_t size, const char
 void free(MemState &state, Address address);
 uint32_t mem_available(MemState &state);
 const char *mem_name(Address address, MemState &state);
+
+// Returns the list of currently committed (allocated) memory regions as (address, size) pairs,
+// merging adjacent pages into a single contiguous range. Used by the savestate system to avoid
+// dumping the full 4GB reserved address space.
+std::vector<std::pair<Address, uint32_t>> get_allocated_regions(const MemState &state);
