@@ -24,32 +24,52 @@
 // parked several native C++ stack frames deep inside sync_primitives.cpp,
 // and the WaitingThreadData queued for it holds raw pointers into that
 // thread's *native* stack (see kernel/sync_primitives.h). A native call
-// stack cannot be serialized to a file and reconstructed in a way that is
-// portable across time (or across a process restart), so:
+// stack cannot be serialized to a file and reconstructed in the general
+// case. What this file does instead, for the specific case of a thread
+// blocked on a semaphore/mutex/event-flag wait, is described by
+// looks_like_parked_import_call()'s comment below: rather than trying to
+// preserve that native stack, the saved CPU context is rewound to the
+// `svc` instruction that dispatched the wait, so that reloading it makes
+// the thread's own run_loop() naturally re-enter the exact same HLE call
+// (kernel::call_import(), already-existing/well-tested code) on its own,
+// freshly-created host thread -- reconstructing an equivalent block without
+// ever touching a native stack at all.
+//
+// Consequences and remaining limits:
 //
 //   - save_state() refuses (ErrorThreadNotSafe) if any guest thread is
-//     currently in ThreadStatus::wait. Most games have short "run" bursts
-//     between waits (e.g. once per frame after vblank), so in practice a
-//     caller should retry the save a frame or two later rather than surface
-//     this as a hard failure to the user.
-//   - Only Semaphore / Mutex / EventFlag dynamic values are captured. Since
-//     the precondition above guarantees no thread is queued on any of them,
-//     RWLock/Condvar/Timer/MsgPipe need no special handling for correctness
-//     yet, but are not captured either (documented as future work).
+//     currently blocked on anything OTHER than a semaphore, mutex, or event
+//     flag wait -- e.g. sceKernelDelayThread, a vblank wait, a thread join,
+//     RWLock/Condvar/Timer/MsgPipe. The same redispatch mechanism plausibly
+//     also reconstructs those correctly (they are dispatched via the same
+//     `svc` convention), but that isn't verified here, and getting this
+//     wrong risks a hang or crash on load rather than a mere save failure
+//     -- so it stays conservative and requires supported cases only. It
+//     also refuses if the parked instruction doesn't match the expected
+//     import-stub pattern at all (see looks_like_parked_import_call()),
+//     which should not happen but is checked rather than assumed, since a
+//     wrong assumption here corrupts the guest's execution on load, not
+//     just this file.
+//   - Only Semaphore / Mutex / EventFlag dynamic values are captured,
+//     matching the set of wait reasons save_state() will actually accept.
 //   - GXM/renderer state (in-flight command buffers, render targets) is not
 //     captured. The screen may show one incorrect/incomplete frame right
 //     after loading a state before the game's own render loop corrects it.
 //   - load_state() requires the exact same set of thread UIDs to exist in
 //     the running session as when the state was saved. It does not attempt
 //     to recreate threads that have since exited, nor kill threads that
-//     were spawned after the save. This is the same reason as above: safely
-//     recreating a thread's initial HLE-call stack is out of scope here.
+//     were spawned after the save. This is a different problem from the
+//     wait-reconstruction above: it's about recreating a thread's initial
+//     HLE-call stack from nothing (thread creation bookkeeping, TLS, initial
+//     args), not resuming an existing one, and is out of scope here.
 //
 // None of this is a fundamental limitation of Vita3K -- it is a consequence
-// of the thread-per-guest-thread design. Supporting true "save anywhere,
-// including across threads blocked mid-syscall" would require switching
-// guest thread scheduling to fibers/coroutines (as e.g. RPCS3 does for the
-// same reason), which is a much larger, separate change.
+// of the thread-per-guest-thread design. A guest thread genuinely stuck deep
+// in unrecoverable native-stack territory (anything not dispatched through
+// call_import the way described above) still can't be saved; the only fully
+// general fix for that remains switching guest thread scheduling to
+// fibers/coroutines (as e.g. RPCS3 does for the same reason), which is a
+// much larger, separate change.
 //
 // Pausing: KernelState::pause_threads()/resume_threads() (see kernel/kernel.cpp)
 // record each thread's pre-pause status in a single, non-stacking map, so a
@@ -112,17 +132,84 @@ bool read_string(fs::ifstream &in, std::string &str) {
     return static_cast<bool>(in);
 }
 
-// Returns true (and logs which thread) if any guest thread is currently
-// blocked in a kernel wait and therefore unsafe to serialize.
-bool has_unsafe_thread(KernelState &kernel) {
-    const std::lock_guard<std::mutex> lock(kernel.mutex);
-    for (auto &[id, thread] : kernel.threads) {
-        if (thread->status == ThreadStatus::wait) {
-            LOG_WARN("Savestate: thread {} ({}) is blocked in a kernel wait, cannot save right now.", id, thread->name);
+// The Vita3K import stub (see kernel/src/load_self.cpp) is always these three
+// ARM words: `svc #0` (traps into the HLE dispatcher), `mov pc, lr` (a landmark
+// the dispatcher never actually executes as an instruction -- see below), then
+// the NID. kernel/src/thread.cpp's `if (cpu->svc_called)` handling reads the
+// NID from `read_pc(cpu) + 4`, which only makes sense if, by the time a `run()`
+// call returns from hitting the `svc`, dynarmic has already retired it and PC
+// points at the `mov pc, lr` word. That's the same convention this relies on.
+constexpr uint32_t IMPORT_STUB_SVC = 0xef000000; // svc #0
+constexpr uint32_t IMPORT_STUB_RETURN = 0xe1a0f00e; // mov pc, lr
+
+// True if `cpu` is parked exactly where a thread ends up immediately after
+// call_import() dispatches an HLE function that then blocks (i.e. PC sits on
+// the stub's `mov pc, lr` landmark, with an `svc #0` right before it) --
+// checked directly against memory rather than assumed, since getting this
+// wrong would corrupt guest execution on load rather than just fail a save.
+bool looks_like_parked_import_call(CPUState &cpu, MemState &mem) {
+    if (read_cpsr(cpu) & 0x20) // Thumb: the stub is fixed ARM-mode code, can't be it.
+        return false;
+    const uint32_t pc = read_pc(cpu);
+    if (pc < 4)
+        return false;
+    const Ptr<uint32_t> svc_word(pc - 4);
+    const Ptr<uint32_t> return_word(pc);
+    if (!svc_word.valid(mem) || !return_word.valid(mem))
+        return false;
+    return *svc_word.get(mem) == IMPORT_STUB_SVC && *return_word.get(mem) == IMPORT_STUB_RETURN;
+}
+
+// True if `thread` is registered as a waiter in any object of `objects` (a
+// map of sync objects, each with a `waiting_threads` queue that may be null
+// if nothing has ever waited on that particular object) -- used to tell
+// "blocked on a semaphore/mutex/event flag" (the cases this file can
+// reconstruct) apart from other wait reasons (delay, vblank, thread join,
+// RWLock/Condvar/Timer/MsgPipe, ...), which it can't yet and must refuse to
+// save instead of guessing.
+template <typename ObjectMap>
+bool is_waiting_in(const ObjectMap &objects, const ThreadStatePtr &thread) {
+    for (auto &[uid, object] : objects) {
+        if (object->waiting_threads && object->waiting_threads->find(thread) != object->waiting_threads->end())
             return true;
-        }
     }
     return false;
+}
+
+// Returns a human-readable reason (and logs it) if any guest thread is
+// currently unsafe to serialize: blocked on something other than a
+// semaphore/mutex/event-flag wait, or -- defensively -- one of those but not
+// actually parked where looks_like_parked_import_call() expects. Returns an
+// empty string if every thread is safe.
+std::string find_unsafe_thread_reason(KernelState &kernel, MemState &mem) {
+    const std::lock_guard<std::mutex> lock(kernel.mutex);
+    for (auto &[id, thread] : kernel.threads) {
+        if (thread->status != ThreadStatus::wait)
+            continue;
+
+        const bool parked_ok = looks_like_parked_import_call(*thread->cpu, mem);
+        const bool in_sema = parked_ok && is_waiting_in(kernel.semaphores, thread);
+        const bool in_mutex = parked_ok && is_waiting_in(kernel.mutexes, thread);
+        const bool in_eventflag = parked_ok && is_waiting_in(kernel.eventflags, thread);
+
+        if (parked_ok && (in_sema || in_mutex || in_eventflag))
+            continue; // supported and safe
+
+        std::string reason;
+        if (!parked_ok) {
+            const uint32_t pc = read_pc(*thread->cpu);
+            reason = fmt::format(
+                "thread {} ('{}') is waiting but not parked on a recognized import-stub call (PC=0x{:X}, thumb={})",
+                id, thread->name, pc, (read_cpsr(*thread->cpu) & 0x20) != 0);
+        } else {
+            reason = fmt::format(
+                "thread {} ('{}') is waiting on something other than a semaphore/mutex/event flag",
+                id, thread->name);
+        }
+        LOG_WARN("Savestate: {}, cannot save right now.", reason);
+        return reason;
+    }
+    return {};
 }
 
 struct ThreadRecord {
@@ -159,15 +246,18 @@ const char *save_state_result_to_string(SaveStateResult result) {
     return "Unknown error";
 }
 
-SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path) {
+SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::string *out_detail) {
     KernelState &kernel = emuenv.kernel;
     MemState &mem = emuenv.mem;
 
     if (!kernel.is_threads_paused())
         return SaveStateResult::ErrorNotPaused;
 
-    if (has_unsafe_thread(kernel))
+    if (auto reason = find_unsafe_thread_reason(kernel, mem); !reason.empty()) {
+        if (out_detail)
+            *out_detail = std::move(reason);
         return SaveStateResult::ErrorThreadNotSafe;
+    }
 
     // Collect everything into memory first so we only hold the kernel lock
     // briefly, then write to disk afterwards (and resume threads either way).
@@ -189,6 +279,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path) {
     std::vector<MutexRecord> mutex_records;
     std::vector<EventFlagRecord> eventflag_records;
 
+    int waiting_thread_count = 0;
     {
         const std::lock_guard<std::mutex> lock(kernel.mutex);
         thread_records.reserve(kernel.threads.size());
@@ -196,6 +287,8 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path) {
             ThreadRecord rec{};
             rec.id = id;
             rec.status = static_cast<uint8_t>(thread->status);
+            if (thread->status == ThreadStatus::wait)
+                waiting_thread_count++;
             rec.ctx = save_context(*thread->cpu);
             rec.tpidruro = read_tpidruro(*thread->cpu);
             rec.start_tick = thread->start_tick;
@@ -257,11 +350,11 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path) {
         return SaveStateResult::ErrorIO;
     }
 
-    LOG_INFO("Savestate: saved {} memory region(s), {} thread(s) to {}.", regions.size(), thread_records.size(), path.string());
+    LOG_INFO("Savestate: saved {} memory region(s), {} thread(s) ({} waiting) to {}.", regions.size(), thread_records.size(), waiting_thread_count, path.string());
     return SaveStateResult::Success;
 }
 
-SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path) {
+SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::string *out_detail) {
     KernelState &kernel = emuenv.kernel;
     MemState &mem = emuenv.mem;
 
@@ -357,8 +450,11 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path) {
     if (!kernel.is_threads_paused())
         return SaveStateResult::ErrorNotPaused;
 
-    if (has_unsafe_thread(kernel))
+    if (auto reason = find_unsafe_thread_reason(kernel, mem); !reason.empty()) {
+        if (out_detail)
+            *out_detail = std::move(reason);
         return SaveStateResult::ErrorThreadNotSafe;
+    }
 
     // Threads whose live status we changed below, together with the status they
     // should be restored to by the *next* resume_threads() call. Applied after
@@ -393,7 +489,19 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path) {
         // ahead of it.
         for (const auto &rec : thread_records) {
             ThreadStatePtr thread = kernel.threads[rec.id];
-            load_context(*thread->cpu, rec.ctx);
+            CPUContext ctx = rec.ctx;
+            if (static_cast<ThreadStatus>(rec.status) == ThreadStatus::wait) {
+                // Rewind PC by one ARM instruction (4 bytes), from the import stub's
+                // `mov pc, lr` landmark back to the `svc #0` right before it (see
+                // looks_like_parked_import_call()'s comment above). Pass 2 below then
+                // just resumes the thread normally; dynarmic will re-trap that `svc`,
+                // and kernel/src/thread.cpp's existing `if (cpu->svc_called)` handling
+                // re-dispatches the exact same HLE call from scratch -- reconstructing
+                // the wait via ordinary, already-correct code instead of anything
+                // savestate-specific.
+                ctx.set_pc(ctx.get_pc() - 4);
+            }
+            load_context(*thread->cpu, ctx);
             write_tpidruro(*thread->cpu, rec.tpidruro);
             thread->start_tick = rec.start_tick;
             thread->last_vblank_waited = rec.last_vblank_waited;
@@ -423,20 +531,42 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path) {
         }
 
         // Pass 2: now that all data is in place, flip each thread to its saved
-        // status. Only run/dormant were allowed to be saved (has_unsafe_thread
-        // above guarantees the same for the current, pre-load state). This goes
-        // through update_status() (under the thread's own mutex), not a bare
-        // field write, so a thread parked in run_loop()'s status_cond.wait() is
-        // actually woken back up when restored to `run`.
+        // status. This goes through update_status() (under the thread's own
+        // mutex), not a bare field write, so a thread parked in run_loop()'s
+        // status_cond.wait() is actually woken back up.
+        //
+        // A saved `wait` status is a special case: its CPU context was already
+        // rewound to the `svc` in the loop above, and what we set it to *here*
+        // is `run`, not `wait` -- this briefly wakes its run_loop(), which
+        // re-enters the exact HLE call it was blocked in (kernel/src/thread.cpp's
+        // existing `if (cpu->svc_called)` handling), and that call itself
+        // re-blocks (settling status back to `wait` on its own) almost
+        // immediately, since the semaphore/mutex/event-flag data it re-checks
+        // was already restored to the same values above. This "kick" runs on
+        // that one thread's own host OS thread, concurrently with the rest of
+        // this loop, same as any other resumed thread would -- it does not
+        // step outside the `wait`-only guarantee has_unsafe_thread() checked
+        // going in, since the wait condition it re-evaluates is unchanged.
+        // The *recorded* pending-resume target, `pending_resume_updates`
+        // below, is still `wait`, not `run`: the `run` here is only a
+        // transient kick, not the thread's real target status.
+        int reconstructed_wait_count = 0;
         for (const auto &rec : thread_records) {
             ThreadStatePtr thread = kernel.threads[rec.id];
-            const auto new_status = static_cast<ThreadStatus>(rec.status);
+            const auto saved_status = static_cast<ThreadStatus>(rec.status);
+            const auto live_status = (saved_status == ThreadStatus::wait) ? ThreadStatus::run : saved_status;
+            if (saved_status == ThreadStatus::wait) {
+                reconstructed_wait_count++;
+                LOG_INFO("Savestate: re-dispatching wait for thread {} ({}) at PC 0x{:X}.", rec.id, thread->name, rec.ctx.get_pc() - 4);
+            }
             {
                 const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-                thread->update_status(new_status);
+                thread->update_status(live_status);
             }
-            pending_resume_updates.emplace_back(rec.id, new_status);
+            pending_resume_updates.emplace_back(rec.id, saved_status);
         }
+        if (reconstructed_wait_count > 0)
+            LOG_INFO("Savestate: {} thread(s) had their kernel wait re-dispatched on load.", reconstructed_wait_count);
     }
 
     emuenv.frame_count = static_cast<size_t>(frame_count);

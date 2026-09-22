@@ -1,4 +1,4 @@
-// Vita3K emulator project　
+// Vita3K emulator project
 // Copyright (C) 2026 Vita3K team
 //
 // This program is free software; you can redistribute it and/or modify
@@ -18,6 +18,8 @@
 #pragma once
 
 #include <util/fs.h>
+
+#include <string>
 
 struct EmuEnvState;
 
@@ -54,7 +56,12 @@ fs::path get_savestate_path(const EmuEnvState &emuenv, int slot);
 // own pause/resume bookkeeping (KernelState::pause_threads/resume_threads) is not
 // re-entrant, so nesting an internal pause inside an already-paused session would
 // corrupt it. See the comment at the top of savestate.cpp for the full rationale.
-SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path);
-SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path);
+//
+// out_detail, if non-null, is set to extra diagnostic text on ErrorThreadNotSafe
+// (which specific thread, why it was judged unrecoverable) -- there isn't
+// currently another way to see this detail without a debugger/logcat attached, so
+// callers without one (e.g. the Android UI) should surface it directly.
+SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::string *out_detail = nullptr);
+SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::string *out_detail = nullptr);
 
 } // namespace app

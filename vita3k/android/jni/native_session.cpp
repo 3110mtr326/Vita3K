@@ -196,11 +196,17 @@ Java_org_vita3k_emulator_NativeLib_saveState(JNIEnv *env, jclass, jint slot) {
         return env->NewStringUTF("Session is not paused");
 
     const auto path = app::get_savestate_path(*emuenv, static_cast<int>(slot));
-    const auto result = app::save_state(*emuenv, path);
+    std::string detail;
+    const auto result = app::save_state(*emuenv, path, &detail);
     if (result != app::SaveStateResult::Success) {
-        const char *msg = app::save_state_result_to_string(result);
+        // Append the extra diagnostic (thread id/name, why it was judged
+        // unrecoverable) when there is one, so this is diagnosable from just
+        // the on-screen message -- see save_state()'s out_detail doc comment.
+        const std::string msg = detail.empty()
+            ? app::save_state_result_to_string(result)
+            : fmt::format("{}: {}", app::save_state_result_to_string(result), detail);
         LOG_ERROR("saveState(slot={}) failed: {}", slot, msg);
-        return env->NewStringUTF(msg);
+        return env->NewStringUTF(msg.c_str());
     }
     return env->NewStringUTF("");
 }
@@ -217,11 +223,14 @@ Java_org_vita3k_emulator_NativeLib_loadState(JNIEnv *env, jclass, jint slot) {
         return env->NewStringUTF("Session is not paused");
 
     const auto path = app::get_savestate_path(*emuenv, static_cast<int>(slot));
-    const auto result = app::load_state(*emuenv, path);
+    std::string detail;
+    const auto result = app::load_state(*emuenv, path, &detail);
     if (result != app::SaveStateResult::Success) {
-        const char *msg = app::save_state_result_to_string(result);
+        const std::string msg = detail.empty()
+            ? app::save_state_result_to_string(result)
+            : fmt::format("{}: {}", app::save_state_result_to_string(result), detail);
         LOG_ERROR("loadState(slot={}) failed: {}", slot, msg);
-        return env->NewStringUTF(msg);
+        return env->NewStringUTF(msg.c_str());
     }
     return env->NewStringUTF("");
 }
