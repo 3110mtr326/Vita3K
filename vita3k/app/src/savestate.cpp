@@ -176,11 +176,26 @@ bool is_waiting_in(const ObjectMap &objects, const ThreadStatePtr &thread) {
     return false;
 }
 
+// NIDs (see nids/include/nids/nids.inc) of import calls that are safe to
+// redispatch even though they don't register the thread in any sync-object
+// waiting_threads queue: each blocks purely on its *own* thread's
+// status_cond/mutex (see delay_thread() in SceThreadmgr.cpp), with no shared
+// kernel object whose state needs restoring first. Deliberately excludes the
+// "CB" (process-callbacks-then-delay) variants: those run guest callbacks as
+// a side effect before blocking, and redispatching from scratch would risk
+// invoking those callbacks a second time.
+constexpr uint32_t NID_sceKernelDelayThread = 0x4B675D05;
+constexpr uint32_t NID_sceKernelDelayThread200 = 0x97C4A7C4;
+
+bool is_safe_self_contained_wait_nid(uint32_t nid) {
+    return nid == NID_sceKernelDelayThread || nid == NID_sceKernelDelayThread200;
+}
+
 // Returns a human-readable reason (and logs it) if any guest thread is
-// currently unsafe to serialize: blocked on something other than a
-// semaphore/mutex/event-flag wait, or -- defensively -- one of those but not
-// actually parked where looks_like_parked_import_call() expects. Returns an
-// empty string if every thread is safe.
+// currently unsafe to serialize: blocked on something this file doesn't know
+// how to safely redispatch, or -- defensively -- parked somewhere that
+// doesn't match looks_like_parked_import_call()'s expectations at all.
+// Returns an empty string if every thread is safe.
 std::string find_unsafe_thread_reason(KernelState &kernel, MemState &mem) {
     const std::lock_guard<std::mutex> lock(kernel.mutex);
     for (auto &[id, thread] : kernel.threads) {
@@ -188,13 +203,6 @@ std::string find_unsafe_thread_reason(KernelState &kernel, MemState &mem) {
             continue;
 
         const bool parked_ok = looks_like_parked_import_call(*thread->cpu, mem);
-        const bool in_sema = parked_ok && is_waiting_in(kernel.semaphores, thread);
-        const bool in_mutex = parked_ok && is_waiting_in(kernel.mutexes, thread);
-        const bool in_eventflag = parked_ok && is_waiting_in(kernel.eventflags, thread);
-
-        if (parked_ok && (in_sema || in_mutex || in_eventflag))
-            continue; // supported and safe
-
         std::string reason;
         if (!parked_ok) {
             const uint32_t pc = read_pc(*thread->cpu);
@@ -202,9 +210,17 @@ std::string find_unsafe_thread_reason(KernelState &kernel, MemState &mem) {
                 "thread {} ('{}') is waiting but not parked on a recognized import-stub call (PC=0x{:X}, thumb={})",
                 id, thread->name, pc, (read_cpsr(*thread->cpu) & 0x20) != 0);
         } else {
+            const bool in_known_object = is_waiting_in(kernel.semaphores, thread)
+                || is_waiting_in(kernel.mutexes, thread)
+                || is_waiting_in(kernel.eventflags, thread)
+                || is_waiting_in(kernel.condvars, thread)
+                || is_waiting_in(kernel.lwcondvars, thread);
+            const uint32_t nid = *Ptr<uint32_t>(read_pc(*thread->cpu) + 4).get(mem);
+            if (in_known_object || is_safe_self_contained_wait_nid(nid))
+                continue; // supported and safe
             reason = fmt::format(
-                "thread {} ('{}') is waiting on something other than a semaphore/mutex/event flag",
-                id, thread->name);
+                "thread {} ('{}') is waiting on unsupported call NID=0x{:08X}",
+                id, thread->name, nid);
         }
         LOG_WARN("Savestate: {}, cannot save right now.", reason);
         return reason;
