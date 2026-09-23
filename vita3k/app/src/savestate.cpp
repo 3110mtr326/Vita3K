@@ -186,9 +186,19 @@ bool is_waiting_in(const ObjectMap &objects, const ThreadStatePtr &thread) {
 // invoking those callbacks a second time.
 constexpr uint32_t NID_sceKernelDelayThread = 0x4B675D05;
 constexpr uint32_t NID_sceKernelDelayThread200 = 0x97C4A7C4;
+// sceAudioOutOutput (modules/SceAudio/SceAudio.cpp) marks the thread `wait`
+// and blocks on the host audio backend's *own* port-level mutex/condvar
+// (e.g. SDLAudioAdapter::audio_output, audio/src/impl/sdl_audio.cpp) purely
+// to pace submission against how much is left to play -- not on anything
+// savestate.cpp captures. That wait always has a bounded timeout (twice the
+// port's buffer duration), so redispatching can't hang: worst case it just
+// resubmits the same audio buffer sooner or later than originally, which can
+// cause a brief audio blip right after loading but nothing worse.
+constexpr uint32_t NID_sceAudioOutOutput = 0x02DB3F5F;
 
 bool is_safe_self_contained_wait_nid(uint32_t nid) {
-    return nid == NID_sceKernelDelayThread || nid == NID_sceKernelDelayThread200;
+    return nid == NID_sceKernelDelayThread || nid == NID_sceKernelDelayThread200
+        || nid == NID_sceAudioOutOutput;
 }
 
 // Returns a human-readable reason (and logs it) if any guest thread is
