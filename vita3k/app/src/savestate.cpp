@@ -102,7 +102,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 1;
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 2; // v2: added SimpleEvent records (sceKernelWaitEvent)
 
 template <typename T>
 void write_pod(fs::ofstream &out, const T &value) {
@@ -214,7 +214,8 @@ std::string find_unsafe_thread_reason(KernelState &kernel, MemState &mem) {
                 || is_waiting_in(kernel.mutexes, thread)
                 || is_waiting_in(kernel.eventflags, thread)
                 || is_waiting_in(kernel.condvars, thread)
-                || is_waiting_in(kernel.lwcondvars, thread);
+                || is_waiting_in(kernel.lwcondvars, thread)
+                || is_waiting_in(kernel.simple_events, thread);
             const uint32_t nid = *Ptr<uint32_t>(read_pc(*thread->cpu) + 4).get(mem);
             if (in_known_object || is_safe_self_contained_wait_nid(nid))
                 continue; // supported and safe
@@ -291,9 +292,17 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         SceUID uid;
         int32_t flags;
     };
+    struct SimpleEventRecord {
+        SceUID uid;
+        uint32_t pattern;
+        uint64_t last_user_data;
+        uint8_t auto_reset;
+        uint8_t cb_wakeup_only;
+    };
     std::vector<SemaRecord> sema_records;
     std::vector<MutexRecord> mutex_records;
     std::vector<EventFlagRecord> eventflag_records;
+    std::vector<SimpleEventRecord> simple_event_records;
 
     int waiting_thread_count = 0;
     {
@@ -319,6 +328,8 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             mutex_records.push_back({ uid, mutex->lock_count, mutex->init_count, mutex->owner ? mutex->owner->id : -1 });
         for (auto &[uid, ef] : kernel.eventflags)
             eventflag_records.push_back({ uid, ef->flags });
+        for (auto &[uid, ev] : kernel.simple_events)
+            simple_event_records.push_back({ uid, ev->pattern, ev->last_user_data, ev->auto_reset, ev->cb_wakeup_only });
     }
 
     const auto regions = get_allocated_regions(mem);
@@ -356,6 +367,9 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         write_pod(out, rec);
     write_pod(out, static_cast<uint32_t>(eventflag_records.size()));
     for (const auto &rec : eventflag_records)
+        write_pod(out, rec);
+    write_pod(out, static_cast<uint32_t>(simple_event_records.size()));
+    for (const auto &rec : simple_event_records)
         write_pod(out, rec);
 
     const bool ok = static_cast<bool>(out);
@@ -457,10 +471,18 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         SceUID uid;
         int32_t flags;
     };
+    struct SimpleEventRecord {
+        SceUID uid;
+        uint32_t pattern;
+        uint64_t last_user_data;
+        uint8_t auto_reset;
+        uint8_t cb_wakeup_only;
+    };
     std::vector<SemaRecord> sema_records;
     std::vector<MutexRecord> mutex_records;
     std::vector<EventFlagRecord> eventflag_records;
-    if (!read_records(sema_records) || !read_records(mutex_records) || !read_records(eventflag_records))
+    std::vector<SimpleEventRecord> simple_event_records;
+    if (!read_records(sema_records) || !read_records(mutex_records) || !read_records(eventflag_records) || !read_records(simple_event_records))
         return SaveStateResult::ErrorIO;
 
     if (!kernel.is_threads_paused())
@@ -544,6 +566,15 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             auto it = kernel.eventflags.find(rec.uid);
             if (it != kernel.eventflags.end())
                 it->second->flags = rec.flags;
+        }
+        for (const auto &rec : simple_event_records) {
+            auto it = kernel.simple_events.find(rec.uid);
+            if (it != kernel.simple_events.end()) {
+                it->second->pattern = rec.pattern;
+                it->second->last_user_data = rec.last_user_data;
+                it->second->auto_reset = rec.auto_reset;
+                it->second->cb_wakeup_only = rec.cb_wakeup_only;
+            }
         }
 
         // Pass 2: now that all data is in place, flip each thread to its saved
