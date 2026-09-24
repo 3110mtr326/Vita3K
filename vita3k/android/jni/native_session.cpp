@@ -197,18 +197,28 @@ Java_org_vita3k_emulator_NativeLib_saveState(JNIEnv *env, jclass, jint slot) {
 
     const auto path = app::get_savestate_path(*emuenv, static_cast<int>(slot));
     std::string detail;
-    const auto result = app::save_state(*emuenv, path, &detail);
-    if (result != app::SaveStateResult::Success) {
-        // Append the extra diagnostic (thread id/name, why it was judged
-        // unrecoverable) when there is one, so this is diagnosable from just
-        // the on-screen message -- see save_state()'s out_detail doc comment.
-        const std::string msg = detail.empty()
-            ? app::save_state_result_to_string(result)
-            : fmt::format("{}: {}", app::save_state_result_to_string(result), detail);
-        LOG_ERROR("saveState(slot={}) failed: {}", slot, msg);
+    // A crash inside save_state() (a real memory-access violation) can't be
+    // caught here -- that terminates the process outright -- but this at
+    // least turns an ordinary C++ exception into a visible error message
+    // instead of an unexplained crash.
+    try {
+        const auto result = app::save_state(*emuenv, path, &detail);
+        if (result != app::SaveStateResult::Success) {
+            // Append the extra diagnostic (thread id/name, why it was judged
+            // unrecoverable) when there is one, so this is diagnosable from just
+            // the on-screen message -- see save_state()'s out_detail doc comment.
+            const std::string msg = detail.empty()
+                ? app::save_state_result_to_string(result)
+                : fmt::format("{}: {}", app::save_state_result_to_string(result), detail);
+            LOG_ERROR("saveState(slot={}) failed: {}", slot, msg);
+            return env->NewStringUTF(msg.c_str());
+        }
+        return env->NewStringUTF("");
+    } catch (const std::exception &e) {
+        const std::string msg = fmt::format("threw an exception: {}", e.what());
+        LOG_ERROR("saveState(slot={}) {}", slot, msg);
         return env->NewStringUTF(msg.c_str());
     }
-    return env->NewStringUTF("");
 }
 
 JNIEXPORT jstring JNICALL
@@ -224,12 +234,18 @@ Java_org_vita3k_emulator_NativeLib_loadState(JNIEnv *env, jclass, jint slot) {
 
     const auto path = app::get_savestate_path(*emuenv, static_cast<int>(slot));
     std::string detail;
-    const auto result = app::load_state(*emuenv, path, &detail);
-    if (result != app::SaveStateResult::Success) {
-        const std::string msg = detail.empty()
-            ? app::save_state_result_to_string(result)
-            : fmt::format("{}: {}", app::save_state_result_to_string(result), detail);
-        LOG_ERROR("loadState(slot={}) failed: {}", slot, msg);
+    try {
+        const auto result = app::load_state(*emuenv, path, &detail);
+        if (result != app::SaveStateResult::Success) {
+            const std::string msg = detail.empty()
+                ? app::save_state_result_to_string(result)
+                : fmt::format("{}: {}", app::save_state_result_to_string(result), detail);
+            LOG_ERROR("loadState(slot={}) failed: {}", slot, msg);
+            return env->NewStringUTF(msg.c_str());
+        }
+    } catch (const std::exception &e) {
+        const std::string msg = fmt::format("threw an exception: {}", e.what());
+        LOG_ERROR("loadState(slot={}) {}", slot, msg);
         return env->NewStringUTF(msg.c_str());
     }
     return env->NewStringUTF("");

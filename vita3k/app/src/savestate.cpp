@@ -314,6 +314,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     std::vector<EventFlagRecord> eventflag_records;
     std::vector<SimpleEventRecord> simple_event_records;
 
+    LOG_INFO("Savestate: collecting kernel state...");
     int waiting_thread_count = 0;
     {
         const std::lock_guard<std::mutex> lock(kernel.mutex);
@@ -342,7 +343,29 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             simple_event_records.push_back({ uid, ev->pattern, ev->last_user_data, ev->auto_reset, ev->cb_wakeup_only });
     }
 
+    LOG_INFO("Savestate: kernel state collected ({} thread(s), {} waiting). Scanning allocated memory...", thread_records.size(), waiting_thread_count);
     const auto regions = get_allocated_regions(mem);
+
+    // Sanity bound: a real Vita title's total allocated memory is at most a few
+    // hundred MB. If this comes out far larger than that, get_allocated_regions()
+    // almost certainly misread the allocator's bitmap (e.g. an inverted bit or a
+    // wrong region boundary) rather than the game legitimately using that much --
+    // bail out with a clear error instead of attempting a multi-GB read/write
+    // that could itself crash (OOM) or hang long enough to look like a crash.
+    constexpr uint64_t SANITY_MAX_TOTAL_BYTES = 1536ULL * 1024 * 1024; // 1.5 GB
+    uint64_t total_region_bytes = 0;
+    for (const auto &[addr, size] : regions)
+        total_region_bytes += size;
+    LOG_INFO("Savestate: {} allocated region(s) totalling {} byte(s).", regions.size(), total_region_bytes);
+    if (total_region_bytes > SANITY_MAX_TOTAL_BYTES) {
+        const std::string reason = fmt::format(
+            "get_allocated_regions() reported {} byte(s) across {} region(s), which is implausibly large -- aborting instead of attempting that read/write",
+            total_region_bytes, regions.size());
+        LOG_ERROR("Savestate: {}", reason);
+        if (out_detail)
+            *out_detail = reason;
+        return SaveStateResult::ErrorIO;
+    }
 
     fs::create_directories(path.parent_path());
 
@@ -362,6 +385,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         write_pod(out, size);
         out.write(reinterpret_cast<const char *>(&mem.memory[addr]), size);
     }
+    LOG_INFO("Savestate: memory written. Writing thread/sync-object records...");
 
     // -- Threads --
     write_pod(out, static_cast<uint32_t>(thread_records.size()));
