@@ -572,6 +572,8 @@ std::vector<std::pair<Address, uint32_t>> get_allocated_regions(const MemState &
     // bugs. It reads as allocated but is never actually accessible, so it
     // must be skipped here rather than treated like real committed memory.
     const size_t null_guard_pages = (state.host_page_size + STANDARD_PAGE_SIZE - 1) / STANDARD_PAGE_SIZE;
+    LOG_INFO("get_allocated_regions: host_page_size={}, STANDARD_PAGE_SIZE={}, null_guard_pages={}, total_pages={}",
+        state.host_page_size, STANDARD_PAGE_SIZE, null_guard_pages, total_pages);
 
     bool in_region = false;
     uint32_t region_start_page = 0;
@@ -597,6 +599,9 @@ std::vector<std::pair<Address, uint32_t>> get_allocated_regions(const MemState &
         }
     }
     close_region(static_cast<uint32_t>(total_pages));
+
+    if (!regions.empty())
+        LOG_INFO("get_allocated_regions: first region starts at 0x{:X}, size {}.", regions.front().first, regions.front().second);
 
     return regions;
 }

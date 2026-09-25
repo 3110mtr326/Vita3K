@@ -379,8 +379,29 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     write_pod(out, static_cast<uint64_t>(emuenv.frame_count));
 
     // -- Memory --
-    write_pod(out, static_cast<uint32_t>(regions.size()));
-    for (const auto &[addr, size] : regions) {
+    // Defensive, redundant re-check of get_allocated_regions()'s own null-guard
+    // exclusion (see its doc comment): trims/drops anything overlapping
+    // [0, mem.host_page_size) right before the actual read/write, so a bug in
+    // that exclusion degrades to "one region silently shortened" instead of a
+    // crash here.
+    std::vector<std::pair<Address, uint32_t>> safe_regions;
+    safe_regions.reserve(regions.size());
+    for (auto [addr, size] : regions) {
+        if (addr < mem.host_page_size) {
+            const uint32_t overlap = static_cast<uint32_t>(mem.host_page_size - addr);
+            if (overlap >= size) {
+                LOG_WARN("Savestate: dropping region at 0x{:X} (size {}) -- entirely inside the null-guard page.", addr, size);
+                continue;
+            }
+            LOG_WARN("Savestate: trimming {} byte(s) off the start of region at 0x{:X} -- inside the null-guard page.", overlap, addr);
+            addr += overlap;
+            size -= overlap;
+        }
+        safe_regions.emplace_back(addr, size);
+    }
+
+    write_pod(out, static_cast<uint32_t>(safe_regions.size()));
+    for (const auto &[addr, size] : safe_regions) {
         write_pod(out, addr);
         write_pod(out, size);
         out.write(reinterpret_cast<const char *>(&mem.memory[addr]), size);
