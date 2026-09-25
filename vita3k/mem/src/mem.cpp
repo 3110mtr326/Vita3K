@@ -564,6 +564,15 @@ std::vector<std::pair<Address, uint32_t>> get_allocated_regions(const MemState &
     const auto &words = state.allocator.words;
     const size_t total_pages = state.allocator.max_offset;
 
+    // Page 0 (and however many more STANDARD_PAGE_SIZE pages fit in one host
+    // page) is marked "allocated" in the bitmap -- see the `null_address`
+    // alloc_inner() call in init_mem() -- purely so nothing else can ever be
+    // allocated at address 0, then immediately mprotect'd back to PROT_NONE
+    // forever right after, as a deliberate guard against guest null-pointer
+    // bugs. It reads as allocated but is never actually accessible, so it
+    // must be skipped here rather than treated like real committed memory.
+    const size_t null_guard_pages = (state.host_page_size + STANDARD_PAGE_SIZE - 1) / STANDARD_PAGE_SIZE;
+
     bool in_region = false;
     uint32_t region_start_page = 0;
 
@@ -574,7 +583,7 @@ std::vector<std::pair<Address, uint32_t>> get_allocated_regions(const MemState &
         }
     };
 
-    for (size_t page = 0; page < total_pages; page++) {
+    for (size_t page = null_guard_pages; page < total_pages; page++) {
         // BitmapAllocator: a set bit means the page is FREE, and bits are numbered
         // MSB-first within each word (see BitmapAllocator::allocate_from), i.e. bit
         // (31 - page % 32) of words[page / 32] corresponds to `page`.
