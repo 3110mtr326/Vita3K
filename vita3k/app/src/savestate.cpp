@@ -93,8 +93,10 @@
 
 #include <fmt/format.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace app {
@@ -553,6 +555,10 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     // should be restored to by the *next* resume_threads() call. Applied after
     // releasing kernel.mutex (set_pending_resume_status() takes it itself).
     std::vector<std::pair<SceUID, ThreadStatus>> pending_resume_updates;
+    // ThreadStatePtr handles collected in Pass 1 (parallel to thread_records, same
+    // order/indices), so Pass 2 below can run *without* kernel.mutex held -- see
+    // its own comment for why that matters.
+    std::vector<ThreadStatePtr> thread_handles;
 
     {
         const std::lock_guard<std::mutex> lock(kernel.mutex);
@@ -580,8 +586,10 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         // be in their final, loaded state first. This mirrors resume_threads()'s own
         // one-lock, sequential-resume design, just with the data restore ordered
         // ahead of it.
+        thread_handles.reserve(thread_records.size());
         for (const auto &rec : thread_records) {
             ThreadStatePtr thread = kernel.threads[rec.id];
+            thread_handles.push_back(thread);
             CPUContext ctx = rec.ctx;
             if (static_cast<ThreadStatus>(rec.status) == ThreadStatus::wait) {
                 // Rewind PC by one ARM instruction (4 bytes), from the import stub's
@@ -632,43 +640,116 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             }
         }
 
-        // Pass 2: now that all data is in place, flip each thread to its saved
-        // status. This goes through update_status() (under the thread's own
-        // mutex), not a bare field write, so a thread parked in run_loop()'s
-        // status_cond.wait() is actually woken back up.
-        //
-        // A saved `wait` status is a special case: its CPU context was already
-        // rewound to the `svc` in the loop above, and what we set it to *here*
-        // is `run`, not `wait` -- this briefly wakes its run_loop(), which
-        // re-enters the exact HLE call it was blocked in (kernel/src/thread.cpp's
-        // existing `if (cpu->svc_called)` handling), and that call itself
-        // re-blocks (settling status back to `wait` on its own) almost
-        // immediately, since the semaphore/mutex/event-flag data it re-checks
-        // was already restored to the same values above. This "kick" runs on
-        // that one thread's own host OS thread, concurrently with the rest of
-        // this loop, same as any other resumed thread would -- it does not
-        // step outside the `wait`-only guarantee has_unsafe_thread() checked
-        // going in, since the wait condition it re-evaluates is unchanged.
-        // The *recorded* pending-resume target, `pending_resume_updates`
-        // below, is still `wait`, not `run`: the `run` here is only a
-        // transient kick, not the thread's real target status.
-        int reconstructed_wait_count = 0;
-        for (const auto &rec : thread_records) {
-            ThreadStatePtr thread = kernel.threads[rec.id];
-            const auto saved_status = static_cast<ThreadStatus>(rec.status);
-            const auto live_status = (saved_status == ThreadStatus::wait) ? ThreadStatus::run : saved_status;
-            if (saved_status == ThreadStatus::wait) {
+    } // release kernel.mutex -- see Pass 2's own comment for why this must
+      // happen before it runs, not just before the whole function returns.
+
+    // Pass 2: now that all data is in place, flip each thread to its saved
+    // status, one at a time, *without* kernel.mutex held. Two things that are
+    // both essential here:
+    //
+    // - This goes through update_status() (under the thread's own mutex), not
+    //   a bare field write, so a thread parked in run_loop()'s
+    //   status_cond.wait() is actually woken back up.
+    // - A saved `wait` status is a special case: its CPU context was already
+    //   rewound to the `svc` in Pass 1, and what we set it to *here* is `run`,
+    //   not `wait` -- this briefly wakes its run_loop(), which re-enters the
+    //   exact HLE call it was blocked in (kernel/src/thread.cpp's existing
+    //   `if (cpu->svc_called)` handling), and that call itself re-blocks
+    //   (settling status back to `wait` on its own) almost immediately, since
+    //   the semaphore/mutex/event-flag/condvar data it re-checks was already
+    //   restored above. The *recorded* pending-resume target,
+    //   `pending_resume_updates`, is still `wait`, not `run`: the `run` here
+    //   is only a transient kick, not the thread's real target status.
+    //
+    // Kicking a thread and moving straight on to the next one, letting them
+    // run concurrently, is NOT safe: a redispatched HLE wait call (e.g.
+    // condvar_wait()) itself needs kernel.mutex and/or other threads' own
+    // mutexes for perfectly ordinary reasons unrelated to savestates (looking
+    // up a sync object, handing a mutex to the next waiter, ...), same as it
+    // would on any other call. If *this* function were still holding
+    // kernel.mutex at that point, the kicked thread would deadlock waiting
+    // for it -- hence releasing it, above, before this loop. And even with
+    // kernel.mutex free, letting every kicked thread run at once reintroduces
+    // a version of the ordering problem Pass 1/Pass 2 already exists to
+    // avoid: several waits that share an underlying mutex/condvar (a common
+    // pattern for e.g. worker-thread pools) can race with each other while
+    // more than one is simultaneously mid-redispatch. So each thread is
+    // kicked, then waited on (via its own status_cond, with a timeout so a
+    // genuinely stuck thread can't hang this call forever) until it settles
+    // to something other than `run`, before moving on to the next one.
+    //
+    // One more wrinkle this has to account for: ordinary kernel code can
+    // itself wake another thread as a side effect -- e.g.
+    // mutex_unlock_impl() (kernel/src/sync_primitives.cpp) directly flips the
+    // next queued waiter to `run` when handing it the mutex, exactly as it
+    // would during normal play. So a thread this loop hasn't gotten to yet
+    // may already be running -- or have already finished running and
+    // re-settled back to `wait`, the *same* status it started at -- purely
+    // as a side effect of an earlier thread's redispatch. Status alone can't
+    // distinguish "never touched" from "already fully handled" in that
+    // second case, so `handled[i]` tracks it explicitly instead: a thread is
+    // only ever kicked once, the first time this loop (or another thread's
+    // side effect) is observed moving it out of `wait`.
+    //
+    // This runs as a poll loop over every wait-origin thread rather than one
+    // thread at a time, so a chain of hand-offs several threads deep -- awoken
+    // by an earlier thread's redispatch, itself resolving quickly and handing
+    // off to a third -- keeps getting picked up regardless of which of them
+    // this loop happens to reach first, instead of only being able to react
+    // to the *one specific thread* an earlier design's status_cond.wait_for()
+    // would have been scoped to.
+    std::vector<bool> handled(thread_records.size(), false);
+    int reconstructed_wait_count = 0;
+    bool any_in_flight = true;
+    for (int round = 0; any_in_flight && round < 500; round++) { // hard cap: 500 * 20ms = 10s
+        any_in_flight = false;
+        for (size_t i = 0; i < thread_records.size(); i++) {
+            const auto &rec = thread_records[i];
+            if (static_cast<ThreadStatus>(rec.status) != ThreadStatus::wait || handled[i])
+                continue;
+            const ThreadStatePtr &thread = thread_handles[i];
+            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+            if (thread->status == ThreadStatus::run) {
+                any_in_flight = true; // kicked (by us or a hand-off) but not yet settled
+            } else {
+                // status == wait and handled[i] is still false (checked above): this
+                // loop hasn't kicked it, and the settle-check pass below hasn't seen
+                // it stop running either, so nothing has touched it yet -- kick it.
                 reconstructed_wait_count++;
                 LOG_INFO("Savestate: re-dispatching wait for thread {} ({}) at PC 0x{:X}.", rec.id, thread->name, rec.ctx.get_pc() - 4);
+                thread->update_status(ThreadStatus::run);
+                any_in_flight = true;
             }
-            {
-                const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-                thread->update_status(live_status);
-            }
-            pending_resume_updates.emplace_back(rec.id, saved_status);
         }
-        if (reconstructed_wait_count > 0)
-            LOG_INFO("Savestate: {} thread(s) had their kernel wait re-dispatched on load.", reconstructed_wait_count);
+        if (any_in_flight)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        // Re-check which threads have now settled, so a thread that finished
+        // between the loop above and here isn't kicked a second time next round.
+        for (size_t i = 0; i < thread_records.size(); i++) {
+            if (static_cast<ThreadStatus>(thread_records[i].status) != ThreadStatus::wait || handled[i])
+                continue;
+            const ThreadStatePtr &thread = thread_handles[i];
+            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+            if (thread->status != ThreadStatus::run)
+                handled[i] = true;
+        }
+    }
+    for (size_t i = 0; i < thread_records.size(); i++) {
+        if (static_cast<ThreadStatus>(thread_records[i].status) == ThreadStatus::wait && !handled[i])
+            LOG_WARN("Savestate: thread {} ({}) did not settle within 10s after its wait was re-dispatched; continuing anyway.", thread_records[i].id, thread_handles[i]->name);
+    }
+    if (reconstructed_wait_count > 0)
+        LOG_INFO("Savestate: {} thread(s) had their kernel wait re-dispatched on load.", reconstructed_wait_count);
+
+    for (size_t i = 0; i < thread_records.size(); i++) {
+        const auto &rec = thread_records[i];
+        const auto saved_status = static_cast<ThreadStatus>(rec.status);
+        if (saved_status != ThreadStatus::wait) {
+            const ThreadStatePtr &thread = thread_handles[i];
+            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+            thread->update_status(saved_status);
+        }
+        pending_resume_updates.emplace_back(rec.id, saved_status);
     }
 
     emuenv.frame_count = static_cast<size_t>(frame_count);
