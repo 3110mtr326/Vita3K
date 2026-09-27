@@ -203,6 +203,26 @@ bool is_safe_self_contained_wait_nid(uint32_t nid) {
         || nid == NID_sceAudioOutOutput;
 }
 
+// True if `thread` is registered as a waiter-for-completion on some other
+// thread -- see wait_thread_end() (modules/SceKernelThreadMgr/SceThreadmgr.cpp,
+// backing sceKernelWaitThreadEnd/CB), which pushes the waiting thread onto the
+// *target* thread's own `waiting_threads` (ThreadState, not a sync object) and
+// parks it the same way. Woken the same way too: ThreadState::update_status()
+// calls raise_waiting_threads() when a thread goes dormant, which is the exact
+// same "flip status, notify" pattern as mutex_unlock_impl()'s hand-off (see
+// the Pass 2 comment on why that matters here). Nothing about this holds a raw
+// stack pointer either, so it's just as reconstructable as the sync-object
+// cases above.
+bool is_waiting_for_thread_end(const KernelState &kernel, const ThreadStatePtr &thread) {
+    for (auto &[id, target] : kernel.threads) {
+        for (auto &waiter : target->waiting_threads) {
+            if (waiter == thread)
+                return true;
+        }
+    }
+    return false;
+}
+
 // Returns a human-readable reason (and logs it) if any guest thread is
 // currently unsafe to serialize: blocked on something this file doesn't know
 // how to safely redispatch, or -- defensively -- parked somewhere that
@@ -227,7 +247,8 @@ std::string find_unsafe_thread_reason(KernelState &kernel, MemState &mem) {
                 || is_waiting_in(kernel.eventflags, thread)
                 || is_waiting_in(kernel.condvars, thread)
                 || is_waiting_in(kernel.lwcondvars, thread)
-                || is_waiting_in(kernel.simple_events, thread);
+                || is_waiting_in(kernel.simple_events, thread)
+                || is_waiting_for_thread_end(kernel, thread);
             const uint32_t nid = *Ptr<uint32_t>(read_pc(*thread->cpu) + 4).get(mem);
             if (in_known_object || is_safe_self_contained_wait_nid(nid))
                 continue; // supported and safe
@@ -730,8 +751,10 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 continue;
             const ThreadStatePtr &thread = thread_handles[i];
             const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            if (thread->status != ThreadStatus::run)
+            if (thread->status != ThreadStatus::run) {
                 handled[i] = true;
+                LOG_INFO("Savestate: thread {} ({}) settled (status={}).", thread_records[i].id, thread->name, static_cast<int>(thread->status));
+            }
         }
     }
     for (size_t i = 0; i < thread_records.size(); i++) {
