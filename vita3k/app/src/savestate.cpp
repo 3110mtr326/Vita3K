@@ -737,7 +737,11 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 // loop hasn't kicked it, and the settle-check pass below hasn't seen
                 // it stop running either, so nothing has touched it yet -- kick it.
                 reconstructed_wait_count++;
-                LOG_INFO("Savestate: re-dispatching wait for thread {} ({}) at PC 0x{:X}.", rec.id, thread->name, rec.ctx.get_pc() - 4);
+                {
+                    const Ptr<uint32_t> nid_ptr(rec.ctx.get_pc() + 4);
+                    const uint32_t nid = nid_ptr.valid(mem) ? *nid_ptr.get(mem) : 0;
+                    LOG_INFO("Savestate: re-dispatching wait for thread {} ({}) at PC 0x{:X}, NID=0x{:08X}.", rec.id, thread->name, rec.ctx.get_pc() - 4, nid);
+                }
                 thread->update_status(ThreadStatus::run);
                 any_in_flight = true;
             }
