@@ -24,34 +24,61 @@
 // parked several native C++ stack frames deep inside sync_primitives.cpp,
 // and the WaitingThreadData queued for it holds raw pointers into that
 // thread's *native* stack (see kernel/sync_primitives.h). A native call
-// stack cannot be serialized to a file and reconstructed in the general
-// case. What this file does instead, for the specific case of a thread
-// blocked on a semaphore/mutex/event-flag wait, is described by
-// looks_like_parked_import_call()'s comment below: rather than trying to
-// preserve that native stack, the saved CPU context is rewound to the
-// `svc` instruction that dispatched the wait, so that reloading it makes
-// the thread's own run_loop() naturally re-enter the exact same HLE call
-// (kernel::call_import(), already-existing/well-tested code) on its own,
-// freshly-created host thread -- reconstructing an equivalent block without
-// ever touching a native stack at all.
+// stack cannot be serialized to a file and reconstructed once that stack
+// no longer exists -- e.g. after the app has been closed and reopened, or
+// after enough time/gameplay has passed that the thread has moved on to a
+// different call entirely. This file does NOT attempt that in the general
+// case.
+//
+// What it DOES support is narrower, and depends on the thread's native call
+// stack still being the exact same one as when the state was saved: within
+// one continuously-paused session (save, then load again without ever
+// resuming gameplay in between -- e.g. both from the same pause-menu visit),
+// nothing has run, so a thread that was blocked inside e.g. condvar_wait()
+// at save time is *still* sitting in that exact same call, unmoved, on its
+// own still-alive host OS thread, when load_state() runs. Its host thread
+// was never touched by pause_threads() in the first place (see
+// kernel/kernel.cpp: it only suspends threads that were actively running).
+// So rather than trying to serialize or reconstruct that native stack,
+// load_state() leaves a waiting thread's CPU context and native stack alone
+// entirely and just flips its status to `run` (see Pass 2 below) -- the
+// exact same "wake it up" mechanism kernel code already uses for normal
+// signaling (mutex_unlock_impl()'s hand-off, condvar_signal(), ...), which
+// lets the still-live call simply resume and complete on its own, using its
+// own already-correct native locals, and re-block by itself exactly as it
+// would during ordinary play if the wait condition still doesn't hold.
+// (An earlier version of this file instead rewound the saved PC by one
+// instruction, on the theory that call_import()'s dispatch -- kernel/src/
+// thread.cpp -- would unwind back to run_loop()'s own top-level wait before
+// blocking, and reconstructed the wait by making it re-enter via a fresh
+// `svc` trap. That assumption was wrong: these HLE waits block *inside*
+// their own call frame, on the same thread->status_cond run_loop() itself
+// waits on, so a flip to `run` wakes whichever of those is currently
+// parked there -- the live inner call, not run_loop() -- and forcing a
+// second, redundant re-entry via a rewound PC on top of that was the actual
+// source of several hard-to-diagnose crashes.)
 //
 // Consequences and remaining limits:
 //
+//   - This only works within a continuously-paused session as described
+//     above. It is not a substitute for true "save now, close the app, load
+//     hours later" support, which would need a fundamentally different
+//     approach (e.g. switching guest thread scheduling to fibers/coroutines,
+//     as e.g. RPCS3 does for the same reason) -- restoring memory and
+//     resuming a live, unmodified native thread are very different
+//     operations, and only the latter is what makes this narrower case work.
 //   - save_state() refuses (ErrorThreadNotSafe) if any guest thread is
-//     currently blocked on anything OTHER than a semaphore, mutex, or event
-//     flag wait -- e.g. sceKernelDelayThread, a vblank wait, a thread join,
-//     RWLock/Condvar/Timer/MsgPipe. The same redispatch mechanism plausibly
-//     also reconstructs those correctly (they are dispatched via the same
-//     `svc` convention), but that isn't verified here, and getting this
-//     wrong risks a hang or crash on load rather than a mere save failure
-//     -- so it stays conservative and requires supported cases only. It
-//     also refuses if the parked instruction doesn't match the expected
-//     import-stub pattern at all (see looks_like_parked_import_call()),
-//     which should not happen but is checked rather than assumed, since a
-//     wrong assumption here corrupts the guest's execution on load, not
-//     just this file.
-//   - Only Semaphore / Mutex / EventFlag dynamic values are captured,
-//     matching the set of wait reasons save_state() will actually accept.
+//     currently blocked on anything OTHER than a semaphore, mutex, event
+//     flag, condvar/lwcondvar, simple event (sceKernelWaitEvent), a thread
+//     join (sceKernelWaitThreadEnd), sceKernelDelayThread(200), or
+//     sceAudioOutOutput -- see has_unsafe_thread()'s doc comment for why
+//     each of those specifically is treated as safe. Unrecognized cases
+//     (RWLock, Timer, MsgPipe, a vblank wait, ...) are refused rather than
+//     assumed safe, since getting this wrong risks a hang or crash on load
+//     rather than a mere save failure.
+//   - Only Semaphore / Mutex / EventFlag / SimpleEvent dynamic values are
+//     captured; Condvar/lwcondvar have none to capture (see
+//     is_waiting_in()'s doc comment).
 //   - GXM/renderer state (in-flight command buffers, render targets) is not
 //     captured. The screen may show one incorrect/incomplete frame right
 //     after loading a state before the game's own render loop corrects it.
@@ -59,7 +86,7 @@
 //     the running session as when the state was saved. It does not attempt
 //     to recreate threads that have since exited, nor kill threads that
 //     were spawned after the save. This is a different problem from the
-//     wait-reconstruction above: it's about recreating a thread's initial
+//     wait handling above: it's about recreating a thread's initial
 //     HLE-call stack from nothing (thread creation bookkeeping, TLS, initial
 //     args), not resuming an existing one, and is out of scope here.
 //
@@ -611,19 +638,34 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         for (const auto &rec : thread_records) {
             ThreadStatePtr thread = kernel.threads[rec.id];
             thread_handles.push_back(thread);
-            CPUContext ctx = rec.ctx;
+
             if (static_cast<ThreadStatus>(rec.status) == ThreadStatus::wait) {
-                // Rewind PC by one ARM instruction (4 bytes), from the import stub's
-                // `mov pc, lr` landmark back to the `svc #0` right before it (see
-                // looks_like_parked_import_call()'s comment above). Pass 2 below then
-                // just resumes the thread normally; dynarmic will re-trap that `svc`,
-                // and kernel/src/thread.cpp's existing `if (cpu->svc_called)` handling
-                // re-dispatches the exact same HLE call from scratch -- reconstructing
-                // the wait via ordinary, already-correct code instead of anything
-                // savestate-specific.
-                ctx.set_pc(ctx.get_pc() - 4);
+                // Deliberately NOT restoring CPU context (or anything else) here for a
+                // waiting thread. Earlier versions of this file rewound its saved PC by
+                // one instruction and expected Pass 2 to make it re-enter the wait via
+                // a fresh `svc` trap -- but that assumed call_import()'s dispatch
+                // (kernel/src/thread.cpp) unwinds back to run_loop()'s own top-level
+                // wait before blocking. It doesn't: sceKernelWaitLwCond/sceKernelDelayThread/etc
+                // all block *inside* their own C++ call frame, on thread->status_cond,
+                // same as run_loop() itself waits on. Flipping status to `run` wakes
+                // whichever of those is *currently* parked on that condition variable --
+                // which, for a thread still sitivity blocked since the state was saved
+                // (this session was paused throughout, so its native call stack is
+                // exactly as it was at save time), is that inner, still-live HLE call,
+                // not run_loop(). It simply resumes and completes on its own from
+                // there, using its own already-correct locals -- so writing new CPU
+                // register/PC values here would at best be ignored until much later
+                // (when this call finally returns and unwinds back to run_loop(), which
+                // only then calls run(*cpu) again) and at worst, combined with the PC
+                // rewind, cause that later run(*cpu) to re-execute the same `svc` a
+                // second time after the call it belongs to has already completed.
+                // Restoring the relevant sync object's own value below is still
+                // correct and worth doing (e.g. so a semaphore reflects the saved
+                // count) -- this only skips the *thread's own* CPU state.
+                continue;
             }
-            load_context(*thread->cpu, ctx);
+
+            load_context(*thread->cpu, rec.ctx);
             write_tpidruro(*thread->cpu, rec.tpidruro);
             thread->start_tick = rec.start_tick;
             thread->last_vblank_waited = rec.last_vblank_waited;
@@ -671,14 +713,16 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     // - This goes through update_status() (under the thread's own mutex), not
     //   a bare field write, so a thread parked in run_loop()'s
     //   status_cond.wait() is actually woken back up.
-    // - A saved `wait` status is a special case: its CPU context was already
-    //   rewound to the `svc` in Pass 1, and what we set it to *here* is `run`,
-    //   not `wait` -- this briefly wakes its run_loop(), which re-enters the
-    //   exact HLE call it was blocked in (kernel/src/thread.cpp's existing
-    //   `if (cpu->svc_called)` handling), and that call itself re-blocks
-    //   (settling status back to `wait` on its own) almost immediately, since
-    //   the semaphore/mutex/event-flag/condvar data it re-checks was already
-    //   restored above. The *recorded* pending-resume target,
+    // - A saved `wait` status is a special case: its CPU context was
+    //   deliberately left untouched in Pass 1 (see that loop's comment), and
+    //   what we set it to *here* is `run`, not `wait` -- this wakes whatever
+    //   is currently parked on thread->status_cond, which, for a thread that
+    //   has been blocked since the state was saved, is the still-live native
+    //   call it was already inside (e.g. condvar_wait()'s handle_timeout()),
+    //   not run_loop(). That call simply resumes and completes on its own
+    //   from there and re-blocks by itself if it needs to, same as it would
+    //   during normal play -- nothing here re-enters or redispatches
+    //   anything. The *recorded* pending-resume target,
     //   `pending_resume_updates`, is still `wait`, not `run`: the `run` here
     //   is only a transient kick, not the thread's real target status.
     //
@@ -712,58 +756,71 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     // only ever kicked once, the first time this loop (or another thread's
     // side effect) is observed moving it out of `wait`.
     //
-    // This runs as a poll loop over every wait-origin thread rather than one
-    // thread at a time, so a chain of hand-offs several threads deep -- awoken
-    // by an earlier thread's redispatch, itself resolving quickly and handing
-    // off to a third -- keeps getting picked up regardless of which of them
-    // this loop happens to reach first, instead of only being able to react
-    // to the *one specific thread* an earlier design's status_cond.wait_for()
-    // would have been scoped to.
+    // This is a genuinely single-file-at-a-time loop, not "kick everyone still
+    // untouched, then wait": an earlier version of this scanned and kicked
+    // every not-yet-handled thread found still `wait` within one pass before
+    // ever sleeping/waiting, which meant several threads could still end up
+    // kicked within the same round and briefly run at once -- exactly the
+    // concurrent-execution hazard this whole design exists to avoid. Here,
+    // each outer iteration kicks (at most) one thread, then drain_running()
+    // blocks until *nothing* in the managed set is `run` -- including
+    // anything that iteration's kick cascaded into via a hand-off -- before
+    // the outer loop is allowed to even look at kicking another one.
     std::vector<bool> handled(thread_records.size(), false);
     int reconstructed_wait_count = 0;
-    bool any_in_flight = true;
-    for (int round = 0; any_in_flight && round < 500; round++) { // hard cap: 500 * 20ms = 10s
-        any_in_flight = false;
-        for (size_t i = 0; i < thread_records.size(); i++) {
-            const auto &rec = thread_records[i];
-            if (static_cast<ThreadStatus>(rec.status) != ThreadStatus::wait || handled[i])
-                continue;
-            const ThreadStatePtr &thread = thread_handles[i];
-            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            if (thread->status == ThreadStatus::run) {
-                any_in_flight = true; // kicked (by us or a hand-off) but not yet settled
-            } else {
-                // status == wait and handled[i] is still false (checked above): this
-                // loop hasn't kicked it, and the settle-check pass below hasn't seen
-                // it stop running either, so nothing has touched it yet -- kick it.
-                reconstructed_wait_count++;
-                {
-                    const Ptr<uint32_t> nid_ptr(rec.ctx.get_pc() + 4);
-                    const uint32_t nid = nid_ptr.valid(mem) ? *nid_ptr.get(mem) : 0;
-                    LOG_INFO("Savestate: re-dispatching wait for thread {} ({}) at PC 0x{:X}, NID=0x{:08X}.", rec.id, thread->name, rec.ctx.get_pc() - 4, nid);
+
+    // Blocks (polling, bounded by an overall deadline) until every wait-origin
+    // thread is observed to be something other than `run`. Marks each such
+    // thread `handled` as soon as it's seen settled, whichever thread's kick
+    // (or hand-off cascade) it settled as a side effect of -- this is what
+    // lets a hand-off chain several threads deep still be picked up correctly
+    // without the outer loop needing to know about it explicitly.
+    const auto drain_running = [&](std::chrono::steady_clock::time_point deadline) {
+        for (;;) {
+            bool any_running = false;
+            for (size_t k = 0; k < thread_records.size(); k++) {
+                if (static_cast<ThreadStatus>(thread_records[k].status) != ThreadStatus::wait || handled[k])
+                    continue;
+                const ThreadStatePtr &t = thread_handles[k];
+                const std::lock_guard<std::mutex> l(t->mutex);
+                if (t->status == ThreadStatus::run) {
+                    any_running = true;
+                } else {
+                    handled[k] = true;
+                    LOG_INFO("Savestate: thread {} ({}) settled (status={}).", thread_records[k].id, t->name, static_cast<int>(t->status));
                 }
-                thread->update_status(ThreadStatus::run);
-                any_in_flight = true;
             }
+            if (!any_running)
+                return true;
+            if (std::chrono::steady_clock::now() >= deadline)
+                return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        if (any_in_flight)
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        // Re-check which threads have now settled, so a thread that finished
-        // between the loop above and here isn't kicked a second time next round.
-        for (size_t i = 0; i < thread_records.size(); i++) {
-            if (static_cast<ThreadStatus>(thread_records[i].status) != ThreadStatus::wait || handled[i])
-                continue;
-            const ThreadStatePtr &thread = thread_handles[i];
-            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            if (thread->status != ThreadStatus::run) {
-                handled[i] = true;
-                LOG_INFO("Savestate: thread {} ({}) settled (status={}).", thread_records[i].id, thread->name, static_cast<int>(thread->status));
-            }
-        }
-    }
+    };
+
     for (size_t i = 0; i < thread_records.size(); i++) {
-        if (static_cast<ThreadStatus>(thread_records[i].status) == ThreadStatus::wait && !handled[i])
-            LOG_WARN("Savestate: thread {} ({}) did not settle within 10s after its wait was re-dispatched; continuing anyway.", thread_records[i].id, thread_handles[i]->name);
+        const auto &rec = thread_records[i];
+        if (static_cast<ThreadStatus>(rec.status) != ThreadStatus::wait || handled[i])
+            continue; // already settled as a side effect of an earlier iteration's kick
+
+        const ThreadStatePtr &thread = thread_handles[i];
+        {
+            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+            if (thread->status != ThreadStatus::wait) {
+                // Already running (or already settled and just not yet observed as
+                // `handled` -- drain_running() below will catch either case) as a
+                // side effect of a previous iteration; nothing for us to kick here.
+            } else {
+                reconstructed_wait_count++;
+                const Ptr<uint32_t> nid_ptr(rec.ctx.get_pc() + 4);
+                const uint32_t nid = nid_ptr.valid(mem) ? *nid_ptr.get(mem) : 0;
+                LOG_INFO("Savestate: waking thread {} ({}) parked at PC 0x{:X}, NID=0x{:08X} (was blocked in this call since the state was saved).", rec.id, thread->name, rec.ctx.get_pc(), nid);
+                thread->update_status(ThreadStatus::run);
+            }
+        }
+
+        if (!drain_running(std::chrono::steady_clock::now() + std::chrono::milliseconds(1000)))
+            LOG_WARN("Savestate: one or more threads did not settle within 1000ms after thread {} ({}) was woken; continuing anyway.", rec.id, thread->name);
     }
     if (reconstructed_wait_count > 0)
         LOG_INFO("Savestate: {} thread(s) had their kernel wait re-dispatched on load.", reconstructed_wait_count);
