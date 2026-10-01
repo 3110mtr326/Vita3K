@@ -23,6 +23,9 @@
 #include <util/lock_and_find.h>
 #include <util/log.h>
 
+#include <algorithm>
+#include <utility>
+
 static constexpr bool LOG_SYNC_PRIMITIVES = false;
 
 // ***********
@@ -81,34 +84,44 @@ inline static int handle_timeout(KernelState &kernel, const ThreadStatePtr &thre
     std::unique_lock<std::mutex> &primitive_lock, WaitingThreadQueuePtr &queue,
     const ThreadDataQueueInterator<WaitingThreadData> &data_it, const char *export_name,
     SceUInt *const timeout) {
+    // A wait can also end because a savestate load asked this thread to abort
+    // (thread->abort_wait). In that case the thread is still `wait` and still
+    // queued, so it is handled exactly like a timeout: unregister and fail.
+    const auto should_wake = [&] { return thread->should_stop_waiting(); };
+    const auto give_up = [&](bool report_zero_timeout) {
+        if (report_zero_timeout && timeout)
+            *timeout = 0; // Time run out, so remaining time is 0
+
+        thread_lock.lock();
+        thread->update_status(ThreadStatus::run, ThreadStatus::wait);
+        thread_lock.unlock();
+
+        queue->erase(data_it);
+
+        return RET_ERROR(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+    };
+
     if (timeout) {
         bool status = false;
         auto start = std::chrono::steady_clock::now();
         if (*timeout > 0) {
-            status = thread->status_cond.wait_for(primitive_lock, std::chrono::microseconds{ *timeout }, [&] { return thread->status == ThreadStatus::run; });
+            status = thread->status_cond.wait_for(primitive_lock, std::chrono::microseconds{ *timeout }, should_wake);
         }
 
-        if (!status) {
-            *timeout = 0; // Time run out, so remaining time is 0
+        if (!status || thread->status != ThreadStatus::run)
+            return give_up(true);
 
-            thread_lock.lock();
-            thread->update_status(ThreadStatus::run, ThreadStatus::wait);
-            thread_lock.unlock();
-
-            queue->erase(data_it);
-
-            return RET_ERROR(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+        auto end = std::chrono::steady_clock::now();
+        uint32_t real_timeout = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+        if (real_timeout > *timeout) {
+            *timeout = 0;
         } else {
-            auto end = std::chrono::steady_clock::now();
-            uint32_t real_timeout = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
-            if (real_timeout > *timeout) {
-                *timeout = 0;
-            } else {
-                *timeout = *timeout - real_timeout;
-            }
+            *timeout = *timeout - real_timeout;
         }
     } else {
-        thread->status_cond.wait(primitive_lock, [&] { return thread->status == ThreadStatus::run; });
+        thread->status_cond.wait(primitive_lock, should_wake);
+        if (thread->status != ThreadStatus::run)
+            return give_up(false);
     }
 
     return SCE_KERNEL_OK;
@@ -1246,8 +1259,15 @@ int condvar_wait(KernelState &kernel, MemState &mem, const char *export_name, Sc
 
     std::unique_lock<std::mutex> condition_variable_lock(condvar->mutex);
 
-    if (auto error = mutex_unlock_impl(kernel, export_name, thread_id, 1, condvar->associated_mutex))
-        return error;
+    // After a savestate load, this call is being re-executed for a thread that
+    // was already inside it (mutex released, queued on the condvar) when the
+    // state was saved; the mutex state loaded from the savestate already
+    // reflects that release.
+    const bool skip_unlock = std::exchange(thread->restore_skip_condvar_unlock, false);
+    if (!skip_unlock) {
+        if (auto error = mutex_unlock_impl(kernel, export_name, thread_id, 1, condvar->associated_mutex))
+            return error;
+    }
 
     std::unique_lock<std::mutex> thread_lock(thread->mutex);
     thread->update_status(ThreadStatus::wait, ThreadStatus::run);

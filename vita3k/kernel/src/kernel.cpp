@@ -214,6 +214,15 @@ void KernelState::set_pending_resume_status(SceUID thread_id, ThreadStatus statu
         it->second = status;
 }
 
+bool KernelState::get_pending_resume_status(SceUID thread_id, ThreadStatus &status_out) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    const auto it = paused_threads_status.find(thread_id);
+    if (it == paused_threads_status.end())
+        return false;
+    status_out = it->second;
+    return true;
+}
+
 void KernelState::resume_threads() {
     const std::lock_guard<std::mutex> lock(mutex);
     for (auto &[_, thread] : threads) {

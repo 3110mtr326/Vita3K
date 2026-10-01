@@ -16,95 +16,72 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 // ---------------------------------------------------------------------------
-// Scope of this implementation (please read before extending)
+// How savestates work here (please read before extending)
 // ---------------------------------------------------------------------------
 // Vita3K runs every guest (emulated) thread on its own real host OS thread.
-// When a guest thread is blocked inside a kernel wait (sceKernelWaitSema,
-// sceKernelLockMutex, sceKernelWaitEventFlag, ...), that host thread is
-// parked several native C++ stack frames deep inside sync_primitives.cpp,
-// and the WaitingThreadData queued for it holds raw pointers into that
-// thread's *native* stack (see kernel/sync_primitives.h). A native call
-// stack cannot be serialized to a file and reconstructed once that stack
-// no longer exists -- e.g. after the app has been closed and reopened, or
-// after enough time/gameplay has passed that the thread has moved on to a
-// different call entirely. This file does NOT attempt that in the general
-// case.
+// A guest thread blocked in a kernel wait (sceKernelWaitSema, sceKernelLockMutex,
+// sceKernelWaitEventFlag, sceKernelWaitCond, ...) is parked several native
+// C++ frames deep inside sync_primitives.cpp, and the queue entry registered
+// for it holds raw pointers into that native stack. That native stack cannot
+// be serialized, and it cannot be "rewound" to the state it had at save time
+// either, so a thread that has moved on since the state was saved can not
+// simply be woken up (earlier versions of this file tried exactly that:
+// flipping the thread to `run` makes the blocked call return as if the wait
+// had succeeded, which silently corrupts the game).
 //
-// What it DOES support is narrower, and depends on the thread's native call
-// stack still being the exact same one as when the state was saved: within
-// one continuously-paused session (save, then load again without ever
-// resuming gameplay in between -- e.g. both from the same pause-menu visit),
-// nothing has run, so a thread that was blocked inside e.g. condvar_wait()
-// at save time is *still* sitting in that exact same call, unmoved, on its
-// own still-alive host OS thread, when load_state() runs. Its host thread
-// was never touched by pause_threads() in the first place (see
-// kernel/kernel.cpp: it only suspends threads that were actively running).
-// So rather than trying to serialize or reconstruct that native stack,
-// load_state() leaves a waiting thread's CPU context and native stack alone
-// entirely and just flips its status to `run` (see Pass 2 below) -- the
-// exact same "wake it up" mechanism kernel code already uses for normal
-// signaling (mutex_unlock_impl()'s hand-off, condvar_signal(), ...), which
-// lets the still-live call simply resume and complete on its own, using its
-// own already-correct native locals, and re-block by itself exactly as it
-// would during ordinary play if the wait condition still doesn't hold.
-// (An earlier version of this file instead rewound the saved PC by one
-// instruction, on the theory that call_import()'s dispatch -- kernel/src/
-// thread.cpp -- would unwind back to run_loop()'s own top-level wait before
-// blocking, and reconstructed the wait by making it re-enter via a fresh
-// `svc` trap. That assumption was wrong: these HLE waits block *inside*
-// their own call frame, on the same thread->status_cond run_loop() itself
-// waits on, so a flip to `run` wakes whichever of those is currently
-// parked there -- the live inner call, not run_loop() -- and forcing a
-// second, redundant re-entry via a rewound PC on top of that was the actual
-// source of several hard-to-diagnose crashes.)
+// What this file does instead is *unwind* instead of resume:
+//
+//   save:  every guest thread is either parked in a supported kernel wait
+//          (semaphore, mutex, lw mutex, event flag, condvar, lw condvar,
+//          simple event, sceKernelWaitThreadEnd, sceKernelDelayThread,
+//          sceAudioOutOutput), suspended by the pause menu, or dormant. For
+//          every thread its CPU context is stored. A thread in a wait is
+//          always stopped on the `mov pc, lr` word of the import stub
+//          (`svc #0` is the word right before it), which is verified.
+//
+//   load:  1. every thread is brought to a standstill (see request_restore_suspend()
+//             in kernel/thread_state.h): a thread blocked in a kernel wait is made
+//             to abort that wait -- handle_timeout() and friends treat it like a
+//             timeout, unregister the thread from the object's wait queue and
+//             return to run_loop() -- and a thread that is running guest code is
+//             halted. All of them end up parked as ThreadStatus::suspend.
+//          2. guest memory is overwritten with the saved memory.
+//          3. each thread's CPU context is replaced by the saved one. For a
+//             thread that was in a kernel wait the PC is moved back by one
+//             instruction, onto the `svc #0`, so that when the thread runs again
+//             it simply executes that system call again from scratch, on its own
+//             (now empty) native stack, and blocks again if the wait condition
+//             still holds. (Condvar waits are special: the original call had
+//             already released the associated mutex, so the re-executed call
+//             is told to skip that step -- see ThreadState::restore_skip_condvar_unlock.)
+//          4. semaphore / mutex / event flag / simple event values are restored.
+//          5. nothing is started here: the session stays paused, and the
+//             threads are resumed by KernelState::resume_threads() when the pause
+//             menu is closed, using the pending-resume statuses set at the end of
+//             load_state().
 //
 // Consequences and remaining limits:
 //
-//   - This only works within a continuously-paused session as described
-//     above. It is not a substitute for true "save now, close the app, load
-//     hours later" support, which would need a fundamentally different
-//     approach (e.g. switching guest thread scheduling to fibers/coroutines,
-//     as e.g. RPCS3 does for the same reason) -- restoring memory and
-//     resuming a live, unmodified native thread are very different
-//     operations, and only the latter is what makes this narrower case work.
 //   - save_state() refuses (ErrorThreadNotSafe) if any guest thread is
-//     currently blocked on anything OTHER than a semaphore, mutex, event
-//     flag, condvar/lwcondvar, simple event (sceKernelWaitEvent), a thread
-//     join (sceKernelWaitThreadEnd), sceKernelDelayThread(200), or
-//     sceAudioOutOutput -- see has_unsafe_thread()'s doc comment for why
-//     each of those specifically is treated as safe. Unrecognized cases
-//     (RWLock, Timer, MsgPipe, a vblank wait, ...) are refused rather than
-//     assumed safe, since getting this wrong risks a hang or crash on load
-//     rather than a mere save failure.
-//   - Only Semaphore / Mutex / EventFlag / SimpleEvent dynamic values are
-//     captured; Condvar/lwcondvar have none to capture (see
-//     is_waiting_in()'s doc comment).
-//   - GXM/renderer state (in-flight command buffers, render targets) is not
-//     captured. The screen may show one incorrect/incomplete frame right
-//     after loading a state before the game's own render loop corrects it.
-//   - load_state() requires the exact same set of thread UIDs to exist in
-//     the running session as when the state was saved. It does not attempt
-//     to recreate threads that have since exited, nor kill threads that
-//     were spawned after the save. This is a different problem from the
-//     wait handling above: it's about recreating a thread's initial
-//     HLE-call stack from nothing (thread creation bookkeeping, TLS, initial
-//     args), not resuming an existing one, and is out of scope here.
+//     blocked on anything else (RWLock, Timer, MsgPipe, vblank wait, ...), is
+//     still running guest code, or is inside a guest callback. load_state()
+//     applies the same check to the *current* session, since those waits can
+//     not be aborted either. A refusal is just a "try again in a moment".
+//   - Only values of semaphores, mutexes, lw mutexes, event flags and simple
+//     events are saved. RWLock/Timer/MsgPipe contents, the memory allocator's
+//     own bookkeeping, GXM/renderer state and audio/FMOD host-side state are
+//     not. The first frame after loading may be wrong, and a state saved
+//     right before the game frees or allocates memory may misbehave.
+//   - load_state() requires the exact same set of thread UIDs as when the
+//     state was saved (ErrorThreadSetChanged otherwise).
+//   - If load_state() fails after it has started stopping threads (for
+//     example because a thread does not stop within a few seconds), the
+//     session may no longer be consistent and should be restarted.
 //
-// None of this is a fundamental limitation of Vita3K -- it is a consequence
-// of the thread-per-guest-thread design. A guest thread genuinely stuck deep
-// in unrecoverable native-stack territory (anything not dispatched through
-// call_import the way described above) still can't be saved; the only fully
-// general fix for that remains switching guest thread scheduling to
-// fibers/coroutines (as e.g. RPCS3 does for the same reason), which is a
-// much larger, separate change.
-//
-// Pausing: KernelState::pause_threads()/resume_threads() (see kernel/kernel.cpp)
-// record each thread's pre-pause status in a single, non-stacking map, so a
-// second nested pause_threads() call while already paused overwrites that
-// bookkeeping instead of composing with it. Rather than duplicate/fix that
-// bookkeeping here, save_state()/load_state() simply require the caller to
-// have already paused the session (typically via AppSessionController, which
-// itself calls kernel.pause_threads()) and refuse with ErrorNotPaused if not.
+// Pausing: KernelState::pause_threads()/resume_threads() record each thread's
+// pre-pause status in a single, non-stacking map, so save_state()/load_state()
+// require the caller to have already paused the session (typically via
+// AppSessionController) and refuse with ErrorNotPaused if not.
 // ---------------------------------------------------------------------------
 
 #include <app/savestate.h>
@@ -121,6 +98,7 @@
 #include <fmt/format.h>
 
 #include <chrono>
+#include <map>
 #include <cstdint>
 #include <cstring>
 #include <thread>
@@ -131,7 +109,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 2; // v2: added SimpleEvent records (sceKernelWaitEvent)
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 3; // v3: re-executed waits (resume status, condvar flag), lw mutex records
 
 template <typename T>
 void write_pod(fs::ofstream &out, const T &value) {
@@ -251,13 +229,29 @@ bool is_waiting_for_thread_end(const KernelState &kernel, const ThreadStatePtr &
 }
 
 // Returns a human-readable reason (and logs it) if any guest thread is
-// currently unsafe to serialize: blocked on something this file doesn't know
-// how to safely redispatch, or -- defensively -- parked somewhere that
-// doesn't match looks_like_parked_import_call()'s expectations at all.
-// Returns an empty string if every thread is safe.
-std::string find_unsafe_thread_reason(KernelState &kernel, MemState &mem) {
+// currently unsafe to save (for_load == false) or to unwind (for_load ==
+// true): blocked on something this file can not abort and re-execute, parked
+// somewhere that does not match looks_like_parked_import_call(), or inside a
+// guest callback. Returns an empty string if every thread is fine.
+//
+// A thread that is still running guest code is refused when saving (the
+// caller should retry once it is parked), but accepted when loading, where
+// load_state() halts it itself.
+std::string find_unsafe_thread_reason(KernelState &kernel, MemState &mem, bool for_load) {
     const std::lock_guard<std::mutex> lock(kernel.mutex);
     for (auto &[id, thread] : kernel.threads) {
+        if (thread->get_call_level() > 1) {
+            const std::string reason = fmt::format("thread {} ('{}') is inside a guest callback", id, thread->name);
+            LOG_WARN("Savestate: {}, cannot {} right now.", reason, for_load ? "load" : "save");
+            return reason;
+        }
+
+        if (thread->status == ThreadStatus::run && !for_load) {
+            const std::string reason = fmt::format("thread {} ('{}') is still running", id, thread->name);
+            LOG_WARN("Savestate: {}, cannot save right now.", reason);
+            return reason;
+        }
+
         if (thread->status != ThreadStatus::wait)
             continue;
 
@@ -271,6 +265,7 @@ std::string find_unsafe_thread_reason(KernelState &kernel, MemState &mem) {
         } else {
             const bool in_known_object = is_waiting_in(kernel.semaphores, thread)
                 || is_waiting_in(kernel.mutexes, thread)
+                || is_waiting_in(kernel.lwmutexes, thread)
                 || is_waiting_in(kernel.eventflags, thread)
                 || is_waiting_in(kernel.condvars, thread)
                 || is_waiting_in(kernel.lwcondvars, thread)
@@ -283,7 +278,7 @@ std::string find_unsafe_thread_reason(KernelState &kernel, MemState &mem) {
                 "thread {} ('{}') is waiting on unsupported call NID=0x{:08X}",
                 id, thread->name, nid);
         }
-        LOG_WARN("Savestate: {}, cannot save right now.", reason);
+        LOG_WARN("Savestate: {}, cannot {} right now.", reason, for_load ? "load" : "save");
         return reason;
     }
     return {};
@@ -292,11 +287,37 @@ std::string find_unsafe_thread_reason(KernelState &kernel, MemState &mem) {
 struct ThreadRecord {
     SceUID id;
     uint8_t status;
+    // Status KernelState::resume_threads() would give the thread back (what it had before the pause).
+    uint8_t resume_status;
+    // 1 if the thread was blocked in sceKernelWaitCond / sceKernelWaitLwCond.
+    uint8_t in_condvar;
     CPUContext ctx;
     uint32_t tpidruro;
     uint64_t start_tick;
     uint64_t last_vblank_waited;
     uint32_t returned_value;
+};
+
+// Plain-data copies of the sync object values that are saved/restored.
+struct SemaRecord {
+    SceUID uid;
+    int32_t val, max, init_val;
+};
+struct MutexRecord {
+    SceUID uid;
+    int32_t lock_count, init_count;
+    SceUID owner_id; // -1 if unlocked
+};
+struct EventFlagRecord {
+    SceUID uid;
+    int32_t flags;
+};
+struct SimpleEventRecord {
+    SceUID uid;
+    uint32_t pattern;
+    uint64_t last_user_data;
+    uint8_t auto_reset;
+    uint8_t cb_wakeup_only;
 };
 
 } // namespace
@@ -330,7 +351,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     if (!kernel.is_threads_paused())
         return SaveStateResult::ErrorNotPaused;
 
-    if (auto reason = find_unsafe_thread_reason(kernel, mem); !reason.empty()) {
+    if (auto reason = find_unsafe_thread_reason(kernel, mem, false); !reason.empty()) {
         if (out_detail)
             *out_detail = std::move(reason);
         return SaveStateResult::ErrorThreadNotSafe;
@@ -339,32 +360,30 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     // Collect everything into memory first so we only hold the kernel lock
     // briefly, then write to disk afterwards (and resume threads either way).
     std::vector<ThreadRecord> thread_records;
-    struct SemaRecord {
-        SceUID uid;
-        int32_t val, max, init_val;
-    };
-    struct MutexRecord {
-        SceUID uid;
-        int32_t lock_count, init_count;
-        SceUID owner_id; // -1 if unlocked
-    };
-    struct EventFlagRecord {
-        SceUID uid;
-        int32_t flags;
-    };
-    struct SimpleEventRecord {
-        SceUID uid;
-        uint32_t pattern;
-        uint64_t last_user_data;
-        uint8_t auto_reset;
-        uint8_t cb_wakeup_only;
-    };
     std::vector<SemaRecord> sema_records;
     std::vector<MutexRecord> mutex_records;
     std::vector<EventFlagRecord> eventflag_records;
     std::vector<SimpleEventRecord> simple_event_records;
+    std::vector<MutexRecord> lwmutex_records;
 
     LOG_INFO("Savestate: collecting kernel state...");
+
+    // KernelState::get_pending_resume_status() takes kernel.mutex itself, so
+    // gather these before holding it below.
+    std::map<SceUID, ThreadStatus> resume_statuses;
+    {
+        std::vector<SceUID> ids;
+        {
+            const std::lock_guard<std::mutex> lock(kernel.mutex);
+            for (auto &[id, thread] : kernel.threads)
+                ids.push_back(id);
+        }
+        for (const SceUID id : ids) {
+            ThreadStatus st;
+            if (kernel.get_pending_resume_status(id, st))
+                resume_statuses[id] = st;
+        }
+    }
     int waiting_thread_count = 0;
     {
         const std::lock_guard<std::mutex> lock(kernel.mutex);
@@ -373,6 +392,9 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             ThreadRecord rec{};
             rec.id = id;
             rec.status = static_cast<uint8_t>(thread->status);
+            const auto resume_it = resume_statuses.find(id);
+            rec.resume_status = static_cast<uint8_t>(resume_it != resume_statuses.end() ? resume_it->second : ThreadStatus::run);
+            rec.in_condvar = (is_waiting_in(kernel.condvars, thread) || is_waiting_in(kernel.lwcondvars, thread)) ? 1 : 0;
             if (thread->status == ThreadStatus::wait)
                 waiting_thread_count++;
             rec.ctx = save_context(*thread->cpu);
@@ -387,6 +409,8 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             sema_records.push_back({ uid, sema->val, sema->max, sema->init_val });
         for (auto &[uid, mutex] : kernel.mutexes)
             mutex_records.push_back({ uid, mutex->lock_count, mutex->init_count, mutex->owner ? mutex->owner->id : -1 });
+        for (auto &[uid, mutex] : kernel.lwmutexes)
+            lwmutex_records.push_back({ uid, mutex->lock_count, mutex->init_count, mutex->owner ? mutex->owner->id : -1 });
         for (auto &[uid, ef] : kernel.eventflags)
             eventflag_records.push_back({ uid, ef->flags });
         for (auto &[uid, ev] : kernel.simple_events)
@@ -476,6 +500,9 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     write_pod(out, static_cast<uint32_t>(simple_event_records.size()));
     for (const auto &rec : simple_event_records)
         write_pod(out, rec);
+    write_pod(out, static_cast<uint32_t>(lwmutex_records.size()));
+    for (const auto &rec : lwmutex_records)
+        write_pod(out, rec);
 
     const bool ok = static_cast<bool>(out);
     out.close();
@@ -563,114 +590,164 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         return true;
     };
 
-    struct SemaRecord {
-        SceUID uid;
-        int32_t val, max, init_val;
-    };
-    struct MutexRecord {
-        SceUID uid;
-        int32_t lock_count, init_count;
-        SceUID owner_id;
-    };
-    struct EventFlagRecord {
-        SceUID uid;
-        int32_t flags;
-    };
-    struct SimpleEventRecord {
-        SceUID uid;
-        uint32_t pattern;
-        uint64_t last_user_data;
-        uint8_t auto_reset;
-        uint8_t cb_wakeup_only;
-    };
     std::vector<SemaRecord> sema_records;
     std::vector<MutexRecord> mutex_records;
     std::vector<EventFlagRecord> eventflag_records;
     std::vector<SimpleEventRecord> simple_event_records;
-    if (!read_records(sema_records) || !read_records(mutex_records) || !read_records(eventflag_records) || !read_records(simple_event_records))
+    std::vector<MutexRecord> lwmutex_records;
+    if (!read_records(sema_records) || !read_records(mutex_records) || !read_records(eventflag_records) || !read_records(simple_event_records)
+        || !read_records(lwmutex_records))
         return SaveStateResult::ErrorIO;
 
     if (!kernel.is_threads_paused())
         return SaveStateResult::ErrorNotPaused;
 
-    if (auto reason = find_unsafe_thread_reason(kernel, mem); !reason.empty()) {
+    // A waiting thread is restored by re-executing its `svc #0`, which sits one
+    // instruction before the saved PC. That only works for ARM-mode import stubs;
+    // save_state() only ever stores such threads, so anything else is a corrupt
+    // or incompatible file.
+    for (const auto &rec : thread_records) {
+        if (static_cast<ThreadStatus>(rec.status) == ThreadStatus::wait && ((rec.ctx.cpsr & 0x20) != 0 || rec.ctx.get_pc() < 4))
+            return SaveStateResult::ErrorMismatch;
+    }
+
+    // The set of threads must be identical -- see the file header comment.
+    std::vector<ThreadStatePtr> thread_handles; // parallel to thread_records
+    {
+        const std::lock_guard<std::mutex> lock(kernel.mutex);
+        if (kernel.threads.size() != thread_records.size())
+            return SaveStateResult::ErrorThreadSetChanged;
+        thread_handles.reserve(thread_records.size());
+        for (const auto &rec : thread_records) {
+            const auto it = kernel.threads.find(rec.id);
+            if (it == kernel.threads.end())
+                return SaveStateResult::ErrorThreadSetChanged;
+            thread_handles.push_back(it->second);
+        }
+    }
+
+    // Nothing has been touched so far, so refusing here is free. Threads that
+    // are blocked in something that can not be aborted must be refused now,
+    // before the first one is disturbed.
+    if (auto reason = find_unsafe_thread_reason(kernel, mem, true); !reason.empty()) {
         if (out_detail)
             *out_detail = std::move(reason);
         return SaveStateResult::ErrorThreadNotSafe;
     }
 
-    // Threads whose live status we changed below, together with the status they
-    // should be restored to by the *next* resume_threads() call. Applied after
-    // releasing kernel.mutex (set_pending_resume_status() takes it itself).
-    std::vector<std::pair<SceUID, ThreadStatus>> pending_resume_updates;
-    // ThreadStatePtr handles collected in Pass 1 (parallel to thread_records, same
-    // order/indices), so Pass 2 below can run *without* kernel.mutex held -- see
-    // its own comment for why that matters.
-    std::vector<ThreadStatePtr> thread_handles;
+    // ---- Step 1: bring every thread to a standstill (suspend or dormant) ----
+    // A thread blocked in a kernel wait aborts it and unregisters itself from
+    // the object's wait queue; a thread running guest code is halted. This is
+    // polled, and the request repeated every round, because a wake-up that
+    // arrives just before the thread blocks can be missed.
+    const auto quiesce_start = std::chrono::steady_clock::now();
+    const auto quiesce_deadline = quiesce_start + std::chrono::milliseconds(5000);
+    std::vector<bool> flagged(thread_handles.size(), false);
+    for (;;) {
+        bool all_parked = true;
+        for (size_t i = 0; i < thread_handles.size(); i++) {
+            const ThreadStatePtr &thread = thread_handles[i];
+            ThreadStatus st;
+            {
+                const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+                st = thread->status;
+            }
+            if (st == ThreadStatus::wait || st == ThreadStatus::run) {
+                all_parked = false;
+                flagged[i] = true;
+                thread->request_restore_suspend();
+            }
+        }
+        if (all_parked)
+            break;
+        if (std::chrono::steady_clock::now() >= quiesce_deadline) {
+            for (size_t i = 0; i < thread_handles.size(); i++) {
+                if (flagged[i])
+                    thread_handles[i]->clear_restore_requests();
+            }
+            for (size_t i = 0; i < thread_handles.size(); i++) {
+                const ThreadStatePtr &thread = thread_handles[i];
+                const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+                if (thread->status == ThreadStatus::wait || thread->status == ThreadStatus::run) {
+                    const std::string reason = fmt::format("thread {} ('{}') did not stop within 5 seconds (status={})",
+                        thread->id, thread->name, static_cast<int>(thread->status));
+                    LOG_ERROR("Savestate: {}; the session may be inconsistent now, restart the game.", reason);
+                    if (out_detail)
+                        *out_detail = reason + " -- the session may be inconsistent now, restart the game";
+                    return SaveStateResult::ErrorThreadNotSafe;
+                }
+            }
+            return SaveStateResult::ErrorThreadNotSafe;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    for (size_t i = 0; i < thread_handles.size(); i++) {
+        if (flagged[i])
+            thread_handles[i]->clear_restore_requests();
+    }
+    LOG_INFO("Savestate: all {} thread(s) stopped in {} ms.", thread_handles.size(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - quiesce_start).count());
 
+    // ---- Step 2: memory ----
+    // Every guest thread is parked now, so nothing else is touching guest
+    // memory through the CPU, and the translated-code cache is dropped for
+    // the restored ranges in case any of them held code.
+    for (const auto &region : pending_regions) {
+        if (region.bytes.empty())
+            continue;
+        std::memcpy(&mem.memory[region.addr], region.bytes.data(), region.bytes.size());
+        kernel.invalidate_jit_cache(region.addr, region.bytes.size());
+    }
+
+    // ---- Step 3: CPU contexts and thread status ----
+    int reexecuted_wait_count = 0;
+    std::vector<std::pair<SceUID, ThreadStatus>> pending_resume_updates;
+    pending_resume_updates.reserve(thread_records.size());
+    for (size_t i = 0; i < thread_records.size(); i++) {
+        const ThreadRecord &rec = thread_records[i];
+        const ThreadStatePtr &thread = thread_handles[i];
+        const auto saved_status = static_cast<ThreadStatus>(rec.status);
+
+        CPUContext ctx = rec.ctx;
+        thread->restore_skip_condvar_unlock = false;
+        if (saved_status == ThreadStatus::wait) {
+            // Execute the `svc #0` in front of the saved PC again.
+            ctx.set_pc(rec.ctx.get_pc() - 4);
+            thread->restore_skip_condvar_unlock = rec.in_condvar != 0;
+            reexecuted_wait_count++;
+            const Ptr<uint32_t> nid_ptr(rec.ctx.get_pc() + 4);
+            LOG_INFO("Savestate: thread {} ({}) will re-execute its wait (saved PC 0x{:X}, NID=0x{:08X}{}).", rec.id, thread->name,
+                rec.ctx.get_pc(), nid_ptr.valid(mem) ? *nid_ptr.get(mem) : 0, rec.in_condvar ? ", condvar" : "");
+        }
+        load_context(*thread->cpu, ctx);
+        write_tpidruro(*thread->cpu, rec.tpidruro);
+        thread->start_tick = rec.start_tick;
+        thread->last_vblank_waited = rec.last_vblank_waited;
+        thread->returned_value = rec.returned_value;
+
+        // `live` is what the thread is set to now; `pending` is what
+        // resume_threads() will turn it into when the pause menu closes.
+        ThreadStatus live = ThreadStatus::suspend;
+        ThreadStatus pending = ThreadStatus::run;
+        if (saved_status == ThreadStatus::dormant) {
+            live = ThreadStatus::dormant;
+            pending = ThreadStatus::dormant;
+        } else if (saved_status != ThreadStatus::wait) {
+            const auto resume_status = static_cast<ThreadStatus>(rec.resume_status);
+            if (resume_status == ThreadStatus::dormant || resume_status == ThreadStatus::suspend)
+                pending = resume_status;
+        }
+        {
+            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+            if (thread->status != live)
+                thread->update_status(live);
+        }
+        pending_resume_updates.emplace_back(rec.id, pending);
+    }
+
+    // ---- Step 4: synchronization object values ----
     {
         const std::lock_guard<std::mutex> lock(kernel.mutex);
-
-        // Refuse if the set of thread UIDs differs -- see the file header comment
-        // for why we do not attempt to recreate/destroy threads here.
-        if (kernel.threads.size() != thread_records.size())
-            return SaveStateResult::ErrorThreadSetChanged;
-        for (const auto &rec : thread_records) {
-            if (kernel.threads.find(rec.id) == kernel.threads.end())
-                return SaveStateResult::ErrorThreadSetChanged;
-        }
-
-        // Apply memory first (thread stacks/TLS live in it too).
-        for (const auto &region : pending_regions) {
-            if (!region.bytes.empty())
-                std::memcpy(&mem.memory[region.addr], region.bytes.data(), region.bytes.size());
-        }
-
-        // Pass 1: restore every thread's CPU context and every sync object's value,
-        // but *without* touching thread status yet. update_status(run) can wake a
-        // thread's host OS thread immediately (see below), and once that happens it
-        // runs concurrently with the rest of this loop -- so every other thread's
-        // registers and every semaphore/mutex/event flag it might touch must already
-        // be in their final, loaded state first. This mirrors resume_threads()'s own
-        // one-lock, sequential-resume design, just with the data restore ordered
-        // ahead of it.
-        thread_handles.reserve(thread_records.size());
-        for (const auto &rec : thread_records) {
-            ThreadStatePtr thread = kernel.threads[rec.id];
-            thread_handles.push_back(thread);
-
-            if (static_cast<ThreadStatus>(rec.status) == ThreadStatus::wait) {
-                // Deliberately NOT restoring CPU context (or anything else) here for a
-                // waiting thread. Earlier versions of this file rewound its saved PC by
-                // one instruction and expected Pass 2 to make it re-enter the wait via
-                // a fresh `svc` trap -- but that assumed call_import()'s dispatch
-                // (kernel/src/thread.cpp) unwinds back to run_loop()'s own top-level
-                // wait before blocking. It doesn't: sceKernelWaitLwCond/sceKernelDelayThread/etc
-                // all block *inside* their own C++ call frame, on thread->status_cond,
-                // same as run_loop() itself waits on. Flipping status to `run` wakes
-                // whichever of those is *currently* parked on that condition variable --
-                // which, for a thread still sitivity blocked since the state was saved
-                // (this session was paused throughout, so its native call stack is
-                // exactly as it was at save time), is that inner, still-live HLE call,
-                // not run_loop(). It simply resumes and completes on its own from
-                // there, using its own already-correct locals -- so writing new CPU
-                // register/PC values here would at best be ignored until much later
-                // (when this call finally returns and unwinds back to run_loop(), which
-                // only then calls run(*cpu) again) and at worst, combined with the PC
-                // rewind, cause that later run(*cpu) to re-execute the same `svc` a
-                // second time after the call it belongs to has already completed.
-                // Restoring the relevant sync object's own value below is still
-                // correct and worth doing (e.g. so a semaphore reflects the saved
-                // count) -- this only skips the *thread's own* CPU state.
-                continue;
-            }
-
-            load_context(*thread->cpu, rec.ctx);
-            write_tpidruro(*thread->cpu, rec.tpidruro);
-            thread->start_tick = rec.start_tick;
-            thread->last_vblank_waited = rec.last_vblank_waited;
-            thread->returned_value = rec.returned_value;
-        }
 
         for (const auto &rec : sema_records) {
             auto it = kernel.semaphores.find(rec.uid);
@@ -680,14 +757,19 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 it->second->init_val = rec.init_val;
             }
         }
-        for (const auto &rec : mutex_records) {
-            auto it = kernel.mutexes.find(rec.uid);
-            if (it != kernel.mutexes.end()) {
+        const auto restore_mutexes = [&](const std::vector<MutexRecord> &records, MutexPtrs &mutexes) {
+            for (const auto &rec : records) {
+                auto it = mutexes.find(rec.uid);
+                if (it == mutexes.end())
+                    continue;
                 it->second->lock_count = rec.lock_count;
                 it->second->init_count = rec.init_count;
-                it->second->owner = (rec.owner_id != -1 && kernel.threads.count(rec.owner_id)) ? kernel.threads[rec.owner_id] : nullptr;
+                const auto owner_it = rec.owner_id != -1 ? kernel.threads.find(rec.owner_id) : kernel.threads.end();
+                it->second->owner = owner_it != kernel.threads.end() ? owner_it->second : nullptr;
             }
-        }
+        };
+        restore_mutexes(mutex_records, kernel.mutexes);
+        restore_mutexes(lwmutex_records, kernel.lwmutexes);
         for (const auto &rec : eventflag_records) {
             auto it = kernel.eventflags.find(rec.uid);
             if (it != kernel.eventflags.end())
@@ -702,150 +784,20 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 it->second->cb_wakeup_only = rec.cb_wakeup_only;
             }
         }
-
-    } // release kernel.mutex -- see Pass 2's own comment for why this must
-      // happen before it runs, not just before the whole function returns.
-
-    // Pass 2: now that all data is in place, flip each thread to its saved
-    // status, one at a time, *without* kernel.mutex held. Two things that are
-    // both essential here:
-    //
-    // - This goes through update_status() (under the thread's own mutex), not
-    //   a bare field write, so a thread parked in run_loop()'s
-    //   status_cond.wait() is actually woken back up.
-    // - A saved `wait` status is a special case: its CPU context was
-    //   deliberately left untouched in Pass 1 (see that loop's comment), and
-    //   what we set it to *here* is `run`, not `wait` -- this wakes whatever
-    //   is currently parked on thread->status_cond, which, for a thread that
-    //   has been blocked since the state was saved, is the still-live native
-    //   call it was already inside (e.g. condvar_wait()'s handle_timeout()),
-    //   not run_loop(). That call simply resumes and completes on its own
-    //   from there and re-blocks by itself if it needs to, same as it would
-    //   during normal play -- nothing here re-enters or redispatches
-    //   anything. The *recorded* pending-resume target,
-    //   `pending_resume_updates`, is still `wait`, not `run`: the `run` here
-    //   is only a transient kick, not the thread's real target status.
-    //
-    // Kicking a thread and moving straight on to the next one, letting them
-    // run concurrently, is NOT safe: a redispatched HLE wait call (e.g.
-    // condvar_wait()) itself needs kernel.mutex and/or other threads' own
-    // mutexes for perfectly ordinary reasons unrelated to savestates (looking
-    // up a sync object, handing a mutex to the next waiter, ...), same as it
-    // would on any other call. If *this* function were still holding
-    // kernel.mutex at that point, the kicked thread would deadlock waiting
-    // for it -- hence releasing it, above, before this loop. And even with
-    // kernel.mutex free, letting every kicked thread run at once reintroduces
-    // a version of the ordering problem Pass 1/Pass 2 already exists to
-    // avoid: several waits that share an underlying mutex/condvar (a common
-    // pattern for e.g. worker-thread pools) can race with each other while
-    // more than one is simultaneously mid-redispatch. So each thread is
-    // kicked, then waited on (via its own status_cond, with a timeout so a
-    // genuinely stuck thread can't hang this call forever) until it settles
-    // to something other than `run`, before moving on to the next one.
-    //
-    // One more wrinkle this has to account for: ordinary kernel code can
-    // itself wake another thread as a side effect -- e.g.
-    // mutex_unlock_impl() (kernel/src/sync_primitives.cpp) directly flips the
-    // next queued waiter to `run` when handing it the mutex, exactly as it
-    // would during normal play. So a thread this loop hasn't gotten to yet
-    // may already be running -- or have already finished running and
-    // re-settled back to `wait`, the *same* status it started at -- purely
-    // as a side effect of an earlier thread's redispatch. Status alone can't
-    // distinguish "never touched" from "already fully handled" in that
-    // second case, so `handled[i]` tracks it explicitly instead: a thread is
-    // only ever kicked once, the first time this loop (or another thread's
-    // side effect) is observed moving it out of `wait`.
-    //
-    // This is a genuinely single-file-at-a-time loop, not "kick everyone still
-    // untouched, then wait": an earlier version of this scanned and kicked
-    // every not-yet-handled thread found still `wait` within one pass before
-    // ever sleeping/waiting, which meant several threads could still end up
-    // kicked within the same round and briefly run at once -- exactly the
-    // concurrent-execution hazard this whole design exists to avoid. Here,
-    // each outer iteration kicks (at most) one thread, then drain_running()
-    // blocks until *nothing* in the managed set is `run` -- including
-    // anything that iteration's kick cascaded into via a hand-off -- before
-    // the outer loop is allowed to even look at kicking another one.
-    std::vector<bool> handled(thread_records.size(), false);
-    int reconstructed_wait_count = 0;
-
-    // Blocks (polling, bounded by an overall deadline) until every wait-origin
-    // thread is observed to be something other than `run`. Marks each such
-    // thread `handled` as soon as it's seen settled, whichever thread's kick
-    // (or hand-off cascade) it settled as a side effect of -- this is what
-    // lets a hand-off chain several threads deep still be picked up correctly
-    // without the outer loop needing to know about it explicitly.
-    const auto drain_running = [&](std::chrono::steady_clock::time_point deadline) {
-        for (;;) {
-            bool any_running = false;
-            for (size_t k = 0; k < thread_records.size(); k++) {
-                if (static_cast<ThreadStatus>(thread_records[k].status) != ThreadStatus::wait || handled[k])
-                    continue;
-                const ThreadStatePtr &t = thread_handles[k];
-                const std::lock_guard<std::mutex> l(t->mutex);
-                if (t->status == ThreadStatus::run) {
-                    any_running = true;
-                } else {
-                    handled[k] = true;
-                    LOG_INFO("Savestate: thread {} ({}) settled (status={}).", thread_records[k].id, t->name, static_cast<int>(t->status));
-                }
-            }
-            if (!any_running)
-                return true;
-            if (std::chrono::steady_clock::now() >= deadline)
-                return false;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-    };
-
-    for (size_t i = 0; i < thread_records.size(); i++) {
-        const auto &rec = thread_records[i];
-        if (static_cast<ThreadStatus>(rec.status) != ThreadStatus::wait || handled[i])
-            continue; // already settled as a side effect of an earlier iteration's kick
-
-        const ThreadStatePtr &thread = thread_handles[i];
-        {
-            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            if (thread->status != ThreadStatus::wait) {
-                // Already running (or already settled and just not yet observed as
-                // `handled` -- drain_running() below will catch either case) as a
-                // side effect of a previous iteration; nothing for us to kick here.
-            } else {
-                reconstructed_wait_count++;
-                const Ptr<uint32_t> nid_ptr(rec.ctx.get_pc() + 4);
-                const uint32_t nid = nid_ptr.valid(mem) ? *nid_ptr.get(mem) : 0;
-                LOG_INFO("Savestate: waking thread {} ({}) parked at PC 0x{:X}, NID=0x{:08X} (was blocked in this call since the state was saved).", rec.id, thread->name, rec.ctx.get_pc(), nid);
-                thread->update_status(ThreadStatus::run);
-            }
-        }
-
-        if (!drain_running(std::chrono::steady_clock::now() + std::chrono::milliseconds(1000)))
-            LOG_WARN("Savestate: one or more threads did not settle within 1000ms after thread {} ({}) was woken; continuing anyway.", rec.id, thread->name);
-    }
-    if (reconstructed_wait_count > 0)
-        LOG_INFO("Savestate: {} thread(s) had their kernel wait re-dispatched on load.", reconstructed_wait_count);
-
-    for (size_t i = 0; i < thread_records.size(); i++) {
-        const auto &rec = thread_records[i];
-        const auto saved_status = static_cast<ThreadStatus>(rec.status);
-        if (saved_status != ThreadStatus::wait) {
-            const ThreadStatePtr &thread = thread_handles[i];
-            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            thread->update_status(saved_status);
-        }
-        pending_resume_updates.emplace_back(rec.id, saved_status);
     }
 
     emuenv.frame_count = static_cast<size_t>(frame_count);
 
-    // Keep the "status to restore on resume" bookkeeping in sync with what we
-    // just loaded, so the eventual resume_threads() call (made by whoever paused
-    // the session, e.g. the pause menu closing) doesn't put a thread back into
-    // its pre-load status instead. See set_pending_resume_status()'s doc comment.
+    // ---- Step 5: pending-resume bookkeeping ----
+    // The session is still paused; the threads are started by whoever resumes
+    // it (the pause menu closing -> KernelState::resume_threads()). Make that
+    // call start exactly the threads that should run, instead of putting them
+    // back into the status they had when the pause began.
     for (const auto &[id, status] : pending_resume_updates)
         kernel.set_pending_resume_status(id, status);
 
-    LOG_INFO("Savestate: loaded {} memory region(s), {} thread(s) from {}.", pending_regions.size(), thread_records.size(), path.string());
+    LOG_INFO("Savestate: loaded {} memory region(s), {} thread(s) ({} will re-execute a kernel wait) from {}.",
+        pending_regions.size(), thread_records.size(), reexecuted_wait_count, path.string());
     return SaveStateResult::Success;
 }
 

@@ -26,6 +26,7 @@
 
 #include <util/lock_and_find.h>
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
@@ -859,8 +860,16 @@ static int wait_thread_end(KernelState &kernel, ThreadStatePtr &waiter, ThreadSt
         target->waiting_threads.push_back(waiter);
     }
     waiter->status_cond.wait(waiter_lock, [&]() {
-        return waiter->status == ThreadStatus::run;
+        return waiter->should_stop_waiting();
     });
+    if (waiter->status != ThreadStatus::run) {
+        // Aborted by a savestate load: unregister from the target and give up.
+        waiter->update_status(ThreadStatus::run);
+        const std::unique_lock<std::mutex> thread_lock(target->mutex);
+        auto &waiters = target->waiting_threads;
+        waiters.erase(std::remove(waiters.begin(), waiters.end(), waiter), waiters.end());
+        return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
+    }
     return 0;
 }
 
@@ -1068,7 +1077,7 @@ static int delay_thread(KernelState &kernel, SceUID thread_id, SceUInt delay_us)
     std::unique_lock<std::mutex> lock(thread->mutex);
     thread->update_status(ThreadStatus::wait);
     thread->status_cond.wait_for(lock, std::chrono::microseconds(delay_us),
-        [&] { return thread->status == ThreadStatus::run; });
+        [&] { return thread->should_stop_waiting(); });
     if (thread->status != ThreadStatus::run)
         thread->update_status(ThreadStatus::run);
     return SCE_KERNEL_OK;

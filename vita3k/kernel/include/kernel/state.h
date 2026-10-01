@@ -200,6 +200,10 @@ struct KernelState {
     // later resume_threads() would incorrectly force the thread back to whatever
     // status it had when the pause began.
     void set_pending_resume_status(SceUID thread_id, ThreadStatus status);
+    // Returns the status the thread had when pause_threads() was last called,
+    // i.e. the one resume_threads() will restore it to. False if paused_threads_status
+    // has no entry for it. Must only be called while paused.
+    bool get_pending_resume_status(SceUID thread_id, ThreadStatus &status_out);
 
     // Kill all guest threads and block until they have exited. Must only be called from a host thread.
     void process_exit();

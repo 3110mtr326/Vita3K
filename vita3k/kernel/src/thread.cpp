@@ -444,6 +444,25 @@ void ThreadState::resume(bool step) {
     }
 }
 
+void ThreadState::request_restore_suspend() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    suspend_requested = true;
+    abort_wait.store(true, std::memory_order_release);
+    if (status == ThreadStatus::run)
+        stop(*cpu);
+    status_cond.notify_all();
+}
+
+void ThreadState::clear_restore_requests() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    suspend_requested = false;
+    abort_wait.store(false, std::memory_order_release);
+}
+
+int ThreadState::get_call_level() const {
+    return call_level;
+}
+
 std::string ThreadState::log_stack_traceback() const {
     constexpr Address START_OFFSET = 0;
     constexpr Address END_OFFSET = 1024;

@@ -23,6 +23,7 @@
 #include <mem/block.h>
 #include <mem/ptr.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <optional>
@@ -109,6 +110,40 @@ struct ThreadState {
     void suspend();
     void resume(bool step = false);
     std::string log_stack_traceback() const;
+
+    // ---- Savestate support (see app/src/savestate.cpp) ----
+    // While true, every savestate-aware kernel wait (sync primitives, delay,
+    // thread-end wait) wakes up early and behaves as if it had timed out: it
+    // unregisters itself from whatever queue it sat in, and returns an error
+    // to the guest. The savestate loader uses this to make a thread blocked
+    // deep inside a native call unwind back to run_loop(), so its CPU context
+    // can then be replaced by the saved one.
+    std::atomic<bool> abort_wait{ false };
+
+    // Set by the savestate loader for a thread that was blocked in
+    // sceKernelWaitCond (or the lw variant) when the state was saved. That
+    // call had already released the associated mutex before it started to
+    // wait, so when the call is re-executed after loading it must not do so
+    // a second time. Consumed by condvar_wait().
+    bool restore_skip_condvar_unlock = false;
+
+    // True when a wait should stop: the thread was woken up normally, or a
+    // savestate load asked it to abort.
+    bool should_stop_waiting() const {
+        return status == ThreadStatus::run || abort_wait.load(std::memory_order_acquire);
+    }
+
+    // Asks this thread to stop at the next opportunity and park as
+    // ThreadStatus::suspend (aborting a kernel wait it is blocked in, or
+    // halting guest code it is running). Safe to call repeatedly; the caller
+    // is expected to poll until the thread has actually left run/wait.
+    void request_restore_suspend();
+    // Clears the flags set by request_restore_suspend(). Only call this once
+    // the thread is parked (suspend/dormant).
+    void clear_restore_requests();
+    // Number of nested run_loop() frames; 1 for a thread that is not inside a
+    // guest callback.
+    int get_call_level() const;
 
 private:
     void push_arguments(const std::vector<uint32_t> &args);
