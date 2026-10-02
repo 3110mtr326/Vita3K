@@ -26,6 +26,10 @@ rewound, so loading a state **unwinds** every thread and restarts its wait:
       from scratch on a clean native stack. Condvar waits skip the "release
       the associated mutex" step (`restore_skip_condvar_unlock`).
    4. Sync object values are restored.
+   4b. Host-side state the game refers to by number is reconciled: read-only
+      open files (guest file descriptors) are closed / re-opened / seeked back
+      to the saved state; kernel objects created or destroyed since the save
+      and GXM object counts are logged.
    5. The pending-resume statuses are set; threads start when the pause
       menu closes (`KernelState::resume_threads()`).
 
@@ -38,4 +42,5 @@ rewound, so loading a state **unwinds** every thread and restarts its wait:
   load can be wrong.
 - The set of thread UIDs must be the same as when the state was saved.
 - If a load fails after threads were stopped, restart the game.
-- Format version 3; states from older builds are rejected.
+- Kernel objects (semaphores, ...) destroyed after the save are not re-created; the game will get errors when it uses them. The log lists them (`changed since the save`).
+- Format version 4; states from older builds are rejected.

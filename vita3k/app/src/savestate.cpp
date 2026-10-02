@@ -92,6 +92,7 @@
 #include <mem/functions.h>
 #include <mem/state.h>
 #include <cpu/functions.h>
+#include <gxm/state.h>
 #include <io/state.h>
 #include <util/log.h>
 
@@ -99,6 +100,7 @@
 
 #include <chrono>
 #include <map>
+#include <set>
 #include <cstdint>
 #include <cstring>
 #include <thread>
@@ -109,7 +111,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 3; // v3: re-executed waits (resume status, condvar flag), lw mutex records
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 4; // v4: host object snapshot (kernel object UIDs, open files, GXM counts)
 
 template <typename T>
 void write_pod(fs::ofstream &out, const T &value) {
@@ -312,6 +314,231 @@ struct EventFlagRecord {
     SceUID uid;
     int32_t flags;
 };
+// Host-side state that lives outside guest memory. The game's memory refers
+// to these things by number (file descriptors, kernel object UIDs), so after
+// loading they have to match what they were when the state was saved.
+struct IoFileRecord {
+    SceUID fd;
+    int32_t open_mode;
+    int64_t offset;
+    std::string vita_loc;
+    std::string translated;
+    std::string sys_loc;
+};
+struct ObjectSetRecord {
+    std::string kind;
+    std::vector<SceUID> uids;
+};
+struct GxmCountsRecord {
+    uint32_t sync_objects, render_targets, deferred_contexts, immediate_context;
+};
+
+template <typename Map>
+ObjectSetRecord collect_object_set(const char *kind, const Map &map) {
+    ObjectSetRecord rec;
+    rec.kind = kind;
+    for (const auto &entry : map)
+        rec.uids.push_back(entry.first);
+    return rec;
+}
+
+std::vector<ObjectSetRecord> collect_kernel_object_sets(KernelState &kernel) {
+    const std::lock_guard<std::mutex> lock(kernel.mutex);
+    return {
+        collect_object_set("semaphores", kernel.semaphores),
+        collect_object_set("mutexes", kernel.mutexes),
+        collect_object_set("lwmutexes", kernel.lwmutexes),
+        collect_object_set("condvars", kernel.condvars),
+        collect_object_set("lwcondvars", kernel.lwcondvars),
+        collect_object_set("eventflags", kernel.eventflags),
+        collect_object_set("simple_events", kernel.simple_events),
+        collect_object_set("timers", kernel.timers),
+        collect_object_set("rwlocks", kernel.rwlocks),
+        collect_object_set("msgpipes", kernel.msgpipes),
+        collect_object_set("callbacks", kernel.callbacks),
+    };
+}
+
+std::vector<IoFileRecord> collect_io_files(IOState &io) {
+    std::vector<IoFileRecord> files;
+    for (const auto &[fd, file] : io.std_files) {
+        if (!file.is_regular_file())
+            continue;
+        IoFileRecord rec;
+        rec.fd = fd;
+        rec.open_mode = file.get_open_mode();
+        rec.offset = static_cast<int64_t>(file.tell());
+        rec.vita_loc = file.get_vita_loc();
+        rec.translated = file.get_translated_path();
+        rec.sys_loc = file.get_system_location().generic_string();
+        files.push_back(std::move(rec));
+    }
+    return files;
+}
+
+GxmCountsRecord collect_gxm_counts(GxmState &gxm) {
+    GxmCountsRecord rec{};
+    {
+        const std::lock_guard<std::mutex> lock(gxm.sync_objects_mutex);
+        rec.sync_objects = static_cast<uint32_t>(gxm.sync_objects.size());
+    }
+    rec.render_targets = static_cast<uint32_t>(gxm.render_targets.size());
+    rec.deferred_contexts = static_cast<uint32_t>(gxm.deferred_contexts.size());
+    rec.immediate_context = gxm.immediate_context;
+    return rec;
+}
+
+bool write_host_state(fs::ofstream &out, const std::vector<IoFileRecord> &io_files,
+    const std::vector<ObjectSetRecord> &object_sets, const GxmCountsRecord &gxm_counts) {
+    write_pod(out, static_cast<uint32_t>(io_files.size()));
+    for (const auto &rec : io_files) {
+        write_pod(out, rec.fd);
+        write_pod(out, rec.open_mode);
+        write_pod(out, rec.offset);
+        write_string(out, rec.vita_loc);
+        write_string(out, rec.translated);
+        write_string(out, rec.sys_loc);
+    }
+    write_pod(out, static_cast<uint32_t>(object_sets.size()));
+    for (const auto &set : object_sets) {
+        write_string(out, set.kind);
+        write_pod(out, static_cast<uint32_t>(set.uids.size()));
+        for (const SceUID uid : set.uids)
+            write_pod(out, uid);
+    }
+    write_pod(out, gxm_counts);
+    return static_cast<bool>(out);
+}
+
+bool read_host_state(fs::ifstream &in, std::vector<IoFileRecord> &io_files,
+    std::vector<ObjectSetRecord> &object_sets, GxmCountsRecord &gxm_counts) {
+    uint32_t count = 0;
+    if (!read_pod(in, count) || count > 100000)
+        return false;
+    io_files.resize(count);
+    for (auto &rec : io_files) {
+        if (!read_pod(in, rec.fd) || !read_pod(in, rec.open_mode) || !read_pod(in, rec.offset)
+            || !read_string(in, rec.vita_loc) || !read_string(in, rec.translated) || !read_string(in, rec.sys_loc))
+            return false;
+    }
+    if (!read_pod(in, count) || count > 1000)
+        return false;
+    object_sets.resize(count);
+    for (auto &set : object_sets) {
+        uint32_t uid_count = 0;
+        if (!read_string(in, set.kind) || !read_pod(in, uid_count) || uid_count > 10000000)
+            return false;
+        set.uids.resize(uid_count);
+        for (auto &uid : set.uids) {
+            if (!read_pod(in, uid))
+                return false;
+        }
+    }
+    return read_pod(in, gxm_counts);
+}
+
+// Brings the host-side state that the game refers to by number back in line
+// with the saved state. Returns a short summary for the log.
+//
+// What is reconciled: read-only open files (the guest's file descriptors).
+// A descriptor the game opened after the save is closed (the saved memory
+// knows nothing about it); a descriptor that was open at save time but was
+// closed afterwards is re-opened at its saved offset; one that is still open
+// gets its saved offset back. Files opened for writing are never touched
+// (re-opening could truncate them).
+//
+// What is only logged: kernel objects (semaphores, ...) that were created or
+// destroyed since the save, and GXM object counts. A game that uses an
+// object destroyed after the save will see errors; see docs/savestate.md.
+std::string reconcile_host_state(EmuEnvState &emuenv, const std::vector<IoFileRecord> &saved_files,
+    const std::vector<ObjectSetRecord> &saved_sets, const GxmCountsRecord &saved_gxm) {
+    int closed = 0, reopened = 0, repositioned = 0, failed = 0, skipped_writable = 0;
+    IOState &io = emuenv.io;
+
+    std::map<SceUID, const IoFileRecord *> saved_by_fd;
+    for (const auto &rec : saved_files)
+        saved_by_fd[rec.fd] = &rec;
+
+    // 1. descriptors that exist now
+    for (auto it = io.std_files.begin(); it != io.std_files.end();) {
+        FileStats &file = it->second;
+        if (!file.is_regular_file() || can_write(file.get_open_mode())) {
+            ++it;
+            continue;
+        }
+        const auto saved_it = saved_by_fd.find(it->first);
+        if (saved_it == saved_by_fd.end() || saved_it->second->sys_loc != file.get_system_location().generic_string()) {
+            it = io.std_files.erase(it);
+            closed++;
+            continue;
+        }
+        if (file.tell() != saved_it->second->offset) {
+            file.seek(saved_it->second->offset, SCE_SEEK_SET);
+            repositioned++;
+        }
+        ++it;
+    }
+
+    // 2. descriptors that were open at save time but are not any more
+    for (const auto &rec : saved_files) {
+        if (can_write(rec.open_mode)) {
+            skipped_writable++;
+            continue;
+        }
+        if (io.std_files.count(rec.fd))
+            continue;
+        FileStats file(rec.vita_loc.c_str(), rec.translated, fs::path(rec.sys_loc), rec.open_mode);
+        if (!file.get_file_pointer()) {
+            LOG_WARN("Savestate: could not re-open fd {} ({})", rec.fd, rec.sys_loc);
+            failed++;
+            continue;
+        }
+        file.seek(rec.offset, SCE_SEEK_SET);
+        io.std_files.emplace(rec.fd, std::move(file));
+        reopened++;
+    }
+    // Never hand out a descriptor number the saved memory could still hold.
+    for (const auto &rec : saved_files) {
+        if (io.next_fd <= rec.fd)
+            io.next_fd = rec.fd + 1;
+    }
+
+    // Kernel object differences (log only)
+    for (const auto &saved : saved_sets) {
+        const std::set<SceUID> saved_uids(saved.uids.begin(), saved.uids.end());
+        const auto now_sets = collect_kernel_object_sets(emuenv.kernel);
+        for (const auto &now : now_sets) {
+            if (now.kind != saved.kind)
+                continue;
+            const std::set<SceUID> now_uids(now.uids.begin(), now.uids.end());
+            std::string created, destroyed;
+            for (const SceUID uid : now_uids) {
+                if (!saved_uids.count(uid))
+                    created += fmt::format(" {}", uid);
+            }
+            for (const SceUID uid : saved_uids) {
+                if (!now_uids.count(uid))
+                    destroyed += fmt::format(" {}", uid);
+            }
+            if (!created.empty() || !destroyed.empty()) {
+                LOG_WARN("Savestate: {} changed since the save: created [{} ], destroyed [{} ] (destroyed ones are gone for good)",
+                    saved.kind, created, destroyed);
+            }
+        }
+    }
+
+    const GxmCountsRecord now_gxm = collect_gxm_counts(emuenv.gxm);
+    if (now_gxm.sync_objects != saved_gxm.sync_objects || now_gxm.render_targets != saved_gxm.render_targets
+        || now_gxm.deferred_contexts != saved_gxm.deferred_contexts || now_gxm.immediate_context != saved_gxm.immediate_context) {
+        LOG_WARN("Savestate: GXM objects changed since the save: sync objects {} -> {}, render targets {} -> {}, deferred contexts {} -> {}, immediate context 0x{:X} -> 0x{:X}",
+            saved_gxm.sync_objects, now_gxm.sync_objects, saved_gxm.render_targets, now_gxm.render_targets,
+            saved_gxm.deferred_contexts, now_gxm.deferred_contexts, saved_gxm.immediate_context, now_gxm.immediate_context);
+    }
+
+    return fmt::format("files: {} closed, {} re-opened, {} repositioned, {} failed, {} writable left alone", closed, reopened,
+        repositioned, failed, skipped_writable);
+}
+
 struct SimpleEventRecord {
     SceUID uid;
     uint32_t pattern;
@@ -365,6 +592,9 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     std::vector<EventFlagRecord> eventflag_records;
     std::vector<SimpleEventRecord> simple_event_records;
     std::vector<MutexRecord> lwmutex_records;
+    const std::vector<IoFileRecord> io_files = collect_io_files(emuenv.io);
+    const std::vector<ObjectSetRecord> object_sets = collect_kernel_object_sets(kernel);
+    const GxmCountsRecord gxm_counts = collect_gxm_counts(emuenv.gxm);
 
     LOG_INFO("Savestate: collecting kernel state...");
 
@@ -503,6 +733,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     write_pod(out, static_cast<uint32_t>(lwmutex_records.size()));
     for (const auto &rec : lwmutex_records)
         write_pod(out, rec);
+    write_host_state(out, io_files, object_sets, gxm_counts);
 
     const bool ok = static_cast<bool>(out);
     out.close();
@@ -595,8 +826,11 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     std::vector<EventFlagRecord> eventflag_records;
     std::vector<SimpleEventRecord> simple_event_records;
     std::vector<MutexRecord> lwmutex_records;
+    std::vector<IoFileRecord> saved_io_files;
+    std::vector<ObjectSetRecord> saved_object_sets;
+    GxmCountsRecord saved_gxm_counts{};
     if (!read_records(sema_records) || !read_records(mutex_records) || !read_records(eventflag_records) || !read_records(simple_event_records)
-        || !read_records(lwmutex_records))
+        || !read_records(lwmutex_records) || !read_host_state(in, saved_io_files, saved_object_sets, saved_gxm_counts))
         return SaveStateResult::ErrorIO;
 
     if (!kernel.is_threads_paused())
@@ -697,6 +931,12 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             continue;
         std::memcpy(&mem.memory[region.addr], region.bytes.data(), region.bytes.size());
         kernel.invalidate_jit_cache(region.addr, region.bytes.size());
+    }
+
+    // ---- Step 2b: host-side state the game refers to by number ----
+    {
+        const std::string summary = reconcile_host_state(emuenv, saved_io_files, saved_object_sets, saved_gxm_counts);
+        LOG_INFO("Savestate: host state reconciled ({}).", summary);
     }
 
     // ---- Step 3: CPU contexts and thread status ----
