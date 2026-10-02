@@ -1350,6 +1350,33 @@ struct SceGxmRenderTarget {
     SceUID driverMemBlock;
 };
 
+namespace gxm {
+
+std::vector<std::pair<uint32_t, uint32_t>> get_host_object_ranges(EmuEnvState &emuenv) {
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    GxmState &gxm = emuenv.gxm;
+
+    if (gxm.immediate_context != 0)
+        ranges.emplace_back(gxm.immediate_context, static_cast<uint32_t>(sizeof(SceGxmContext)));
+    for (const auto &[context, address] : gxm.deferred_contexts)
+        ranges.emplace_back(address, static_cast<uint32_t>(sizeof(SceGxmContext)));
+    for (const auto &[render_target, address] : gxm.render_targets)
+        ranges.emplace_back(address, static_cast<uint32_t>(sizeof(SceGxmRenderTarget)));
+    {
+        const std::lock_guard<std::mutex> lock(gxm.sync_objects_mutex);
+        for (SceGxmSyncObject *sync_object : gxm.sync_objects)
+            ranges.emplace_back(Ptr<SceGxmSyncObject>(sync_object, emuenv.mem).address(), static_cast<uint32_t>(sizeof(SceGxmSyncObject)));
+    }
+    {
+        const std::lock_guard<std::mutex> lock(gxm.host_objects_mutex);
+        for (const auto &[address, size] : gxm.host_objects)
+            ranges.emplace_back(address, size);
+    }
+    return ranges;
+}
+
+} // namespace gxm
+
 static int destroy_gxm_render_target(EmuEnvState &emuenv, SceGxmRenderTarget *render_target, const Address render_target_addr, const bool force_backend_destroy) {
     if (!render_target) {
         return static_cast<int>(SCE_GXM_ERROR_INVALID_POINTER);
@@ -4466,6 +4493,10 @@ static Ptr<T> alloc_callbacked(EmuEnvState &emuenv, SceUID thread_id, const SceG
     }
     T *const memory = ptr.get(emuenv.mem);
     new (memory) T;
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.gxm.host_objects_mutex);
+        emuenv.gxm.host_objects[address] = sizeof(T);
+    }
     return ptr;
 }
 
@@ -4477,6 +4508,10 @@ static Ptr<T> alloc_callbacked(EmuEnvState &emuenv, SceUID thread_id, SceGxmShad
 static void free_callbacked(EmuEnvState &emuenv, SceUID thread_id, SceGxmShaderPatcher *shaderPatcher, Address data) {
     if (!shaderPatcher->params.hostFreeCallback) {
         LOG_ERROR("Empty hostFreeCallback");
+    }
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.gxm.host_objects_mutex);
+        emuenv.gxm.host_objects.erase(data);
     }
     const auto thread = emuenv.kernel.get_thread(thread_id);
     thread->run_callback(shaderPatcher->params.hostFreeCallback.address(), { shaderPatcher->params.userData.address(), data });

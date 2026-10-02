@@ -26,6 +26,10 @@ rewound, so loading a state **unwinds** every thread and restarts its wait:
       from scratch on a clean native stack. Condvar waits skip the "release
       the associated mutex" step (`restore_skip_condvar_unlock`).
    4. Sync object values are restored.
+   2b. GXM objects (contexts, render targets, sync objects, shader patcher,
+      vertex/fragment programs) live in guest memory but contain host
+      pointers and C++ containers. Their bytes are kept as they are now and
+      written back after the memory restore (`gxm::get_host_object_ranges()`).
    4b. Host-side state the game refers to by number is reconciled: read-only
       open files (guest file descriptors) are closed / re-opened / seeked back
       to the saved state; kernel objects created or destroyed since the save

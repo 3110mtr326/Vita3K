@@ -92,6 +92,7 @@
 #include <mem/functions.h>
 #include <mem/state.h>
 #include <cpu/functions.h>
+#include <gxm/functions.h>
 #include <gxm/state.h>
 #include <io/state.h>
 #include <util/log.h>
@@ -926,12 +927,32 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     // Every guest thread is parked now, so nothing else is touching guest
     // memory through the CPU, and the translated-code cache is dropped for
     // the restored ranges in case any of them held code.
+    //
+    // GXM keeps C++ objects (contexts, render targets, sync objects, shader
+    // patchers, vertex/fragment programs) *inside* guest memory. Their bytes
+    // hold host pointers, vtables and containers that are only valid for the
+    // current run, so writing old bytes over them crashes the emulator the
+    // next time the game draws. Remember what they hold now and put it back
+    // after the memory restore.
+    struct KeptRange {
+        Address addr;
+        std::vector<uint8_t> bytes;
+    };
+    std::vector<KeptRange> kept_ranges;
+    for (const auto &[addr, size] : gxm::get_host_object_ranges(emuenv)) {
+        if (size == 0 || !is_valid_addr(mem, addr) || !is_valid_addr(mem, addr + size - 1))
+            continue;
+        kept_ranges.push_back({ addr, std::vector<uint8_t>(&mem.memory[addr], &mem.memory[addr] + size) });
+    }
     for (const auto &region : pending_regions) {
         if (region.bytes.empty())
             continue;
         std::memcpy(&mem.memory[region.addr], region.bytes.data(), region.bytes.size());
         kernel.invalidate_jit_cache(region.addr, region.bytes.size());
     }
+    for (const auto &kept : kept_ranges)
+        std::memcpy(&mem.memory[kept.addr], kept.bytes.data(), kept.bytes.size());
+    LOG_INFO("Savestate: {} GXM host object range(s) kept as they were.", kept_ranges.size());
 
     // ---- Step 2b: host-side state the game refers to by number ----
     {

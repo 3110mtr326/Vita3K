@@ -22,6 +22,8 @@
 #include <array>
 #include <bitset>
 #include <string>
+#include <utility>
+#include <vector>
 
 struct EmuEnvState;
 struct GxmState;
@@ -54,6 +56,12 @@ bool convert_color_format_to_texture_format(SceGxmColorFormat format, SceGxmText
 
 // Transfer
 uint32_t get_bits_per_pixel(SceGxmTransferFormat Format);
+
+// Ranges of guest memory (address, size) that hold GXM objects with host C++
+// members in them (contexts, render targets, sync objects, shader patchers,
+// vertex/fragment programs). Their bytes are only meaningful for the current
+// run of the emulator, so a savestate load must leave them alone.
+std::vector<std::pair<uint32_t, uint32_t>> get_host_object_ranges(EmuEnvState &emuenv);
 
 void destroy_all_contexts(EmuEnvState &emuenv, bool force_backend_destroy);
 void destroy_all_render_targets(EmuEnvState &emuenv, bool force_backend_destroy);

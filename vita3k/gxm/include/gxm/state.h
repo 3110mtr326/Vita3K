@@ -71,6 +71,13 @@ struct GxmState {
     std::mutex sync_objects_mutex;
     std::unordered_set<SceGxmSyncObject *> sync_objects;
 
+    // Objects with C++ members (shader patcher, vertex/fragment programs) that
+    // were placement-new'd into guest memory obtained through the game's own
+    // allocation callbacks: guest address -> size. Savestates must never
+    // overwrite these with old bytes (see gxm::get_host_object_ranges()).
+    std::mutex host_objects_mutex;
+    std::map<Address, uint32_t> host_objects;
+
     std::map<Address, MemoryMapInfo> memory_mapped_regions;
     std::mutex callback_lock;
     Address immediate_context = 0;
@@ -86,6 +93,10 @@ struct GxmState {
             sync_objects.clear();
         }
 
+        {
+            const std::lock_guard<std::mutex> lock(host_objects_mutex);
+            host_objects.clear();
+        }
         memory_mapped_regions.clear();
         display_queue.reset();
         params = {};
