@@ -749,4 +749,5 @@
     <string name="trophy_detail_earned_label">Earned</string>
     <string name="trophy_detail_description_label">Details</string>
     <string name="trophy_not_yet_earned">Not yet earned</string>
+    <string name="emulation_state_operation_in_progress">Saving or loading state… Please wait.</string>
 </resources>

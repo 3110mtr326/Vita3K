@@ -284,7 +284,7 @@ void ThreadState::run_loop() {
 
             lock.lock();
 
-            if (do_step || suspend_requested || hit_breakpoint(*cpu)) {
+            if (do_step || suspend_requested || (restore_wait_barrier && cpu->svc_called) || hit_breakpoint(*cpu)) {
                 suspend_requested = false;
                 update_status(ThreadStatus::suspend);
             }
@@ -457,6 +457,25 @@ void ThreadState::clear_restore_requests() {
     const std::lock_guard<std::mutex> lock(mutex);
     suspend_requested = false;
     abort_wait.store(false, std::memory_order_release);
+    restore_wait_barrier = false;
+}
+
+void ThreadState::replay_restore_wait() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    assert(status == ThreadStatus::suspend);
+    restore_wait_barrier = true;
+    single_stepping = false;
+    update_status(ThreadStatus::run);
+}
+
+void ThreadState::resume_after_pause(const bool should_run) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    const bool replayed_wait = restore_wait_barrier;
+    restore_wait_barrier = false;
+    if ((should_run || replayed_wait) && (status == ThreadStatus::suspend || status == ThreadStatus::dormant)) {
+        single_stepping = false;
+        update_status(ThreadStatus::run);
+    }
 }
 
 int ThreadState::get_call_level() const {

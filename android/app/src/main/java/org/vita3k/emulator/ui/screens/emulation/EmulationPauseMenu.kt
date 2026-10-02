@@ -384,6 +384,19 @@ private fun PauseDrawer(
     onShowHelp: (SettingsHelpEntry) -> Unit
 ) {
     val uiState = sessionViewModel.uiState
+    if (uiState.isStateOperationInProgress) {
+        Surface(shape = RoundedCornerShape(20.dp)) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                androidx.compose.material3.CircularProgressIndicator()
+                Text(stringResource(R.string.emulation_state_operation_in_progress))
+            }
+        }
+        return
+    }
+
     val scrollState = rememberScrollState()
 
     LaunchedEffect(uiState.statusMessage) {
@@ -610,7 +623,7 @@ private fun SessionTab(
         ) {
             OutlinedButton(
                 onClick = { sessionViewModel.saveState(context, slot = 0) },
-                enabled = uiState.isPaused,
+                enabled = uiState.isPaused && !uiState.isStateOperationInProgress,
                 modifier = Modifier.weight(1f)
             ) {
                 Icon(Icons.Default.Save, contentDescription = null)
@@ -619,7 +632,7 @@ private fun SessionTab(
             }
             OutlinedButton(
                 onClick = { sessionViewModel.loadState(context, slot = 0) },
-                enabled = uiState.isPaused && remember(uiState.showMenu, uiState.statusMessage) {
+                enabled = uiState.isPaused && !uiState.isStateOperationInProgress && remember(uiState.showMenu, uiState.stateOperationRevision) {
                     sessionViewModel.hasSaveState(slot = 0)
                 },
                 modifier = Modifier.weight(1f)

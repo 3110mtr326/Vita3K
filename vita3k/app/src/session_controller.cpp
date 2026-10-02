@@ -17,6 +17,7 @@
 
 #include <app/functions.h>
 #include <app/session_controller.h>
+#include <app/savestate.h>
 
 #include <audio/state.h>
 #include <ctrl/state.h>
@@ -139,6 +140,11 @@ bool AppSessionController::set_pause_reason(const AppSessionPauseReason reason, 
     if (current_phase.load(std::memory_order_relaxed) != AppSessionPhase::Running)
         return false;
 
+    // The menu owns the pause during an operation. Background pause changes
+    // may still be recorded, but must not inspect/mutate the kernel mid-restore.
+    if (savestate_in_progress && reason == AppSessionPauseReason::Menu && !enabled)
+        return false;
+
     const uint32_t mask = to_pause_mask(reason);
     const uint32_t current_reasons = active_pause_reasons.load(std::memory_order_relaxed);
     const uint32_t next_reasons = enabled
@@ -148,7 +154,8 @@ bool AppSessionController::set_pause_reason(const AppSessionPauseReason reason, 
         return true;
 
     active_pause_reasons.store(next_reasons, std::memory_order_release);
-    apply_runtime_state_locked();
+    if (!savestate_in_progress)
+        apply_runtime_state_locked();
     return true;
 }
 
@@ -161,8 +168,43 @@ bool AppSessionController::set_input_intercepted(const bool enabled) {
         return true;
 
     input_intercepted = enabled;
-    apply_runtime_state_locked();
+    if (!savestate_in_progress)
+        apply_runtime_state_locked();
     return true;
+}
+
+std::string AppSessionController::perform_savestate(const int slot, const bool load) {
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (current_phase.load(std::memory_order_relaxed) != AppSessionPhase::Running)
+            return "No running session";
+        if (slot < 0)
+            return "Invalid savestate slot";
+        if (savestate_in_progress)
+            return "A save/load operation is already in progress";
+        if (!(active_pause_reasons.load(std::memory_order_relaxed) & to_pause_mask(AppSessionPauseReason::Menu)))
+            return "Pause the game from the menu before saving or loading";
+        savestate_in_progress = true;
+    }
+
+    // This is a scope guard, not ownership of the controller. stop() waits
+    // for it before destroying the session; exceptions release it as well.
+    const auto finish = [this](AppSessionController *) {
+        std::lock_guard<std::mutex> lock(mutex);
+        savestate_in_progress = false;
+        if (current_phase.load(std::memory_order_relaxed) == AppSessionPhase::Running)
+            apply_runtime_state_locked();
+        savestate_finished.notify_all();
+    };
+    const std::unique_ptr<AppSessionController, decltype(finish)> guard(this, finish);
+
+    const auto path = get_savestate_path(emuenv, slot);
+    std::string detail;
+    const auto result = load ? load_state(emuenv, path, &detail) : save_state(emuenv, path, &detail);
+    if (result == SaveStateResult::Success)
+        return {};
+    const std::string message = save_state_result_to_string(result);
+    return detail.empty() ? message : message + ": " + detail;
 }
 
 void AppSessionController::stop(const AppSessionStopReason reason) {
@@ -172,7 +214,7 @@ void AppSessionController::stop(const AppSessionStopReason reason) {
     bool app_started = false;
 
     {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(mutex);
         const AppSessionPhase phase = current_phase.load(std::memory_order_relaxed);
         if (phase == AppSessionPhase::Idle || phase == AppSessionPhase::Stopping)
             return;
@@ -182,6 +224,9 @@ void AppSessionController::stop(const AppSessionStopReason reason) {
         runtime_was_initialized = runtime_initialized;
         app_started = phase == AppSessionPhase::Running;
         set_phase(AppSessionPhase::Stopping);
+        // Do not destroy memory, threads or files while the IO worker uses them.
+        // wait() releases mutex, allowing the worker's scope guard to finish.
+        savestate_finished.wait(lock, [this] { return !savestate_in_progress; });
     }
 
     const bool needs_renderer_cleanup = renderer_was_initialized || active_frame_host.has_value();

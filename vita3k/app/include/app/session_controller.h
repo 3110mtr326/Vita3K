@@ -21,6 +21,7 @@
 #include <renderer/state.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -62,6 +63,9 @@ public:
     bool load_and_run();
     bool set_pause_reason(AppSessionPauseReason reason, bool enabled);
     bool set_input_intercepted(bool enabled);
+    // Serializes savestate work with session teardown. Disk I/O runs without
+    // holding mutex, so Android lifecycle pause notifications stay responsive.
+    std::string perform_savestate(int slot, bool load);
     void stop(AppSessionStopReason reason = AppSessionStopReason::UserRequest);
 
 private:
@@ -71,6 +75,8 @@ private:
 
     EmuEnvState &emuenv;
     mutable std::mutex mutex;
+    std::condition_variable savestate_finished;
+    bool savestate_in_progress = false; // protected by mutex
     std::atomic<AppSessionPhase> current_phase{ AppSessionPhase::Idle };
     std::optional<std::reference_wrapper<renderer::FrameHost>> frame_host;
     AppLaunchRequest active_launch_request;

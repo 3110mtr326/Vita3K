@@ -226,8 +226,12 @@ bool KernelState::get_pending_resume_status(SceUID thread_id, ThreadStatus &stat
 void KernelState::resume_threads() {
     const std::lock_guard<std::mutex> lock(mutex);
     for (auto &[_, thread] : threads) {
-        if (paused_threads_status[thread->id] == ThreadStatus::run)
-            thread->resume();
+        // A replayed wait may still be blocked, or may have completed and
+        // parked at the barrier. Only the latter needs an explicit wake-up.
+        // Do this under the thread lock so a completion racing menu close
+        // either sees the cleared barrier or is resumed here, never stranded.
+        const auto pending = paused_threads_status.find(thread->id);
+        thread->resume_after_pause(pending != paused_threads_status.end() && pending->second == ThreadStatus::run);
     }
     paused_threads_status.clear();
 }

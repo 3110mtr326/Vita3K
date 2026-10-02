@@ -55,10 +55,11 @@
 //             already released the associated mutex, so the re-executed call
 //             is told to skip that step -- see ThreadState::restore_skip_condvar_unlock.)
 //          4. semaphore / mutex / event flag / simple event values are restored.
-//          5. nothing is started here: the session stays paused, and the
-//             threads are resumed by KernelState::resume_threads() when the pause
-//             menu is closed, using the pending-resume statuses set at the end of
-//             load_state().
+//          5. saved waits are re-entered behind restore_wait_barrier before
+//             ordinary guest code can run. A completed wait parks at its HLE
+//             return boundary; a blocked wait has re-registered its queue entry.
+//          6. KernelState::resume_threads() releases that barrier when the pause
+//             menu closes. Blocked waits are not spuriously signaled.
 //
 // Consequences and remaining limits:
 //
@@ -70,8 +71,9 @@
 //   - Only values of semaphores, mutexes, lw mutexes, event flags and simple
 //     events are saved. RWLock/Timer/MsgPipe contents, the memory allocator's
 //     own bookkeeping, GXM/renderer state and audio/FMOD host-side state are
-//     not. The first frame after loading may be wrong, and a state saved
-//     right before the game frees or allocates memory may misbehave.
+//     not. Preserving current GXM host objects prevents stale C++ pointers
+//     from being copied over them, but does not restore their logical state.
+//     Freezes and corruption are possible, not just a bad first frame.
 //   - load_state() requires the exact same set of thread UIDs as when the
 //     state was saved (ErrorThreadSetChanged otherwise).
 //   - If load_state() fails after it has started stopping threads (for
@@ -916,10 +918,8 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    for (size_t i = 0; i < thread_handles.size(); i++) {
-        if (flagged[i])
-            thread_handles[i]->clear_restore_requests();
-    }
+    for (const auto &thread : thread_handles)
+        thread->clear_restore_requests();
     LOG_INFO("Savestate: all {} thread(s) stopped in {} ms.", thread_handles.size(),
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - quiesce_start).count());
 
@@ -1049,15 +1049,54 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
 
     emuenv.frame_count = static_cast<size_t>(frame_count);
 
-    // ---- Step 5: pending-resume bookkeeping ----
-    // The session is still paused; the threads are started by whoever resumes
-    // it (the pause menu closing -> KernelState::resume_threads()). Make that
-    // call start exactly the threads that should run, instead of putting them
-    // back into the status they had when the pause began.
+    // ---- Step 5: rebuild waits before allowing ordinary guest execution ----
+    // Starting all threads together loses condvar signals: a runnable producer
+    // may signal before a restored waiter has re-entered its (empty) queue.
+    // Each saved waiter executes only its import call. It either blocks again,
+    // or parks at the syscall return boundary. The barrier remains set until
+    // the menu resumes the session, including for waits that time out meanwhile.
+    for (size_t i = 0; i < thread_records.size(); ++i) {
+        if (static_cast<ThreadStatus>(thread_records[i].status) == ThreadStatus::wait)
+            thread_handles[i]->replay_restore_wait();
+    }
+    const auto replay_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+        bool all_registered = true;
+        for (size_t i = 0; i < thread_records.size(); ++i) {
+            if (static_cast<ThreadStatus>(thread_records[i].status) != ThreadStatus::wait)
+                continue;
+            const auto &thread = thread_handles[i];
+            const std::lock_guard<std::mutex> lock(thread->mutex);
+            if (thread->status == ThreadStatus::run)
+                all_registered = false;
+        }
+        if (all_registered)
+            break;
+        if (std::chrono::steady_clock::now() >= replay_deadline) {
+            LOG_ERROR("Savestate: rebuilding wait queues timed out; restart the game.");
+            if (out_detail)
+                *out_detail = "rebuilding wait queues timed out -- restart the game";
+            return SaveStateResult::ErrorThreadNotSafe;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    for (size_t i = 0; i < thread_records.size(); ++i) {
+        if (static_cast<ThreadStatus>(thread_records[i].status) != ThreadStatus::wait)
+            continue;
+        const auto &thread = thread_handles[i];
+        const std::lock_guard<std::mutex> lock(thread->mutex);
+        LOG_INFO("Savestate: rebuilt wait for thread {} ({}): status={}, PC=0x{:X}.",
+            thread->id, thread->name, static_cast<int>(thread->status), read_pc(*thread->cpu));
+    }
+
+    // ---- Step 6: pending-resume bookkeeping ----
+    // The session is still paused; ordinary guest execution starts when the
+    // pause menu closes. resume_threads() also releases the replay barrier,
+    // leaving still-blocked waits queued and waking those that completed early.
     for (const auto &[id, status] : pending_resume_updates)
         kernel.set_pending_resume_status(id, status);
 
-    LOG_INFO("Savestate: loaded {} memory region(s), {} thread(s) ({} will re-execute a kernel wait) from {}.",
+    LOG_INFO("Savestate: loaded {} memory region(s), {} thread(s) ({} kernel waits rebuilt before resume) from {}.",
         pending_regions.size(), thread_records.size(), reexecuted_wait_count, path.string());
     return SaveStateResult::Success;
 }

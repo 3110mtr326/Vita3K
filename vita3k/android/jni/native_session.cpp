@@ -172,83 +172,45 @@ Java_org_vita3k_emulator_NativeLib_submitIme(JNIEnv *, jclass) {
     return submitted ? JNI_TRUE : JNI_FALSE;
 }
 
-// Save/load state requires the session to already be paused (i.e. called while
-// the pause menu, which sets AppSessionPauseReason::Menu, is showing). See the
-// large comment at the top of app/src/savestate.cpp for why these functions do
-// not pause the session themselves, and for the "not any guest thread may be
-// mid-syscall" limitation that saveState() below can fail on.
-//
-// Both return an empty string on success, or a human-readable reason on
-// failure (from app::save_state_result_to_string(), plus a couple of cases
-// -- like the emulator/session not being ready -- that never reach that
-// function). Surfacing the *specific* reason in the UI, rather than a single
-// generic "failed" message, is what lets a report from someone without
-// developer tools (no logcat access) actually be diagnosable.
+// Called by the Android IO worker. The controller keeps the paused session
+// alive and serializes save/load with stop(), without blocking lifecycle calls
+// on disk I/O. Return an empty string on success, or the failure detail.
 JNIEXPORT jstring JNICALL
 Java_org_vita3k_emulator_NativeLib_saveState(JNIEnv *env, jclass, jint slot) {
-    auto *emuenv = get_emuenv();
     auto *controller = get_app_session_controller();
-    if (!emuenv)
-        return env->NewStringUTF("No running session (emuenv is null)");
-    if (!controller || !controller->is_running())
-        return env->NewStringUTF("No running session (controller not running)");
-    if (!controller->is_paused())
-        return env->NewStringUTF("Session is not paused");
-
-    const auto path = app::get_savestate_path(*emuenv, static_cast<int>(slot));
-    std::string detail;
-    // A crash inside save_state() (a real memory-access violation) can't be
-    // caught here -- that terminates the process outright -- but this at
-    // least turns an ordinary C++ exception into a visible error message
-    // instead of an unexplained crash.
+    if (!controller)
+        return env->NewStringUTF("No running session");
     try {
-        const auto result = app::save_state(*emuenv, path, &detail);
-        if (result != app::SaveStateResult::Success) {
-            // Append the extra diagnostic (thread id/name, why it was judged
-            // unrecoverable) when there is one, so this is diagnosable from just
-            // the on-screen message -- see save_state()'s out_detail doc comment.
-            const std::string msg = detail.empty()
-                ? app::save_state_result_to_string(result)
-                : fmt::format("{}: {}", app::save_state_result_to_string(result), detail);
-            LOG_ERROR("saveState(slot={}) failed: {}", slot, msg);
-            return env->NewStringUTF(msg.c_str());
-        }
-        return env->NewStringUTF("");
+        const std::string error = controller->perform_savestate(static_cast<int>(slot), false);
+        if (!error.empty())
+            LOG_ERROR("saveState(slot={}) failed: {}", slot, error);
+        return env->NewStringUTF(error.c_str());
     } catch (const std::exception &e) {
-        const std::string msg = fmt::format("threw an exception: {}", e.what());
-        LOG_ERROR("saveState(slot={}) {}", slot, msg);
-        return env->NewStringUTF(msg.c_str());
+        const std::string error = fmt::format("saveState threw an exception: {}", e.what());
+        LOG_ERROR("{}", error);
+        return env->NewStringUTF(error.c_str());
+    } catch (...) {
+        return env->NewStringUTF("saveState threw an unknown exception");
     }
 }
 
 JNIEXPORT jstring JNICALL
 Java_org_vita3k_emulator_NativeLib_loadState(JNIEnv *env, jclass, jint slot) {
-    auto *emuenv = get_emuenv();
     auto *controller = get_app_session_controller();
-    if (!emuenv)
-        return env->NewStringUTF("No running session (emuenv is null)");
-    if (!controller || !controller->is_running())
-        return env->NewStringUTF("No running session (controller not running)");
-    if (!controller->is_paused())
-        return env->NewStringUTF("Session is not paused");
-
-    const auto path = app::get_savestate_path(*emuenv, static_cast<int>(slot));
-    std::string detail;
+    if (!controller)
+        return env->NewStringUTF("No running session");
     try {
-        const auto result = app::load_state(*emuenv, path, &detail);
-        if (result != app::SaveStateResult::Success) {
-            const std::string msg = detail.empty()
-                ? app::save_state_result_to_string(result)
-                : fmt::format("{}: {}", app::save_state_result_to_string(result), detail);
-            LOG_ERROR("loadState(slot={}) failed: {}", slot, msg);
-            return env->NewStringUTF(msg.c_str());
-        }
+        const std::string error = controller->perform_savestate(static_cast<int>(slot), true);
+        if (!error.empty())
+            LOG_ERROR("loadState(slot={}) failed: {}", slot, error);
+        return env->NewStringUTF(error.c_str());
     } catch (const std::exception &e) {
-        const std::string msg = fmt::format("threw an exception: {}", e.what());
-        LOG_ERROR("loadState(slot={}) {}", slot, msg);
-        return env->NewStringUTF(msg.c_str());
+        const std::string error = fmt::format("loadState threw an exception: {}", e.what());
+        LOG_ERROR("{}", error);
+        return env->NewStringUTF(error.c_str());
+    } catch (...) {
+        return env->NewStringUTF("loadState threw an unknown exception");
     }
-    return env->NewStringUTF("");
 }
 
 JNIEXPORT jboolean JNICALL

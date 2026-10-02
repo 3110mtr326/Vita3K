@@ -141,6 +141,12 @@ struct ThreadState {
     // Clears the flags set by request_restore_suspend(). Only call this once
     // the thread is parked (suspend/dormant).
     void clear_restore_requests();
+    // Rebuild a saved wait before any ordinary guest code resumes. If the
+    // syscall returns early, run_loop parks at its return boundary instead.
+    void replay_restore_wait();
+    void resume_after_pause(bool should_run);
+    // Protected by mutex; cleared by KernelState::resume_threads().
+    bool restore_wait_barrier = false;
     // Number of nested run_loop() frames; 1 for a thread that is not inside a
     // guest callback.
     int get_call_level() const;

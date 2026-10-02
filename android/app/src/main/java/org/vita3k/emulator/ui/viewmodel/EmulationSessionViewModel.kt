@@ -5,6 +5,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.vita3k.emulator.Emulator
 import org.vita3k.emulator.NativeLib
 import org.vita3k.emulator.R
@@ -32,6 +37,8 @@ data class EmulationSessionUiState(
     val overlayOpacity: Int = 100,
     val hideOverlayWhenControllerConnected: Boolean = true,
     val controllerConnected: Boolean = false,
+    val isStateOperationInProgress: Boolean = false,
+    val stateOperationRevision: Long = 0,
     val statusMessage: String? = null
 )
 
@@ -89,6 +96,7 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun handleBackPressed(emulator: Emulator): Boolean {
+        if (uiState.isStateOperationInProgress) return true
         return when {
             uiState.isEditingControls -> {
                 finishControlsEditor(emulator)
@@ -139,6 +147,7 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun closeMenu(emulator: Emulator) {
+        if (uiState.isStateOperationInProgress) return
         releaseInputs(emulator)
         if (uiState.isPaused) {
             setNativePauseReasonEnabled(NativeLib.PAUSE_REASON_MENU, false)
@@ -156,6 +165,7 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun togglePause(emulator: Emulator) {
+        if (uiState.isStateOperationInProgress) return
         if (uiState.isPaused) {
             closeMenu(emulator)
         } else {
@@ -169,6 +179,7 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun requestExit() {
+        if (uiState.isStateOperationInProgress) return
         uiState = uiState.copy(showExitConfirmation = true)
     }
 
@@ -177,6 +188,7 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun confirmExit(emulator: Emulator) {
+        if (uiState.isStateOperationInProgress) return
         releaseInputs(emulator)
         uiState = uiState.copy(showExitConfirmation = false, statusMessage = null)
         emulator.requestNativeQuit()
@@ -220,6 +232,7 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun startControlsEditor(emulator: Emulator) {
+        if (uiState.isStateOperationInProgress) return
         val mask = activeOverlayMask()
         releaseInputs(emulator)
         uiState = uiState.copy(
@@ -270,44 +283,49 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
         uiState = uiState.copy(statusMessage = message)
     }
 
-    /**
-     * Saves the running app's state to the given numbered slot. Requires the session to
-     * already be paused (i.e. the caller should only offer this while [uiState.isPaused]
-     * is true). Can fail even while paused, e.g. if a game thread happens to be blocked
-     * on a semaphore/mutex/event flag right now -- in that case, retrying a moment later
-     * usually succeeds.
-     */
+    /** Save/load is single-flight and leaves the menu paused until completion. */
     fun saveState(context: android.content.Context, slot: Int) {
-        if (!uiState.isPaused) {
-            return
-        }
-        // Empty string means success; anything else is the specific failure reason from the
-        // native side (see NativeLib.saveState's doc comment) -- shown as-is rather than a
-        // single generic message, since the exact reason (paused? busy thread? disk error?)
-        // is otherwise only visible in logcat.
-        val error = runCatching { NativeLib.saveState(slot) }.getOrDefault("saveState() threw an exception")
-        showStatusMessage(
-            if (error.isEmpty()) {
-                context.getString(R.string.emulation_state_saved, slot + 1)
-            } else {
-                context.getString(R.string.emulation_state_save_failed, error)
-            }
-        )
+        runStateOperation(context, slot, load = false)
     }
 
-    /** Loads a previously saved state from the given numbered slot. Requires the session to already be paused. */
     fun loadState(context: android.content.Context, slot: Int) {
-        if (!uiState.isPaused) {
-            return
-        }
-        val error = runCatching { NativeLib.loadState(slot) }.getOrDefault("loadState() threw an exception")
-        showStatusMessage(
-            if (error.isEmpty()) {
-                context.getString(R.string.emulation_state_loaded, slot + 1)
-            } else {
-                context.getString(R.string.emulation_state_load_failed, error)
+        runStateOperation(context, slot, load = true)
+    }
+
+    private fun runStateOperation(context: android.content.Context, slot: Int, load: Boolean) {
+        if (!uiState.showMenu || !uiState.isPaused || uiState.isStateOperationInProgress) return
+        // Reserve synchronously, before launching: queued taps cannot start a second job.
+        uiState = uiState.copy(isStateOperationInProgress = true, statusMessage = null)
+        val appContext = context.applicationContext
+        viewModelScope.launch {
+            try {
+                // JNI cannot be cancelled in the middle of a memory restore. Wait until
+                // it actually returns before releasing the busy flag, even on teardown.
+                val error = withContext(Dispatchers.IO + NonCancellable) {
+                    runCatching {
+                        if (load) NativeLib.loadState(slot) else NativeLib.saveState(slot)
+                    }.getOrElse { it.message ?: "Save/load threw an exception" }
+                }
+                showStatusMessage(
+                    if (error.isEmpty()) {
+                        appContext.getString(
+                            if (load) R.string.emulation_state_loaded else R.string.emulation_state_saved,
+                            slot + 1
+                        )
+                    } else {
+                        appContext.getString(
+                            if (load) R.string.emulation_state_load_failed else R.string.emulation_state_save_failed,
+                            error
+                        )
+                    }
+                )
+            } finally {
+                uiState = uiState.copy(
+                    isStateOperationInProgress = false,
+                    stateOperationRevision = uiState.stateOperationRevision + 1
+                )
             }
-        )
+        }
     }
 
     /** Returns true if a savestate exists for the given numbered slot of the running app. */
