@@ -1,113 +1,87 @@
-# Experimental Android savestates — fix19
+# Experimental Android savestates — fix20 development checkpoint
 
-Base: `3110mtr326/Vita3K`, commit `a1248cecca3c9ffd67f2ee730dacbaa7915bf076` (fix18).
-Target: Xperia 1 II SOG01, FFX HD, PCSG00219.
-This remains a partial snapshot, **not a complete machine-state restore**.
+Target: Xperia 1 II SOG01 / FFX HD / PCSG00219.
+Incremental base: fix19, verified repository commit
+`d80b5dd9bc5f8f569d05b3eb5e8c1777621dad93`.
 
-## Evidence
+**This does not fix full game restoration. The next device check is save and
+ordinary resume only, not Load State.** Renderer/GPU and audio state restoration
+remain incomplete. Successful serialization is not proof of a coherent machine
+snapshot or successful FFX recovery.
 
-The supplied log records a 5,001 ms input-dispatch timeout during repeated
-saves of approximately 400–430 MiB. The ViewModel called native save/load on
-the UI thread. The log also records completed loads and 305 preserved GXM
-object ranges; the user reports frozen gameplay after loading. A successful
-loader return does not demonstrate successful game recovery.
+## Changes
 
-The handoff predates the code: fix18 aborts native waits and replays their
-SVC after restoring CPU contexts. It does not reuse current native call stacks
-as saved stacks. The same process can contain a different wait and different
-stack-local values by the time a state is loaded.
+Session pause now applies to waiting and dormant threads as well as running
+threads. A wait may finish its HLE call, but run_loop parks before another guest
+instruction or start callback. Repeated pauses preserve original resume intent.
+Threads published during a pause inherit it. Resume clears the latch under the
+thread mutex; still-blocked waits are not signaled and finished dormant calls
+are not restarted. Saved-wait replay can deliberately bypass the session latch
+for its one SVC, retaining fix19's HLE-return barrier. Loading a saved context
+clears discarded pre-load pause intent.
 
-## Android responsiveness and lifetime
+KernelSnapshotGuard takes kernel, primitive and thread locks using nonblocking
+attempts. On contention it releases all acquired locks and retries for at most
+three seconds. It refuses running threads, drains bounded audio submissions,
+and retains the locks throughout CPU/sync/RAM serialization. Destruction releases
+locks on failures and exceptions. Audio status changes now take the thread mutex.
+This does not freeze renderer/GPU or all host-service workers.
 
-Save/load runs on Dispatchers.IO. Busy state is reserved synchronously before
-launching the worker. The menu shows progress instead of editable controls;
-Back, outside-click, resume, exit and control editing are guarded. Completion
-and error messages return to the UI thread. A revision counter refreshes slot
-availability even after identical success messages.
+Load skips the byte ranges of live GXM C++ objects instead of overwriting them
+and subsequently copying their current bytes back. The latter temporarily
+corrupts pointers and mutexes visible to renderer workers. Sorted overlapping
+protected intervals are supported, including across memory-region boundaries.
+Keeping current objects still does NOT restore their logical state. Command
+buffers and NGS placement objects are not fully covered by this protection.
 
-JNI delegates to AppSessionController::perform_savestate. A short mutex section
-admits one operation and requires a menu-owned pause. Disk I/O does not hold
-that mutex. Background and input-interception changes are recorded but their
-runtime application is deferred until completion; removing the menu pause is
-refused while busy. stop() enters Stopping and waits before destroying resources.
-Scope cleanup releases the operation gate on C++ exceptions. Kotlin cancellation
-cannot release busy state while a started native call still executes.
+Load rejects a different guest allocation bitmap layout before aborting waits.
+This is a necessary preflight, not proof of allocation identity or a restored
+allocator. Region ordering/size/overflow/null-guard and aggregate size are
+checked while parsing, with bounded record counts. File version is now 5 so
+older captures made without the kernel snapshot locks are rejected.
 
-## Restore ordering
+## Remaining work
 
-Previously, runnable threads and saved waiters resumed together. A producer
-could signal a condition variable before its restored waiter re-entered the
-empty queue. This lost-notification race is a possible cause of the freeze,
-not a confirmed diagnosis from the supplied log.
+- Renderer-worker and GPU quiescence, including pending command lists and host
+  pointers inside guest command storage; GPU surface/cache restoration.
+- Typed GXM logical-state snapshots and host resource identity/reconstruction.
+  Preserving current `state.active` alongside old guest RAM can still trigger
+  `SCE_GXM_ERROR_NOT_WITHIN_SCENE`.
+- NGS/audio logical state, guest-resident C++ containers, and audio backend queues.
+- Allocator bookkeeping/identity, kernel object reconstruction, host files and
+  full rollback of failures after load starts mutating the session.
+- Wait FIFO ordering, remaining timeouts, unsupported waits and guest callbacks.
+- Strong same-session identity; matching thread UIDs does not prove compatibility.
+- The separately observed pre-save shutdown crash remains under investigation.
 
-The loader now:
-
-1. Parses/checks the file and aborts supported waits until threads are parked.
-2. Restores memory, retaining fix18's live GXM object bytes, reconciles existing
-   host records, and restores CPU and synchronization-object values.
-3. Starts only saved waiters with restore_wait_barrier set. They execute their
-   saved SVC and register a wait, or park at the HLE return boundary if the
-   call already completed. Ordinary guest execution remains suspended.
-4. Waits at most five seconds for replayed threads to leave Running, then logs
-   their status/PC. Timeout requires restarting the game.
-5. Keeps the barrier until menu resume. Under each thread's mutex,
-   resume_after_pause clears it and wakes completed/suspended calls. Calls
-   still blocked are not spuriously signaled. A completion racing resume either
-   sees the cleared barrier or is resumed under the same lock. Repeated loads
-   clear old replay flags after all threads have been quiesced.
-
-This restores wait registration before ordinary producers run. It does not
-restore every wait queue's original FIFO order or remaining timeout duration.
-
-## GXM protection remains partial
-
-GXM places C++ objects inside guest memory. Copying saved bytes over live
-pointers, mutexes, vtables and containers is invalid. Keeping current objects
-addresses that stale-pointer problem, but also retains their current logical
-state while other guest state is rewound. Counts do not prove object identity;
-freed/recreated resources are not rebuilt. GPU resources, renderer queues and
-host audio state are not fully restored. Persistent freezes or corruption are
-possible, not merely a bad first frame. fix19 retains this mechanism without
-claiming it is a complete restoration design.
-
-## Limits
-
-- UI slot 0; file format remains version 4.
-- Test within the same running game session. There is no robust persisted
-  session-identity check; matching thread UIDs cannot ensure cross-launch safety.
-- RWLock/Timer/MsgPipe/vblank waits and guest callbacks remain unsupported.
-- Kernel-object identity, allocator bookkeeping, full GXM/renderer state,
-  audio/FMOD state and external file writes are not restored completely.
-- Destroyed kernel objects are reported but not recreated.
-- Host mutations and the pause mechanism do not provide a proven globally
-  atomic snapshot.
-- A load error after state mutation is not transactional: restart the game
-  instead of resuming or repeatedly loading the affected session.
+No claim is made that fix20 supplies a globally atomic snapshot. Ordinary game
+saves remain separate. Use a fresh session after a failed experimental load.
 
 ## Validation
 
-- Five modified C++ translation units passed g++ C++20 -fsyntax-only using
-  project headers and downloaded dependencies. This used Windows host g++,
-  with Android declarations enabled for JNI, not an NDK build. The pinned fmt
-  headers are v12; spdlog emits deprecation warnings, with no syntax errors.
-- The modified ViewModel compiled with Kotlin 2.3.21, Android/Compose test
-  doubles and real kotlinx.coroutines. Off-main execution, single-flight,
-  guarded actions, exception reporting and cancellation tests passed.
-- Both Kotlin files passed the Kotlin parser. The whole Compose screen was
-  not type-checked against Android dependencies.
-- Isolated native tests extracted changed method bodies from the sources,
-  with test doubles for surrounding services. Single-flight, nonblocking
-  lifecycle updates, teardown waiting, exception cleanup, replayed waits and
-  2,000 completion/resume races passed. These are not whole-emulator tests.
-- XML resource syntax and ZIP contents were checked.
-- Android linking/APK generation and FFX HD real-device tests remain pending.
+Host g++ C++20 syntax-only checks passed for session_controller.cpp,
+native_session.cpp, kernel.cpp, thread.cpp, savestate.cpp and SceAudio.cpp using
+project headers. JNI used Android declarations. This is not an Android NDK build
+or a linker/APK check; fmt/spdlog deprecation warnings remain.
 
-## Manual test
+Isolated tests extract production bodies and substitute surrounding services:
 
-Upload all changed files together on top of fix18, preserving repository paths,
-then use the existing Android CI job. Start a fresh session and make a new state.
-Save, close the menu, advance a few seconds, pause, load, wait for completion,
-then explicitly select Resume. Check movement, sound and game progress for at
-least 30 seconds. Repeat loading once, then check rapid save taps do not queue
-multiple writes. Report the progress indicator, menu, picture and sound
-separately. A fresh freeze log should include rebuilt-wait lines and Resume.
+- 30 actual run_loop/timed-wait pause/resume cycles, plus dormant/start,
+  debugger, restore-replay, restored-dormant and completion cases.
+- 2,000 wait-completion/session-resume races.
+- Snapshot excludes a timeout writer; inverse lock-order contention completes;
+  audio is drained; exceptions and bounded refusals release locks.
+- 10,000 protected-range cases assert that protected bytes are never written.
+- fix19 replay barrier regression tests, including 2,000 completion/resume races.
+
+These establish the tested local invariants, not whole-emulator correctness.
+The inherited Kotlin UI was unchanged in this checkpoint.
+
+## Next device check
+
+Apply all eight changed files on fix19, preserving paths, then use the existing
+Android CI. Test regular pause/resume first, then Save State and ordinary Resume.
+Check controls, picture and sound for at least 30 seconds. Do not test Load State
+as a claimed fix: its renderer/audio restoration remains incomplete. Report a
+save refusal or freeze with its message/log. Version-4 states cannot be loaded.
+New logs include `Savestate fix20: kernel snapshot locks acquired`.

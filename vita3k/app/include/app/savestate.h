@@ -52,10 +52,11 @@ fs::path get_savestate_path(const EmuEnvState &emuenv, int slot);
 // Both functions must be called from a host thread (not from a guest/emulated thread),
 // and only while the session is already paused (emuenv.kernel.is_threads_paused()) --
 // e.g. from within the pause menu, after AppSessionController::set_pause_reason(Menu, true)
-// has taken effect. They do not pause or resume the session themselves: kernel state's
-// own pause/resume bookkeeping (KernelState::pause_threads/resume_threads) is not
-// re-entrant, so nesting an internal pause inside an already-paused session would
-// corrupt it. See the comment at the top of savestate.cpp for the full rationale.
+// has taken effect. They do not acquire an independent session pause: repeated
+// pause_threads() calls are idempotent but do not create another ownership level.
+// The caller must retain its pause and exclude resume/teardown for the operation.
+// save_state() additionally locks kernel objects and threads while serializing;
+// renderer and other host workers are not fully frozen by this guard.
 //
 // out_detail, if non-null, is set to extra diagnostic text on ErrorThreadNotSafe
 // (which specific thread, why it was judged unrecoverable) -- there isn't

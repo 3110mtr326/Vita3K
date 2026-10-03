@@ -107,6 +107,9 @@ struct ThreadState {
     // args and argp are passed to thread->start as is
     uint32_t run_guest_function(Address callback_address, SceSize args = 0, const Ptr<void> argp = Ptr<void>{});
 
+    // Session pause survives a blocked HLE call completing. Returns the status
+    // observed under mutex, for KernelState's resume bookkeeping.
+    ThreadStatus pause_for_session();
     void suspend();
     void resume(bool step = false);
     std::string log_stack_traceback() const;
@@ -144,6 +147,7 @@ struct ThreadState {
     // Rebuild a saved wait before any ordinary guest code resumes. If the
     // syscall returns early, run_loop parks at its return boundary instead.
     void replay_restore_wait();
+    void set_restored_status(ThreadStatus status);
     void resume_after_pause(bool should_run);
     // Protected by mutex; cleared by KernelState::resume_threads().
     bool restore_wait_barrier = false;
@@ -164,6 +168,11 @@ private:
     bool delete_requested = false;
     // Set by suspend(), consumed in run_loop() to transition to ThreadStatus::suspend.
     bool suspend_requested = false;
+    // Separate from debugger suspension and from the one-shot restore request.
+    bool session_pause_requested = false;
+    bool session_pause_parked = false;
+    // Called only by run_loop() with mutex held, including nested callbacks.
+    bool park_for_session_pause();
     // Single stepping mode.
     bool single_stepping = false;
 

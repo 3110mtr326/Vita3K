@@ -81,7 +81,10 @@
 //     session may no longer be consistent and should be restarted.
 //
 // Pausing: KernelState::pause_threads()/resume_threads() record each thread's
-// pre-pause status in a single, non-stacking map, so save_state()/load_state()
+// pre-pause status in a single, non-stacking map and keep a persistent session
+// barrier even after timed waits complete. Repeated pause calls are idempotent.
+// save_state() locks kernel objects and threads during serialization; this is
+// not a renderer/GPU snapshot barrier. save_state()/load_state()
 // require the caller to have already paused the session (typically via
 // AppSessionController) and refuse with ErrorNotPaused if not.
 // ---------------------------------------------------------------------------
@@ -101,6 +104,7 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <chrono>
 #include <map>
 #include <set>
@@ -114,7 +118,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 4; // v4: host object snapshot (kernel object UIDs, open files, GXM counts)
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 5; // v5: persistent pause and locked kernel capture; reject older potentially torn snapshots
 
 template <typename T>
 void write_pod(fs::ofstream &out, const T &value) {
@@ -213,6 +217,107 @@ bool is_safe_self_contained_wait_nid(uint32_t nid) {
         || nid == NID_sceAudioOutOutput;
 }
 
+// Freeze kernel wait queues AND their threads while reading CPU/sync/RAM.
+// A run_loop pause barrier alone is insufficient: an HLE timeout can still
+// change a queue, a return register or a guest timeout pointer before parking.
+// Never block acquiring a second lock: HLE uses primitive -> thread and some
+// paths need kernel.mutex. Release the entire set and retry on contention.
+// This guard does NOT freeze renderer/GPU/audio-backend workers.
+class KernelSnapshotGuard {
+    std::unique_lock<std::mutex> kernel_lock;
+    std::vector<std::unique_lock<std::mutex>> locks;
+    std::set<std::mutex *> seen;
+
+    bool take(std::mutex &mutex) {
+        if (!seen.insert(&mutex).second)
+            return true;
+        locks.emplace_back(mutex, std::try_to_lock);
+        return locks.back().owns_lock();
+    }
+
+    template <typename Map>
+    bool take_objects(Map &objects) {
+        for (auto &[id, object] : objects) {
+            if (!take(object->mutex))
+                return false;
+        }
+        return true;
+    }
+
+public:
+    explicit KernelSnapshotGuard(KernelState &kernel)
+        : kernel_lock(kernel.mutex, std::defer_lock) {}
+
+    bool acquire(KernelState &kernel, MemState &mem, std::string &reason) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        do {
+            if (kernel_lock.try_lock()) {
+                bool ready = take_objects(kernel.semaphores)
+                    && take_objects(kernel.mutexes) && take_objects(kernel.lwmutexes)
+                    && take_objects(kernel.condvars) && take_objects(kernel.lwcondvars)
+                    && take_objects(kernel.eventflags) && take_objects(kernel.simple_events)
+                    && take_objects(kernel.timers) && take_objects(kernel.rwlocks)
+                    && take_objects(kernel.msgpipes);
+                if (ready) {
+                    for (auto &[id, thread] : kernel.threads) {
+                        if (!take(thread->mutex)) {
+                            ready = false;
+                            break;
+                        }
+                        if (thread->status == ThreadStatus::run) {
+                            reason = fmt::format("thread {} ('{}') has not reached the session pause barrier", id, thread->name);
+                            ready = false;
+                            break;
+                        }
+                        // Audio waits use a port lock instead of the thread lock.
+                        // Let that bounded HLE call finish and park before reading
+                        // its CPU registers or the submitted guest buffer.
+                        if (thread->status == ThreadStatus::wait
+                            && looks_like_parked_import_call(*thread->cpu, mem)
+                            && *Ptr<uint32_t>(read_pc(*thread->cpu) + 4).get(mem) == NID_sceAudioOutOutput) {
+                            reason = fmt::format("thread {} ('{}') is still submitting audio", id, thread->name);
+                            ready = false;
+                            break;
+                        }
+                    }
+                }
+                if (ready)
+                    return true;
+                locks.clear();
+                seen.clear();
+                kernel_lock.unlock();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } while (std::chrono::steady_clock::now() < deadline);
+        if (reason.empty())
+            reason = "kernel wait queues did not become stable within 3 seconds";
+        return false;
+    }
+};
+
+// Restore only the complement of live host-object ranges. Copying old bytes
+// over a live mutex/pointer and then putting the current bytes back creates a
+// corruption window for renderer workers, even if the final bytes look right.
+// Input intervals must be sorted; overlaps and nesting are intentionally OK.
+template <typename Copy>
+void copy_guest_spans(uint64_t begin, uint64_t end,
+    const std::vector<std::pair<uint64_t, uint64_t>> &protected_ranges, Copy copy) {
+    uint64_t cursor = begin;
+    for (const auto &[protected_begin, protected_end] : protected_ranges) {
+        if (protected_end <= cursor)
+            continue;
+        if (protected_begin >= end)
+            break;
+        if (cursor < protected_begin)
+            copy(cursor, protected_begin - cursor);
+        cursor = std::min(end, std::max(cursor, protected_end));
+        if (cursor == end)
+            return;
+    }
+    if (cursor < end)
+        copy(cursor, end - cursor);
+}
+
 // True if `thread` is registered as a waiter-for-completion on some other
 // thread -- see wait_thread_end() (modules/SceKernelThreadMgr/SceThreadmgr.cpp,
 // backing sceKernelWaitThreadEnd/CB), which pushes the waiting thread onto the
@@ -242,8 +347,10 @@ bool is_waiting_for_thread_end(const KernelState &kernel, const ThreadStatePtr &
 // A thread that is still running guest code is refused when saving (the
 // caller should retry once it is parked), but accepted when loading, where
 // load_state() halts it itself.
-std::string find_unsafe_thread_reason(KernelState &kernel, MemState &mem, bool for_load) {
-    const std::lock_guard<std::mutex> lock(kernel.mutex);
+std::string find_unsafe_thread_reason(KernelState &kernel, MemState &mem, bool for_load, bool kernel_locked = false) {
+    std::unique_lock<std::mutex> lock(kernel.mutex, std::defer_lock);
+    if (!kernel_locked)
+        lock.lock();
     for (auto &[id, thread] : kernel.threads) {
         if (thread->get_call_level() > 1) {
             const std::string reason = fmt::format("thread {} ('{}') is inside a guest callback", id, thread->name);
@@ -345,8 +452,10 @@ ObjectSetRecord collect_object_set(const char *kind, const Map &map) {
     return rec;
 }
 
-std::vector<ObjectSetRecord> collect_kernel_object_sets(KernelState &kernel) {
-    const std::lock_guard<std::mutex> lock(kernel.mutex);
+std::vector<ObjectSetRecord> collect_kernel_object_sets(KernelState &kernel, bool kernel_locked = false) {
+    std::unique_lock<std::mutex> lock(kernel.mutex, std::defer_lock);
+    if (!kernel_locked)
+        lock.lock();
     return {
         collect_object_set("semaphores", kernel.semaphores),
         collect_object_set("mutexes", kernel.mutexes),
@@ -581,26 +690,6 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     if (!kernel.is_threads_paused())
         return SaveStateResult::ErrorNotPaused;
 
-    if (auto reason = find_unsafe_thread_reason(kernel, mem, false); !reason.empty()) {
-        if (out_detail)
-            *out_detail = std::move(reason);
-        return SaveStateResult::ErrorThreadNotSafe;
-    }
-
-    // Collect everything into memory first so we only hold the kernel lock
-    // briefly, then write to disk afterwards (and resume threads either way).
-    std::vector<ThreadRecord> thread_records;
-    std::vector<SemaRecord> sema_records;
-    std::vector<MutexRecord> mutex_records;
-    std::vector<EventFlagRecord> eventflag_records;
-    std::vector<SimpleEventRecord> simple_event_records;
-    std::vector<MutexRecord> lwmutex_records;
-    const std::vector<IoFileRecord> io_files = collect_io_files(emuenv.io);
-    const std::vector<ObjectSetRecord> object_sets = collect_kernel_object_sets(kernel);
-    const GxmCountsRecord gxm_counts = collect_gxm_counts(emuenv.gxm);
-
-    LOG_INFO("Savestate: collecting kernel state...");
-
     // KernelState::get_pending_resume_status() takes kernel.mutex itself, so
     // gather these before holding it below.
     std::map<SceUID, ThreadStatus> resume_statuses;
@@ -617,16 +706,48 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 resume_statuses[id] = st;
         }
     }
+    KernelSnapshotGuard snapshot(kernel);
+    std::string snapshot_reason;
+    if (!snapshot.acquire(kernel, mem, snapshot_reason)) {
+        LOG_WARN("Savestate: save refused before writing: {}", snapshot_reason);
+        if (out_detail)
+            *out_detail = snapshot_reason;
+        return SaveStateResult::ErrorThreadNotSafe;
+    }
+    LOG_INFO("Savestate fix20: kernel snapshot locks acquired; guest execution remains paused.");
+
+    if (auto reason = find_unsafe_thread_reason(kernel, mem, false, true); !reason.empty()) {
+        if (out_detail)
+            *out_detail = std::move(reason);
+        return SaveStateResult::ErrorThreadNotSafe;
+    }
+
+    // Keep snapshot locks until disk serialization ends, including on errors.
+    // This avoids another ~450 MB copy on Android. The worker must not call
+    // helpers that re-acquire kernel.mutex while this guard is alive.
+    std::vector<ThreadRecord> thread_records;
+    std::vector<SemaRecord> sema_records;
+    std::vector<MutexRecord> mutex_records;
+    std::vector<EventFlagRecord> eventflag_records;
+    std::vector<SimpleEventRecord> simple_event_records;
+    std::vector<MutexRecord> lwmutex_records;
+    const std::vector<IoFileRecord> io_files = collect_io_files(emuenv.io);
+    const std::vector<ObjectSetRecord> object_sets = collect_kernel_object_sets(kernel, true);
+    const GxmCountsRecord gxm_counts = collect_gxm_counts(emuenv.gxm);
+
+    LOG_INFO("Savestate: collecting kernel state...");
+
     int waiting_thread_count = 0;
-    {
-        const std::lock_guard<std::mutex> lock(kernel.mutex);
+    { // kernel, primitive and thread locks are held by snapshot
         thread_records.reserve(kernel.threads.size());
         for (auto &[id, thread] : kernel.threads) {
             ThreadRecord rec{};
             rec.id = id;
             rec.status = static_cast<uint8_t>(thread->status);
             const auto resume_it = resume_statuses.find(id);
-            rec.resume_status = static_cast<uint8_t>(resume_it != resume_statuses.end() ? resume_it->second : ThreadStatus::run);
+            const ThreadStatus pending = resume_it != resume_statuses.end() ? resume_it->second : ThreadStatus::run;
+            rec.resume_status = static_cast<uint8_t>(thread->status == ThreadStatus::suspend && pending == ThreadStatus::wait
+                    ? ThreadStatus::run : pending);
             rec.in_condvar = (is_waiting_in(kernel.condvars, thread) || is_waiting_in(kernel.lwcondvars, thread)) ? 1 : 0;
             if (thread->status == ThreadStatus::wait)
                 waiting_thread_count++;
@@ -776,7 +897,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
 
     // -- Memory --
     uint32_t region_count = 0;
-    if (!read_pod(in, region_count))
+    if (!read_pod(in, region_count) || region_count > 65536)
         return SaveStateResult::ErrorIO;
 
     struct PendingRegion {
@@ -785,11 +906,19 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     };
     std::vector<PendingRegion> pending_regions;
     pending_regions.reserve(region_count);
+    uint64_t previous_end = mem.host_page_size;
+    uint64_t total_bytes = 0;
     for (uint32_t i = 0; i < region_count; i++) {
         Address addr = 0;
         uint32_t size = 0;
         if (!read_pod(in, addr) || !read_pod(in, size))
             return SaveStateResult::ErrorIO;
+        const uint64_t end = static_cast<uint64_t>(addr) + size;
+        total_bytes += size;
+        if (size == 0 || addr < previous_end || end > (1ULL << 32)
+            || total_bytes > 1536ULL * 1024 * 1024)
+            return SaveStateResult::ErrorMismatch;
+        previous_end = end;
         PendingRegion region;
         region.addr = addr;
         region.bytes.resize(size);
@@ -803,7 +932,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
 
     // -- Threads --
     uint32_t thread_count = 0;
-    if (!read_pod(in, thread_count))
+    if (!read_pod(in, thread_count) || thread_count > 65536)
         return SaveStateResult::ErrorIO;
     std::vector<ThreadRecord> thread_records(thread_count);
     for (auto &rec : thread_records) {
@@ -814,7 +943,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     // -- Semaphores / Mutexes / Event flags --
     auto read_records = [&](auto &records) -> bool {
         uint32_t count = 0;
-        if (!read_pod(in, count))
+        if (!read_pod(in, count) || count > 100000)
             return false;
         records.resize(count);
         for (auto &rec : records) {
@@ -861,6 +990,20 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 return SaveStateResult::ErrorThreadSetChanged;
             thread_handles.push_back(it->second);
         }
+    }
+
+    // This loader does not restore allocator bookkeeping. Refuse a different
+    // allocation layout before aborting waits or touching the running session.
+    const auto current_regions = get_allocated_regions(mem);
+    bool same_layout = current_regions.size() == pending_regions.size();
+    for (size_t i = 0; same_layout && i < current_regions.size(); ++i)
+        same_layout = current_regions[i].first == pending_regions[i].addr
+            && current_regions[i].second == pending_regions[i].bytes.size();
+    if (!same_layout) {
+        if (out_detail)
+            *out_detail = "Guest memory allocation layout changed since saving; load refused before memory restore";
+        LOG_WARN("Savestate fix20: refusing changed guest memory allocation layout.");
+        return SaveStateResult::ErrorMismatch;
     }
 
     // Nothing has been touched so far, so refusing here is free. Threads that
@@ -928,31 +1071,24 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     // memory through the CPU, and the translated-code cache is dropped for
     // the restored ranges in case any of them held code.
     //
-    // GXM keeps C++ objects (contexts, render targets, sync objects, shader
-    // patchers, vertex/fragment programs) *inside* guest memory. Their bytes
-    // hold host pointers, vtables and containers that are only valid for the
-    // current run, so writing old bytes over them crashes the emulator the
-    // next time the game draws. Remember what they hold now and put it back
-    // after the memory restore.
-    struct KeptRange {
-        Address addr;
-        std::vector<uint8_t> bytes;
-    };
-    std::vector<KeptRange> kept_ranges;
+    // Guest CPU threads are stopped, but renderer workers can still touch
+    // GXM objects. Never overwrite those bytes, even transiently. This avoids
+    // one corruption window; it does NOT restore GXM logical/GPU state.
+    std::vector<std::pair<uint64_t, uint64_t>> protected_ranges;
     for (const auto &[addr, size] : gxm::get_host_object_ranges(emuenv)) {
-        if (size == 0 || !is_valid_addr(mem, addr) || !is_valid_addr(mem, addr + size - 1))
-            continue;
-        kept_ranges.push_back({ addr, std::vector<uint8_t>(&mem.memory[addr], &mem.memory[addr] + size) });
+        const uint64_t end = static_cast<uint64_t>(addr) + size;
+        if (size != 0 && end <= (1ULL << 32))
+            protected_ranges.emplace_back(addr, end);
     }
+    std::sort(protected_ranges.begin(), protected_ranges.end());
     for (const auto &region : pending_regions) {
-        if (region.bytes.empty())
-            continue;
-        std::memcpy(&mem.memory[region.addr], region.bytes.data(), region.bytes.size());
+        copy_guest_spans(region.addr, static_cast<uint64_t>(region.addr) + region.bytes.size(), protected_ranges,
+            [&](uint64_t address, uint64_t size) {
+                std::memcpy(&mem.memory[address], region.bytes.data() + (address - region.addr), size);
+            });
         kernel.invalidate_jit_cache(region.addr, region.bytes.size());
     }
-    for (const auto &kept : kept_ranges)
-        std::memcpy(&mem.memory[kept.addr], kept.bytes.data(), kept.bytes.size());
-    LOG_INFO("Savestate: {} GXM host object range(s) kept as they were.", kept_ranges.size());
+    LOG_INFO("Savestate fix20: {} GXM host ranges excluded from writes (logical renderer state is not restored).", protected_ranges.size());
 
     // ---- Step 2b: host-side state the game refers to by number ----
     {
@@ -998,11 +1134,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             if (resume_status == ThreadStatus::dormant || resume_status == ThreadStatus::suspend)
                 pending = resume_status;
         }
-        {
-            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            if (thread->status != live)
-                thread->update_status(live);
-        }
+        thread->set_restored_status(live);
         pending_resume_updates.emplace_back(rec.id, pending);
     }
 

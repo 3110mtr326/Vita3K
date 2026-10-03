@@ -240,6 +240,10 @@ void ThreadState::run_loop() {
             // Status is now dormant: we'll park until the next start() or exit_delete().
         }
 
+        // A timed wait, start(), or external signal may have made us runnable
+        // while the pause menu was open. Do not enter callbacks or the JIT.
+        park_for_session_pause();
+
         // Park until we have something to do.
         if (status != ThreadStatus::run) {
             status_cond.wait(lock, [&] {
@@ -288,6 +292,8 @@ void ThreadState::run_loop() {
                 suspend_requested = false;
                 update_status(ThreadStatus::suspend);
             }
+
+            park_for_session_pause();
 
             // Guest function for this run_loop returned (or errored).
             if (res != 0) {
@@ -418,12 +424,32 @@ void ThreadState::update_status(ThreadStatus status, std::optional<ThreadStatus>
     status_cond.notify_all();
 
     if (status == ThreadStatus::dormant) {
+        session_pause_parked = false;
         raise_waiting_threads();
     }
 }
 
 Address ThreadState::stack_top() const {
     return stack.get() + stack_size;
+}
+
+ThreadStatus ThreadState::pause_for_session() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    const ThreadStatus previous = status;
+    session_pause_requested = true;
+    if (status == ThreadStatus::run)
+        stop(*cpu);
+    return previous;
+}
+
+bool ThreadState::park_for_session_pause() {
+    // The loader deliberately runs one saved SVC behind its own return
+    // barrier. Ordinary execution (including newly started threads) stays put.
+    if (!session_pause_requested || restore_wait_barrier || status != ThreadStatus::run)
+        return false;
+    session_pause_parked = true;
+    update_status(ThreadStatus::suspend);
+    return true;
 }
 
 void ThreadState::suspend() {
@@ -468,11 +494,22 @@ void ThreadState::replay_restore_wait() {
     update_status(ThreadStatus::run);
 }
 
+void ThreadState::set_restored_status(const ThreadStatus restored_status) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    // Resume intent now comes from the saved context, not the discarded one.
+    session_pause_parked = false;
+    if (status != restored_status)
+        update_status(restored_status);
+}
+
 void ThreadState::resume_after_pause(const bool should_run) {
     const std::lock_guard<std::mutex> lock(mutex);
     const bool replayed_wait = restore_wait_barrier;
+    const bool parked_for_session = session_pause_parked;
+    session_pause_requested = false;
+    session_pause_parked = false;
     restore_wait_barrier = false;
-    if ((should_run || replayed_wait) && (status == ThreadStatus::suspend || status == ThreadStatus::dormant)) {
+    if ((should_run || replayed_wait || parked_for_session) && status == ThreadStatus::suspend) {
         single_stepping = false;
         update_status(ThreadStatus::run);
     }

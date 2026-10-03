@@ -153,6 +153,10 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
 
     {
         const std::lock_guard<std::mutex> lock(mutex);
+        // An in-flight create syscall can finish after pause_threads(). New
+        // threads inherit the pause before their host thread is published.
+        if (session_paused)
+            paused_threads_status[thread->id] = thread->pause_for_session();
         threads.emplace(thread->id, thread);
     }
 
@@ -200,11 +204,11 @@ void KernelState::process_exit() {
 
 void KernelState::pause_threads() {
     const std::lock_guard<std::mutex> lock(mutex);
-    for (auto &[_, thread] : threads) {
-        paused_threads_status[thread->id] = thread->status;
-        if (thread->status == ThreadStatus::run)
-            thread->suspend();
-    }
+    if (session_paused)
+        return; // do not replace the original resume state on a repeated pause
+    session_paused = true;
+    for (auto &[_, thread] : threads)
+        paused_threads_status[thread->id] = thread->pause_for_session();
 }
 
 void KernelState::set_pending_resume_status(SceUID thread_id, ThreadStatus status) {
@@ -234,6 +238,7 @@ void KernelState::resume_threads() {
         thread->resume_after_pause(pending != paused_threads_status.end() && pending->second == ThreadStatus::run);
     }
     paused_threads_status.clear();
+    session_paused = false;
 }
 
 void KernelState::deinit(MemState &mem) {
@@ -295,6 +300,7 @@ void KernelState::deinit(MemState &mem) {
     next_uid = 1;
 
     paused_threads_status.clear();
+    session_paused = false;
 }
 
 SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
