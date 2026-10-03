@@ -115,6 +115,16 @@ public:
         aborted = false;
     }
 
+    // Acquire an empty queue without blocking on either its lock or contents.
+    // A successful lock is retained by the caller, excluding producers and
+    // consumers for the duration of a snapshot. Never checks size() unlocked.
+    std::unique_lock<std::mutex> try_lock_empty() {
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (lock.owns_lock() && !queue_.empty())
+            lock.unlock();
+        return lock;
+    }
+
     void wait_empty() {
         std::unique_lock<std::mutex> mlock(mutex_);
         cond_.wait(mlock, [&]() { return aborted || queue_.empty(); });

@@ -1,87 +1,112 @@
-# Experimental Android savestates — fix20 development checkpoint
+# Experimental Android savestates — fix21
 
 Target: Xperia 1 II SOG01 / FFX HD / PCSG00219.
-Incremental base: fix19, verified repository commit
-`d80b5dd9bc5f8f569d05b3eb5e8c1777621dad93`.
+Apply this incremental checkpoint on the supplied fix20 sources.
+**Device validation remains save + ordinary Resume, not Load State.**
+Renderer/GPU/audio restoration is still incomplete.
 
-**This does not fix full game restoration. The next device check is save and
-ordinary resume only, not Load State.** Renderer/GPU and audio state restoration
-remain incomplete. Successful serialization is not proof of a coherent machine
-snapshot or successful FFX recovery.
+## Evidence and scope
 
-## Changes
+The October 3 device log recorded eight save refusals, all naming thread 98,
+PhyreEngineRenderThread, as not reaching the pause barrier. No successful save
+was recorded. The user confirmed controls and audio returned on Resume after
+refusal. The log did not record the active HLE call, so the precise device
+blocking site is not yet proven.
 
-Session pause now applies to waiting and dormant threads as well as running
-threads. A wait may finish its HLE call, but run_loop parks before another guest
-instruction or start callback. Repeated pauses preserve original resume intent.
-Threads published during a pause inherit it. Resume clears the latch under the
-thread mutex; still-blocked waits are not signaled and finished dormant calls
-are not restarted. Saved-wait replay can deliberately bypass the session latch
-for its one SVC, retaining fix19's HLE-return barrier. Loading a saved context
-clears discarded pre-load pause intent.
+A concrete dependency exists in the sources: sceGxmDisplayQueueAddEntry can
+block on queue capacity or completion; sceGxmDisplayQueueFinish waits for an
+empty queue. The host consumer calls run_guest_function on the dedicated
+display thread and pops the queue only after callback completion, sync
+notifications and freeing callback data. fix20's session gate also parks that
+guest display callback. A producer can therefore remain inside HLE with status
+run while waiting for a consumer held by the pause.
 
-KernelSnapshotGuard takes kernel, primitive and thread locks using nonblocking
-attempts. On contention it releases all acquired locks and retries for at most
-three seconds. It refuses running threads, drains bounded audio submissions,
-and retains the locks throughout CPU/sync/RAM serialization. Destruction releases
-locks on failures and exceptions. Audio status changes now take the thread mutex.
-This does not freeze renderer/GPU or all host-service workers.
+## Change
 
-Load skips the byte ranges of live GXM C++ objects instead of overwriting them
-and subsequently copying their current bytes back. The latter temporarily
-corrupts pointers and mutexes visible to renderer workers. Sorted overlapping
-protected intervals are supported, including across memory-region boundaries.
-Keeping current objects still does NOT restore their logical state. Command
-buffers and NGS placement objects are not fully covered by this protection.
+Only while preparing a save, DisplayQueueDrainScope grants the registered GXM
+display callback thread permission to complete its pending guest work despite
+the session pause. All ordinary guest threads retain their gates. Only a thread
+parked by the session is woken; debugger suspensions and still-blocked waits are
+not forcibly completed. The grant is revoked on success, refusal and exception.
+It does not fake successful completion, discard queue contents or abort a wait.
 
-Load rejects a different guest allocation bitmap layout before aborting waits.
-This is a necessary preflight, not proof of allocation identity or a restored
-allocator. Region ordering/size/overflow/null-guard and aggregate size are
-checked while parsing, with bounded record counts. File version is now 5 so
-older captures made without the kernel snapshot locks are rejected.
+KernelSnapshotGuard still tries the kernel/primitive/thread locks without
+blocking on a second lock. It now also requires the display queue to be empty
+and retains its mutex for the entire snapshot, excluding new submissions or
+consumption. This is checked with Queue::try_lock_empty(), not unlocked size().
+All guest threads must be non-running and supported before the capture begins.
+The original three-second preparation deadline is unchanged. On contention,
+partial locks are released so the producer/consumer can progress.
 
-## Remaining work
+The drain scope is declared before the snapshot guard so snapshot locks are
+destroyed before the drain scope takes the callback thread mutex to revoke its
+grant. A callback that needs a paused ordinary thread still causes a bounded
+refusal. This is not a general scheduler or renderer pause implementation.
 
-- Renderer-worker and GPU quiescence, including pending command lists and host
-  pointers inside guest command storage; GPU surface/cache restoration.
-- Typed GXM logical-state snapshots and host resource identity/reconstruction.
-  Preserving current `state.active` alongside old guest RAM can still trigger
-  `SCE_GXM_ERROR_NOT_WITHIN_SCENE`.
-- NGS/audio logical state, guest-resident C++ containers, and audio backend queues.
-- Allocator bookkeeping/identity, kernel object reconstruction, host files and
-  full rollback of failures after load starts mutating the session.
-- Wait FIFO ordering, remaining timeouts, unsupported waits and guest callbacks.
-- Strong same-session identity; matching thread UIDs does not prove compatibility.
-- The separately observed pre-save shutdown crash remains under investigation.
+ThreadState now publishes the currently executing HLE NID atomically. Nested
+imports restore their previous diagnostic NID on return. A running-thread save
+refusal includes this NID without reading that thread's live CPU registers.
+Zero means no published HLE call at observation time; the diagnostic is not
+used as synchronization or as permission to capture a running thread.
 
-No claim is made that fix20 supplies a globally atomic snapshot. Ordinary game
-saves remain separate. Use a fresh session after a failed experimental load.
+File version is 6 to reject older snapshots that did not require the drained
+display queue. It does not indicate a complete renderer snapshot.
+
+## Inherited behavior and unresolved work
+
+fix20's persistent session pause, bounded kernel snapshot locks, protected-GXM
+write exclusions, region bounds checks and allocation-layout refusal remain.
+fix19's Android worker, operation gate and replay-wait barrier remain unchanged.
+
+The main unresolved areas are renderer/GPU workers and resources, pending
+renderer command lists, typed GXM logical state, NGS objects and audio queues,
+allocation identity/bookkeeping, kernel object reconstruction, remaining wait
+timeouts/FIFO order, transactional load failures, host file side effects and
+strong session identity. A matching allocation bitmap is not proof of identity.
+GXM protected ranges do not cover every host object or command buffer in guest
+RAM. The separate pre-save shutdown crash has not been fixed.
+
+Keeping live GXM objects can still leave current state.active beside old guest
+RAM. This patch does not claim to resolve NOT_WITHIN_SCENE or successful FFX
+Load State. A save may still be refused when another unsupported dependency is
+present. No claim is made of a globally atomic machine snapshot.
 
 ## Validation
 
-Host g++ C++20 syntax-only checks passed for session_controller.cpp,
-native_session.cpp, kernel.cpp, thread.cpp, savestate.cpp and SceAudio.cpp using
-project headers. JNI used Android declarations. This is not an Android NDK build
-or a linker/APK check; fmt/spdlog deprecation warnings remain.
+Six C++ translation units passed host g++ C++20 syntax checks with project
+headers: session_controller.cpp, native_session.cpp, kernel.cpp, thread.cpp,
+savestate.cpp and SceAudio.cpp. JNI used Android declarations. fmt/spdlog
+deprecation warnings remain. This is not an NDK build/link/APK or device test.
 
-Isolated tests extract production bodies and substitute surrounding services:
+Isolated tests extract production method bodies and use the actual Queue
+template, with test doubles for CPU/HLE and other surrounding services:
 
-- 30 actual run_loop/timed-wait pause/resume cycles, plus dormant/start,
-  debugger, restore-replay, restored-dormant and completion cases.
-- 2,000 wait-completion/session-resume races.
-- Snapshot excludes a timeout writer; inverse lock-order contention completes;
-  audio is drained; exceptions and bounded refusals release locks.
-- 10,000 protected-range cases assert that protected bytes are never written.
-- fix19 replay barrier regression tests, including 2,000 completion/resume races.
-
-These establish the tested local invariants, not whole-emulator correctness.
-The inherited Kotlin UI was unchanged in this checkpoint.
+- Reproduced a queue-waiting producer and session-parked display consumer.
+  Granting only the consumer drained the queue and parked the producer without
+  executing another ordinary guest instruction; ordinary Resume then worked.
+- The actual drain scope revoked its grant both normally and on exception.
+- 30 timed-wait/run_loop pause-resume cycles and 2,000 completion/resume races.
+- Snapshot waited for queue drain, then excluded a concurrent producer while
+  held. A permanently pending callback refused within the preparation bound
+  without discarding its item. Existing contention/audio/error cleanup tests
+  also passed.
+- fix19 replay-barrier regression tests including 2,000 completion/resume races.
 
 ## Next device check
 
-Apply all eight changed files on fix19, preserving paths, then use the existing
-Android CI. Test regular pause/resume first, then Save State and ordinary Resume.
-Check controls, picture and sound for at least 30 seconds. Do not test Load State
-as a claimed fix: its renderer/audio restoration remains incomplete. Report a
-save refusal or freeze with its message/log. Version-4 states cannot be loaded.
-New logs include `Savestate fix20: kernel snapshot locks acquired`.
+Apply all five changed files together on fix20, retaining paths, and use the
+existing Android CI. Start a fresh game session, check ordinary pause/Resume,
+then try Save State once and Resume. Check controls/audio for 30 seconds.
+Do not test Load State yet. If saving is refused, provide the new error/log;
+repeated attempts in the same state are unnecessary.
+
+Log markers:
+- Savestate fix21: preparing display queue drain
+- Savestate fix21: display queue drained and kernel snapshot locks acquired
+- active HLE NID=0x... (on a running-thread refusal)
+
+Relevant NIDs from this source tree:
+- sceGxmDisplayQueueAddEntry: 0xEC5C26B5
+- sceGxmDisplayQueueFinish: 0xB98C5B0D
+- sceGxmFinish: 0x0733D8AE
+- sceGxmNotificationWait: 0x9F448E79

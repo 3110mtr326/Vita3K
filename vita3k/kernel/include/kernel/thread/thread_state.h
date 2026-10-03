@@ -110,6 +110,13 @@ struct ThreadState {
     // Session pause survives a blocked HLE call completing. Returns the status
     // observed under mutex, for KernelState's resume bookkeeping.
     ThreadStatus pause_for_session();
+    // Only the GXM display-callback thread may be granted this by the save
+    // preparer. Pending callbacks can unblock an already-entered GXM syscall.
+    // The grant must end before the save operation returns (including failure).
+    void set_pause_drain_allowed(bool allowed);
+    // Diagnostic only; never read a running thread's CPU registers externally.
+    // Nested imports restore the previous NID when they return.
+    std::atomic<uint32_t> active_import_nid{ 0 };
     void suspend();
     void resume(bool step = false);
     std::string log_stack_traceback() const;
@@ -171,6 +178,7 @@ private:
     // Separate from debugger suspension and from the one-shot restore request.
     bool session_pause_requested = false;
     bool session_pause_parked = false;
+    bool pause_drain_allowed = false; // protected by mutex
     // Called only by run_loop() with mutex held, including nested callbacks.
     bool park_for_session_pause();
     // Single stepping mode.

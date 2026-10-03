@@ -118,7 +118,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 5; // v5: persistent pause and locked kernel capture; reject older potentially torn snapshots
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 6; // v6: locked kernel capture plus a drained and frozen display queue
 
 template <typename T>
 void write_pod(fs::ofstream &out, const T &value) {
@@ -227,6 +227,7 @@ class KernelSnapshotGuard {
     std::unique_lock<std::mutex> kernel_lock;
     std::vector<std::unique_lock<std::mutex>> locks;
     std::set<std::mutex *> seen;
+    std::unique_lock<std::mutex> display_queue_lock;
 
     bool take(std::mutex &mutex) {
         if (!seen.insert(&mutex).second)
@@ -248,7 +249,7 @@ public:
     explicit KernelSnapshotGuard(KernelState &kernel)
         : kernel_lock(kernel.mutex, std::defer_lock) {}
 
-    bool acquire(KernelState &kernel, MemState &mem, std::string &reason) {
+    bool acquire(KernelState &kernel, MemState &mem, GxmState &gxm, std::string &reason) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         do {
             if (kernel_lock.try_lock()) {
@@ -265,7 +266,8 @@ public:
                             break;
                         }
                         if (thread->status == ThreadStatus::run) {
-                            reason = fmt::format("thread {} ('{}') has not reached the session pause barrier", id, thread->name);
+                            reason = fmt::format("thread {} ('{}') has not reached the session pause barrier (active HLE NID=0x{:08X})",
+                                id, thread->name, thread->active_import_nid.load(std::memory_order_acquire));
                             ready = false;
                             break;
                         }
@@ -281,8 +283,15 @@ public:
                         }
                     }
                 }
-                if (ready)
-                    return true;
+                if (ready) {
+                    // The host display worker pops only AFTER its guest
+                    // callback, sync notifications and data free are complete.
+                    // Also exclude any new push while CPU/RAM is serialized.
+                    display_queue_lock = gxm.display_queue.try_lock_empty();
+                    if (display_queue_lock.owns_lock())
+                        return true;
+                    reason = "GXM display queue has not drained or its lock is busy";
+                }
                 locks.clear();
                 seen.clear();
                 kernel_lock.unlock();
@@ -672,7 +681,7 @@ const char *save_state_result_to_string(SaveStateResult result) {
     case SaveStateResult::ErrorNotPaused:
         return "The session must be paused before saving/loading a state";
     case SaveStateResult::ErrorThreadNotSafe:
-        return "A thread is currently waiting on a kernel object; try again in a moment";
+        return "Could not reach a supported save/load pause point; see the details";
     case SaveStateResult::ErrorIO:
         return "Could not read/write the savestate file";
     case SaveStateResult::ErrorMismatch:
@@ -706,15 +715,33 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 resume_statuses[id] = st;
         }
     }
+    // A producer can be inside sceGxmDisplayQueueAddEntry/Finish while the
+    // display callback is parked by the session pause. Permit ONLY that
+    // dedicated consumer to complete pending work. Other guest threads retain
+    // their pause barriers. Declare this before snapshot: on all exits the
+    // snapshot locks must be released before revoking the grant.
+    struct DisplayQueueDrainScope {
+        ThreadStatePtr thread;
+        explicit DisplayQueueDrainScope(ThreadStatePtr thread)
+            : thread(std::move(thread)) {
+            if (this->thread)
+                this->thread->set_pause_drain_allowed(true);
+        }
+        ~DisplayQueueDrainScope() {
+            if (thread)
+                thread->set_pause_drain_allowed(false);
+        }
+    } display_drain(kernel.get_thread(emuenv.gxm.display_queue_thread));
+    LOG_INFO("Savestate fix21: preparing display queue drain (callback thread {}).", emuenv.gxm.display_queue_thread);
     KernelSnapshotGuard snapshot(kernel);
     std::string snapshot_reason;
-    if (!snapshot.acquire(kernel, mem, snapshot_reason)) {
+    if (!snapshot.acquire(kernel, mem, emuenv.gxm, snapshot_reason)) {
         LOG_WARN("Savestate: save refused before writing: {}", snapshot_reason);
         if (out_detail)
             *out_detail = snapshot_reason;
         return SaveStateResult::ErrorThreadNotSafe;
     }
-    LOG_INFO("Savestate fix20: kernel snapshot locks acquired; guest execution remains paused.");
+    LOG_INFO("Savestate fix21: display queue drained and kernel snapshot locks acquired; guest execution remains paused.");
 
     if (auto reason = find_unsafe_thread_reason(kernel, mem, false, true); !reason.empty()) {
         if (out_detail)
@@ -1002,7 +1029,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     if (!same_layout) {
         if (out_detail)
             *out_detail = "Guest memory allocation layout changed since saving; load refused before memory restore";
-        LOG_WARN("Savestate fix20: refusing changed guest memory allocation layout.");
+        LOG_WARN("Savestate fix21: refusing changed guest memory allocation layout.");
         return SaveStateResult::ErrorMismatch;
     }
 
@@ -1088,7 +1115,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             });
         kernel.invalidate_jit_cache(region.addr, region.bytes.size());
     }
-    LOG_INFO("Savestate fix20: {} GXM host ranges excluded from writes (logical renderer state is not restored).", protected_ranges.size());
+    LOG_INFO("Savestate fix21: {} GXM host ranges excluded from writes (logical renderer state is not restored).", protected_ranges.size());
 
     // ---- Step 2b: host-side state the game refers to by number ----
     {

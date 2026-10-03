@@ -278,6 +278,11 @@ void ThreadState::run_loop() {
             // handle svc call if this was what stopped the cpu
             if (cpu->svc_called) {
                 const uint32_t nid = *Ptr<uint32_t>(read_pc(*cpu) + 4).get(mem);
+                struct ImportDiagnosticScope {
+                    std::atomic<uint32_t> &active;
+                    uint32_t previous;
+                    ~ImportDiagnosticScope() { active.store(previous, std::memory_order_release); }
+                } import_scope{ active_import_nid, active_import_nid.exchange(nid, std::memory_order_acq_rel) };
                 kernel.call_import(*cpu, nid, id);
                 clear_exclusive(*cpu);
             }
@@ -442,10 +447,21 @@ ThreadStatus ThreadState::pause_for_session() {
     return previous;
 }
 
+void ThreadState::set_pause_drain_allowed(const bool allowed) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    pause_drain_allowed = allowed;
+    if (allowed && session_pause_requested && session_pause_parked && status == ThreadStatus::suspend) {
+        session_pause_parked = false;
+        update_status(ThreadStatus::run);
+    } else if (!allowed && session_pause_requested && status == ThreadStatus::run) {
+        stop(*cpu);
+    }
+}
+
 bool ThreadState::park_for_session_pause() {
     // The loader deliberately runs one saved SVC behind its own return
     // barrier. Ordinary execution (including newly started threads) stays put.
-    if (!session_pause_requested || restore_wait_barrier || status != ThreadStatus::run)
+    if (!session_pause_requested || pause_drain_allowed || restore_wait_barrier || status != ThreadStatus::run)
         return false;
     session_pause_parked = true;
     update_status(ThreadStatus::suspend);
@@ -508,6 +524,7 @@ void ThreadState::resume_after_pause(const bool should_run) {
     const bool parked_for_session = session_pause_parked;
     session_pause_requested = false;
     session_pause_parked = false;
+    pause_drain_allowed = false;
     restore_wait_barrier = false;
     if ((should_run || replayed_wait || parked_for_session) && status == ThreadStatus::suspend) {
         single_stepping = false;
