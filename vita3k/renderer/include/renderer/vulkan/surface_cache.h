@@ -24,6 +24,9 @@
 #include <vkutil/objects.h>
 
 #include <optional>
+#include <renderer/surface_inventory.h>
+#include <renderer/vulkan/snapshot_sources.h>
+#include <renderer/vulkan/snapshot_depth_sources.h>
 
 struct SwsContext;
 
@@ -202,7 +205,37 @@ public:
     explicit VKSurfaceCache(VKState &state);
     void cleanup();
 
+    // Caller retains host renderer exclusion. Metadata only; no image readback.
+    SurfaceInventory inspect_snapshot_surfaces() const {
+        return inspect_surface_inventory(color_address_lookup, depth_address_lookup, stencil_address_lookup);
+    }
+
+
+    // Complete color subset only. Caller must separately capture depth/stencil.
+    // Same exclusion as inspection; queue ownership is a caller precondition.
+    std::optional<std::vector<SnapshotPinnedImage>> pin_snapshot_sources(
+        const SurfaceInventory &inventory, uint32_t queue_family, uint64_t budget) const {
+        return pin_snapshot_color_sources(color_address_lookup, inventory, queue_family, budget);
+    }
+
+    // Caller holds continuous renderer exclusion and actual queue ownership.
+    // Pins retain allocations only, not device lifetime or image contents.
+    std::optional<std::vector<SnapshotPinnedImage>> pin_snapshot_color_targets(
+        const SurfaceInventory &inventory, uint32_t family, uint64_t budget) const {
+        return pin_snapshot_color_sources<true>(color_address_lookup, inventory, family, budget);
+    }
+    std::optional<std::vector<SnapshotPinnedImage>> pin_snapshot_depth_targets(
+        const SurfaceInventory &inventory, uint32_t family, uint64_t budget) const {
+        return pin_snapshot_depth_sources<true>(depth_address_lookup, stencil_address_lookup, inventory, family, budget);
+    }
+
     SurfaceRetrieveResult retrieve_color_surface_for_framebuffer(MemState &mem, SceGxmColorSurface *color);
+    // Pass a depth-only inventory covering both depth/stencil maps. Color
+    // resources must be handled separately; this does not authorize a full save.
+    std::optional<std::vector<SnapshotPinnedImage>> pin_snapshot_depth_images(
+        const SurfaceInventory &inventory, uint32_t family, uint64_t budget) const {
+        return pin_snapshot_depth_sources(depth_address_lookup, stencil_address_lookup, inventory, family, budget);
+    }
     std::optional<TextureLookupResult> retrieve_color_surface_as_texture(const SceGxmTexture &texture, const SceGxmColorBaseFormat base_format, TextureViewport *texture_viewport);
 
     SurfaceRetrieveResult retrieve_depth_stencil_for_framebuffer(SceGxmDepthStencilSurface *depth_stencil, const uint32_t width, const uint32_t height);

@@ -16,10 +16,13 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #pragma once
+#include <renderer/snapshot_validation.h>
 
 #include <features/state.h>
 #include <renderer/commands.h>
 #include <renderer/frame_host.h>
+#include <renderer/render_pause.h>
+#include <renderer/host_quiescence.h>
 #include <renderer/types.h>
 #include <threads/queue.h>
 
@@ -33,6 +36,7 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+#include <optional>
 
 struct DialogState;
 struct DisplayState;
@@ -123,6 +127,7 @@ struct State {
 
     std::unique_ptr<std::thread> render_thread;
     std::atomic<bool> render_abort{ false };
+    RenderPause render_pause;
 
     std::vector<ShadersHash> precompile_queue;
     bool precompile_requested = false;
@@ -158,6 +163,18 @@ struct State {
 
     void update_overlays();
     void init_overlay_font_dirs();
+
+    // Unsupported backends fail closed. Acquire without kernel/display locks;
+    // retain session lifetime and release on this same host thread.
+    virtual HostQuiescence pause_host_workers_until(std::chrono::steady_clock::time_point) { return {}; }
+    // Encoded detached image data only; not proof of a restorable GPU snapshot.
+    // Caller holds session lifetime, final kernel guard and this renderer's lease.
+    virtual std::optional<std::vector<uint8_t>> capture_snapshot_image_section(
+        const HostQuiescence &, std::chrono::steady_clock::time_point) { return std::nullopt; }
+
+    // Development-only Load diagnostic. Never submits writes or restores state.
+    virtual SnapshotImageValidation validate_snapshot_image_section(const std::vector<uint8_t> &,
+        const HostQuiescence &, std::chrono::steady_clock::time_point) { return SnapshotImageValidation::Unsupported; }
 
     virtual bool init() = 0;
     virtual void cleanup() {};

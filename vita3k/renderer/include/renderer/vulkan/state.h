@@ -18,13 +18,20 @@
 #pragma once
 
 #include <renderer/state.h>
+#include <renderer/host_quiescence.h>
 #include <renderer/types.h>
+#include <renderer/worker_group_pause.h>
 
 #include <renderer/vulkan/overlay_renderer.h>
 #include <renderer/vulkan/pipeline_cache.h>
 #include <renderer/vulkan/screen_renderer.h>
 #include <renderer/vulkan/surface_cache.h>
 #include <renderer/vulkan/types.h>
+#include <renderer/vulkan/snapshot_resources.h>
+#include <renderer/vulkan/snapshot_job.h>
+#include <renderer/snapshot_collect.h>
+#include <renderer/vulkan/snapshot_image_preflight.h>
+#include <renderer/vulkan/snapshot_upload_prepare.h>
 
 #include <chrono>
 
@@ -49,6 +56,14 @@ struct Viewport {
 };
 
 struct VKState : public renderer::State {
+private:
+    using SnapshotJobs = SnapshotTransferService<SnapshotReadbackJob<SnapshotReadbackResources<>>>;
+    // Session lifetime excludes cleanup; callers hold host worker exclusion.
+    // Submission requires this renderer's acknowledged host pause.
+    std::unique_ptr<SnapshotJobs> snapshot_transfers;
+
+
+public:
     MemState *mem;
 
     // 0 = automatic, > 0 = order in instance.enumeratePhysicalDevices
@@ -107,6 +122,32 @@ struct VKState : public renderer::State {
 
     // queue where we put requests that need to wait for the GPU
     Queue<WaitThreadRequest> request_queue;
+    // Separate from render_pause: every wait worker must finish its own fences
+    // and guest-memory writes before acknowledging. Not a device-wide barrier.
+    WorkerGroupPause writeback_pause;
+
+    // The caller must first quiesce guest/display producers without holding
+    // locks needed by the renderer. This is NOT a full GPU snapshot barrier.
+    HostQuiescence pause_host_workers_until(std::chrono::steady_clock::time_point deadline) override;
+
+    // Save calls under session lifetime, final kernel guard, inactive scenes
+    // and this renderer's host lease. Produces detached SGI1 bytes, not a
+    // restorable full GPU snapshot (textures/anonymous targets still missing).
+    std::optional<std::vector<uint8_t>> capture_snapshot_image_section(const HostQuiescence &lease,
+        std::chrono::steady_clock::time_point deadline) override;
+    // Metadata only, not a restore authorization. Requires continuous session
+    // lifetime and this renderer's host pause; saved data must be decoded first.
+    SnapshotImagePreflight preflight_snapshot_image_records(const SnapshotImageRecords &saved,
+        const HostQuiescence &lease) const;
+
+    // Development preparation only: no submission and no guest/GPU writes.
+    // Builds and immediately discards a recorded upload while this lease is held,
+    // proving that all preparation stages can be joined under renderer exclusion.
+    bool validate_snapshot_image_upload(const SnapshotImageRecords &saved,
+        const HostQuiescence &lease, std::chrono::steady_clock::time_point deadline);
+
+    SnapshotImageValidation validate_snapshot_image_section(const std::vector<uint8_t> &bytes,
+        const HostQuiescence &lease, std::chrono::steady_clock::time_point deadline) override;
 
     vkutil::Image default_image;
     vkutil::Buffer default_buffer;

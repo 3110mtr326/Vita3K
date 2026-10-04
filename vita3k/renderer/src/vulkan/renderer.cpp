@@ -20,6 +20,9 @@
 #define __ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__
 #endif
 
+#include <renderer/snapshot_fences.h>
+#include <renderer/vulkan/snapshot_copy.h>
+#include <renderer/vulkan/snapshot_image_sections.h>
 #include <renderer/functions.h>
 #include <renderer/types.h>
 #include <renderer/vulkan/functions.h>
@@ -151,6 +154,133 @@ const static std::vector<const char *> required_device_extensions = {
 };
 
 namespace renderer::vulkan {
+
+HostQuiescence VKState::pause_host_workers_until(std::chrono::steady_clock::time_point deadline) {
+    auto lease = HostQuiescence::acquire_until(render_pause, writeback_pause,
+        command_buffer_queue, request_queue, deadline);
+    if (!lease) return lease;
+    // Reap abandoned readbacks only after their own fence succeeds. Unknown
+    // submissions remain quarantined until the device-idle teardown below.
+    if (snapshot_transfers)
+        snapshot_transfers->poll([](const auto &job) { return job.poll(); });
+    // The parked render worker owns frame submission/reset; parked writeback
+    // workers cannot consume these fences. Observe without resetting/releasing.
+    try {
+        const auto result = wait_snapshot_fences(frames, deadline,
+            [&](const auto &fences, std::chrono::nanoseconds budget) {
+                const auto status = device.waitForFences(fences, VK_TRUE, static_cast<uint64_t>(budget.count()));
+                if (status == vk::Result::eSuccess) return SnapshotFenceResult::Complete;
+                if (status == vk::Result::eTimeout) return SnapshotFenceResult::Pending;
+                return SnapshotFenceResult::Failed;
+            }, [] { return std::chrono::steady_clock::now(); });
+        if (result != SnapshotFenceResult::Complete) {
+            LOG_WARN("Savestate: submitted frame fences did not complete (reason {}).", static_cast<int>(result));
+            return {}; // local lease releases every host pause and queue lock
+        }
+    } catch (const vk::SystemError &error) {
+        LOG_WARN("Savestate: frame fence query failed: {}", error.what());
+        return {};
+    }
+    const auto inventory = surface_cache.inspect_snapshot_surfaces();
+    if (!inventory.valid) {
+        LOG_WARN("Savestate: inconsistent guest-backed surface cache; capture refused.");
+        return {};
+    }
+    size_t colors = 0, depth_stencil = 0, derived = 0;
+    for (const auto &surface : inventory.surfaces) {
+        if (surface.color_address) ++colors;
+        else ++depth_stencil;
+        derived += surface.derived_entries;
+    }
+    LOG_INFO("Savestate: GPU surface inventory: {} color, {} depth/stencil, {} derived entries (pixels not captured).",
+        colors, depth_stencil, derived);
+    // Conservative first provider: only explicit uncompressed RGBA/BGRA8.
+    // Diagnostic planning only; no transfer buffers or commands are created.
+    const auto copies = describe_snapshot_copies(inventory, 256ULL * 1024 * 1024);
+    if (copies)
+        LOG_INFO("Savestate: {} base color copy regions described, {} buffer bytes (no pixels copied).",
+            copies->regions.size(), copies->buffer_bytes);
+    else
+        LOG_INFO("Savestate: GPU color copy descriptions unavailable for this inventory (no pixels copied).");
+    return lease;
+}
+
+
+std::optional<std::vector<uint8_t>> VKState::capture_snapshot_image_section(const HostQuiescence &lease,
+    std::chrono::steady_clock::time_point deadline) {
+    const auto stopped = [&] {
+        return render_abort.load(std::memory_order_relaxed) || std::chrono::steady_clock::now() >= deadline;
+    };
+    if (!lease.owns_renderer(render_pause) || !snapshot_transfers || stopped()
+        || general_family_index >= physical_device_queue_families.size()) return std::nullopt;
+    const auto flags = physical_device_queue_families[general_family_index].queueFlags;
+    if (!(flags & vk::QueueFlagBits::eGraphics)) return std::nullopt;
+    snapshot_transfers->poll([](const auto &job) { return job.poll(); });
+    if (snapshot_transfers->size()) return std::nullopt;
+    const auto inventory = surface_cache.inspect_snapshot_surfaces();
+    auto result = capture_snapshot_image_sections(inventory,
+        [&](const SurfaceInventory &subset, bool depth, uint64_t bytes) -> std::optional<std::vector<uint8_t>> {
+            if (stopped()) return std::nullopt;
+            auto pins = depth
+                ? surface_cache.pin_snapshot_depth_images(subset, general_family_index, bytes)
+                : surface_cache.pin_snapshot_sources(subset, general_family_index, bytes);
+            if (!pins) return std::nullopt;
+            auto target = SnapshotReadbackResources<>::create(device, allocator, general_family_index, bytes);
+            if (stopped()) return std::nullopt;
+            const auto submission = depth
+                ? enqueue_snapshot_depth_copy(*snapshot_transfers, std::move(target), std::move(*pins),
+                    subset, general_family_index, flags, general_queue)
+                : enqueue_snapshot_copy(*snapshot_transfers, std::move(target), std::move(*pins),
+                    subset, general_family_index, general_queue);
+            if (!submission.submitted) {
+                if (submission.id) snapshot_transfers->abandon(submission.id);
+                return std::nullopt;
+            }
+            auto pixels = collect_snapshot_bytes(*snapshot_transfers, submission.id, bytes, deadline,
+                [&] { return render_abort.load(std::memory_order_relaxed); },
+                [] { return std::chrono::steady_clock::now(); },
+                [](auto until) { std::this_thread::sleep_until(until); });
+            if (pixels.result != SnapshotWaitResult::Complete) return std::nullopt;
+            return std::move(pixels.bytes);
+        });
+    if (stopped()) return std::nullopt;
+    return result;
+}
+
+SnapshotImagePreflight VKState::preflight_snapshot_image_records(const SnapshotImageRecords &saved,
+    const HostQuiescence &lease) const {
+    if (!lease.owns_renderer(render_pause) || render_abort.load(std::memory_order_relaxed))
+        return {SnapshotImageMatchError::InvalidCurrent, {}};
+    return preflight_snapshot_images(saved, surface_cache.inspect_snapshot_surfaces());
+}
+
+bool VKState::validate_snapshot_image_upload(const SnapshotImageRecords &saved,
+    const HostQuiescence &lease, std::chrono::steady_clock::time_point deadline) {
+    const auto stopped = [&] {
+        return render_abort.load(std::memory_order_relaxed) || std::chrono::steady_clock::now() >= deadline;
+    };
+    if (!lease.owns_renderer(render_pause) || !snapshot_transfers || stopped()
+        || general_family_index >= physical_device_queue_families.size()) return false;
+    const auto flags = physical_device_queue_families[general_family_index].queueFlags;
+    if (!(flags & vk::QueueFlagBits::eGraphics)) return false;
+    snapshot_transfers->poll([](const auto &job) { return job.poll(); });
+    if (snapshot_transfers->size()) return false;
+    // Preparation never submits. Destroy command pool, staging buffer and pins
+    // before returning, so none can outlive this lease or carry stale layouts.
+    auto prepared = prepare_snapshot_upload_job(saved, surface_cache, device, allocator,
+        general_family_index, flags, stopped);
+    return bool(prepared) && !stopped();
+}
+
+SnapshotImageValidation VKState::validate_snapshot_image_section(const std::vector<uint8_t> &bytes,
+    const HostQuiescence &lease, std::chrono::steady_clock::time_point deadline) {
+    if (!lease.owns_renderer(render_pause) || render_abort.load(std::memory_order_relaxed)
+        || std::chrono::steady_clock::now() >= deadline) return SnapshotImageValidation::NotReady;
+    const auto records = decode_snapshot_image_sections(bytes);
+    if (!records) return SnapshotImageValidation::InvalidData;
+    return validate_snapshot_image_upload(*records, lease, deadline)
+        ? SnapshotImageValidation::Prepared : SnapshotImageValidation::NotReady;
+}
 
 #if defined(__ANDROID__) && defined(USE_ADRENO_TOOLS)
 // need to avoid patching bcn per custom driver more than once
@@ -919,6 +1049,9 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
 }
 
 void VKState::late_init(const Config &cfg, const std::string_view game_id, MemState &mem) {
+    // Never replace an existing service that might still own GPU work.
+    if (!snapshot_transfers)
+        snapshot_transfers = std::make_unique<SnapshotJobs>(1);
     this->mem = &mem;
 
     bool use_high_accuracy = cfg.current_config.high_accuracy;
@@ -991,6 +1124,15 @@ void VKState::cleanup() {
 
     device.waitIdle();
 
+    // The successful wait above proves no submitted command still references
+    // snapshot images/buffers. Release them before cache, allocator and device.
+    // If waitIdle throws, this block is not reached and ownership is retained.
+    if (snapshot_transfers) {
+        snapshot_transfers->shutdown([] { return true; });
+        snapshot_transfers.reset();
+    }
+
+    writeback_pause.close();
     request_queue.abort();
 
     context = nullptr;
@@ -1075,6 +1217,7 @@ void VKState::cleanup() {
     gxp_ptr_map.clear();
     shaders_cache_hashs.clear();
     request_queue.reset();
+    writeback_pause.prepare_start();
     current_frame_idx = 1;
     last_scene_id = 0;
     shaders_count_compiled = 0;
@@ -1759,6 +1902,7 @@ void VKState::precompile_shader(const ShadersHash &hash) {
 void VKState::preclose_action() {
     // Stop the GPU request wait thread before destruction begins.
     // VKState (owns the queue) is destroyed before VKContext (owns the thread).
+    writeback_pause.close();
     request_queue.abort();
 
     // make sure we are in a game

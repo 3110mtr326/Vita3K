@@ -21,8 +21,6 @@
 #include <renderer/state.h>
 #include <renderer/types.h>
 
-#include <renderer/vulkan/types.h>
-
 #include <config/state.h>
 #include <display/state.h>
 #include <functional>
@@ -135,6 +133,11 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
         if (state.render_abort.load(std::memory_order_relaxed))
             return;
 
+        // Return to the render-loop checkpoint between whole command batches.
+        // Pending command lists remain queued; a pause is not a queue drain.
+        if (state.render_pause.requested())
+            return;
+
         // overlay requested an async present
         if (state.async_flip_requested.load(std::memory_order_relaxed))
             return;
@@ -182,6 +185,7 @@ void reset_command_list(CommandList &command_list) {
 }
 
 static void render_loop(renderer::State &state, DisplayState &display, GxmState &gxm, MemState &mem, Config &config) {
+    RenderPause::Worker pause_worker(state.render_pause);
     if (state.precompile_requested) {
         auto progress_overlay = state.overlay_manager
             ? state.overlay_manager->create<overlay::shader_precompile_progress>()
@@ -243,6 +247,9 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState 
         }
     }
     while (!state.render_abort.load(std::memory_order_relaxed)) {
+        pause_worker.checkpoint();
+        if (state.render_abort.load(std::memory_order_relaxed))
+            break;
 #ifdef TRACY_ENABLE
         ZoneScopedN("Game rendering");
 #endif
@@ -250,6 +257,8 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState 
             break;
 
         process_batches(state, state.features, mem, config, 500);
+
+        pause_worker.checkpoint();
 
         if (state.render_abort.load(std::memory_order_relaxed))
             break;
@@ -282,11 +291,13 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState 
 
 void start_render_thread(State &state, DisplayState &display, GxmState &gxm, MemState &mem, Config &config) {
     state.render_abort = false;
+    state.render_pause.prepare_start();
     state.render_thread = std::make_unique<std::thread>(render_loop, std::ref(state), std::ref(display), std::ref(gxm), std::ref(mem), std::ref(config));
 }
 
 void stop_render_thread(State &state) {
     state.render_abort = true;
+    state.render_pause.close();
     state.command_buffer_queue.abort();
     if (state.render_thread && state.render_thread->joinable())
         state.render_thread->join();

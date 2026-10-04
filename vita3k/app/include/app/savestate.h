@@ -42,6 +42,11 @@ enum class SaveStateResult {
     // The save references a thread (by UID) that no longer exists in the running
     // session, or vice-versa (see the comment at the top of savestate.cpp).
     ErrorThreadSetChanged,
+    // Refuse before applying saved memory while graphics/audio restoration is
+    // incomplete. A successful save does not imply this state is loadable.
+    ErrorUnsupportedHostState,
+    // Capture failed before opening/replacing the output file.
+    ErrorGraphicsNotReady,
 };
 
 const char *save_state_result_to_string(SaveStateResult result);
@@ -56,7 +61,8 @@ fs::path get_savestate_path(const EmuEnvState &emuenv, int slot);
 // pause_threads() calls are idempotent but do not create another ownership level.
 // The caller must retain its pause and exclude resume/teardown for the operation.
 // save_state() additionally locks kernel objects and threads while serializing;
-// renderer and other host workers are not fully frozen by this guard.
+// supported renderer/writeback workers are parked too. This is not full GPU
+// or audio quiescence. Unsupported backends fail before opening the output.
 //
 // out_detail, if non-null, is set to extra diagnostic text on ErrorThreadNotSafe
 // (which specific thread, why it was judged unrecoverable) -- there isn't

@@ -20,6 +20,7 @@
 #include <vkutil/vkutil.h>
 
 #include <bit>
+#include <memory>
 
 namespace vkutil {
 
@@ -27,18 +28,32 @@ void init(vma::Allocator vma_allocator);
 void deinit();
 
 struct Image {
-    vma::Allocation allocation;
+    vma::Allocation allocation{};
     vk::Image image{};
     vk::ImageView view{};
     vk::Sampler sampler{};
 
-    uint32_t width;
-    uint32_t height;
-    vk::Format format;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    vk::Format format = vk::Format::eUndefined;
     ImageLayout layout = ImageLayout::Undefined;
+    // True only for images created by init_image with transfer-source usage.
+    // External/borrowed handles default to unknown and cannot authorize readback.
+    bool snapshot_transfer_source = false;
+    bool snapshot_transfer_destination = false;
 
     // should the existing image, view, sampler be destroyed when this image is destroyed?
     bool destroy_on_deletion = true;
+
+private:
+    std::shared_ptr<const void> allocation_lifetime;
+    vk::Image pinned_image{};
+
+public:
+    // Keeps the allocation only (not views/samplers) alive. Requires stable
+    // image metadata and release of every pin before allocator/device teardown.
+    // Borrowed images and unknown transfer usage cannot produce a pin.
+    std::shared_ptr<const void> pin_snapshot_allocation();
 
     Image();
     Image(uint32_t width, uint32_t height, vk::Format format);

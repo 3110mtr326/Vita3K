@@ -90,6 +90,10 @@
 // ---------------------------------------------------------------------------
 
 #include <app/savestate.h>
+#include <app/savestate_file.h>
+#include <app/savestate_image_section.h>
+#include <audio/state.h>
+#include <ngs/state.h>
 
 #include <emuenv/state.h>
 #include <kernel/state.h>
@@ -99,6 +103,9 @@
 #include <cpu/functions.h>
 #include <gxm/functions.h>
 #include <gxm/state.h>
+#include <gxm/context_preflight.h>
+#include <gxm/context_record_codec.h>
+#include <renderer/state.h>
 #include <io/state.h>
 #include <util/log.h>
 
@@ -118,7 +125,8 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 6; // v6: locked kernel capture plus a drained and frozen display queue
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 9; // v9: GCR1 then length-prefixed SGI1 image sections before RAM
+constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
 void write_pod(fs::ofstream &out, const T &value) {
@@ -216,6 +224,19 @@ bool is_safe_self_contained_wait_nid(uint32_t nid) {
     return nid == NID_sceKernelDelayThread || nid == NID_sceKernelDelayThread200
         || nid == NID_sceAudioOutOutput;
 }
+
+struct DisplayQueueDrainScope {
+        ThreadStatePtr thread;
+        explicit DisplayQueueDrainScope(ThreadStatePtr thread)
+            : thread(std::move(thread)) {
+            if (this->thread)
+                this->thread->set_pause_drain_allowed(true);
+        }
+        ~DisplayQueueDrainScope() {
+            if (thread)
+                thread->set_pause_drain_allowed(false);
+        }
+    };
 
 // Freeze kernel wait queues AND their threads while reading CPU/sync/RAM.
 // A run_loop pause barrier alone is insufficient: an HLE timeout can still
@@ -451,6 +472,70 @@ struct ObjectSetRecord {
 struct GxmCountsRecord {
     uint32_t sync_objects, render_targets, deferred_contexts, immediate_context;
 };
+
+// Validate identities before aborting waits or restoring any memory. Counts
+// alone cannot distinguish a deleted object replaced by another object.
+std::string compare_object_sets(const std::vector<ObjectSetRecord> &saved,
+    const std::vector<ObjectSetRecord> &current) {
+    const auto canonical = [](const std::vector<ObjectSetRecord> &sets,
+                               std::map<std::string, std::vector<SceUID>> &result) {
+        for (const auto &record : sets) {
+            auto ids = record.uids;
+            std::sort(ids.begin(), ids.end());
+            if (std::adjacent_find(ids.begin(), ids.end()) != ids.end()
+                || !result.emplace(record.kind, std::move(ids)).second)
+                return false;
+        }
+        return true;
+    };
+    std::map<std::string, std::vector<SceUID>> saved_sets, current_sets;
+    if (!canonical(saved, saved_sets) || !canonical(current, current_sets))
+        return "Duplicate kernel object identities in snapshot metadata";
+    if (saved_sets.size() != current_sets.size())
+        return "Kernel object categories differ from the saved state";
+    for (const auto &[kind, ids] : saved_sets) {
+        const auto it = current_sets.find(kind);
+        if (it == current_sets.end() || it->second != ids)
+            return fmt::format("Kernel {} identities changed since saving; reconstruction is not implemented", kind);
+    }
+    return {};
+}
+
+template <typename Records>
+bool records_match_object_set(const Records &records, const char *kind,
+    const std::vector<ObjectSetRecord> &sets) {
+    const auto it = std::find_if(sets.begin(), sets.end(),
+        [&](const auto &entry) { return entry.kind == kind; });
+    if (it == sets.end())
+        return false;
+    auto expected = it->uids;
+    std::vector<SceUID> actual;
+    for (const auto &record : records)
+        actual.push_back(record.uid);
+    std::sort(actual.begin(), actual.end());
+    std::sort(expected.begin(), expected.end());
+    return actual == expected
+        && std::adjacent_find(actual.begin(), actual.end()) == actual.end();
+}
+
+// Call only under KernelSnapshotGuard after the display queue has drained.
+// Do not run the old destructive path with host subsystems that the file does
+// not reconstruct. This is an explicit development limitation, not success.
+std::string unsupported_host_restore_reason(EmuEnvState &emuenv) {
+    if (emuenv.gxm.immediate_context != 0 || !emuenv.gxm.deferred_contexts.empty()
+        || !emuenv.gxm.render_targets.empty() || !emuenv.gxm.sync_objects.empty()
+        || !emuenv.gxm.host_objects.empty() || !emuenv.gxm.memory_mapped_regions.empty())
+        return "GXM/GPU state restoration is not implemented; no saved memory was applied";
+    if (!emuenv.ngs.systems.empty())
+        return "NGS audio state restoration is not implemented; no saved memory was applied";
+    // Do not invert audio/kernel lock order if a host audio operation is busy.
+    std::unique_lock<std::mutex> audio_lock(emuenv.audio.mutex, std::try_to_lock);
+    if (!audio_lock.owns_lock())
+        return "Audio state is busy; no saved memory was applied";
+    if (!emuenv.audio.out_ports.empty() || emuenv.audio.in_port.running)
+        return "Audio backend state restoration is not implemented; no saved memory was applied";
+    return {};
+}
 
 template <typename Map>
 ObjectSetRecord collect_object_set(const char *kind, const Map &map) {
@@ -688,6 +773,10 @@ const char *save_state_result_to_string(SaveStateResult result) {
         return "This savestate was made with a different game or an incompatible build";
     case SaveStateResult::ErrorThreadSetChanged:
         return "This savestate was made with a different set of running threads";
+    case SaveStateResult::ErrorUnsupportedHostState:
+        return "This build cannot restore the active graphics/audio state yet";
+    case SaveStateResult::ErrorGraphicsNotReady:
+        return "Graphics could not reach a safe capture point; the save was not written";
     }
     return "Unknown error";
 }
@@ -720,21 +809,36 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     // dedicated consumer to complete pending work. Other guest threads retain
     // their pause barriers. Declare this before snapshot: on all exits the
     // snapshot locks must be released before revoking the grant.
-    struct DisplayQueueDrainScope {
-        ThreadStatePtr thread;
-        explicit DisplayQueueDrainScope(ThreadStatePtr thread)
-            : thread(std::move(thread)) {
-            if (this->thread)
-                this->thread->set_pause_drain_allowed(true);
-        }
-        ~DisplayQueueDrainScope() {
-            if (thread)
-                thread->set_pause_drain_allowed(false);
-        }
-    } display_drain(kernel.get_thread(emuenv.gxm.display_queue_thread));
+    DisplayQueueDrainScope display_drain(kernel.get_thread(emuenv.gxm.display_queue_thread));
     LOG_INFO("Savestate fix21: preparing display queue drain (callback thread {}).", emuenv.gxm.display_queue_thread);
-    KernelSnapshotGuard snapshot(kernel);
+    // Drain guest/display producers first, but release ALL their locks before
+    // waiting for the host renderer (it may need those locks to finish).
     std::string snapshot_reason;
+    {
+        KernelSnapshotGuard drain_snapshot(kernel);
+        if (!drain_snapshot.acquire(kernel, mem, emuenv.gxm, snapshot_reason)) {
+            if (out_detail)
+                *out_detail = snapshot_reason;
+            return SaveStateResult::ErrorThreadNotSafe;
+        }
+    }
+    // Declare host lease before the final kernel guard: on every return/throw,
+    // kernel/display locks release first, then queues, writeback and renderer.
+    if (!emuenv.renderer) {
+        if (out_detail)
+            *out_detail = "No renderer is available for graphics capture";
+        return SaveStateResult::ErrorGraphicsNotReady;
+    }
+    auto host_pause = emuenv.renderer->pause_host_workers_until(
+        std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    if (!host_pause) {
+        if (out_detail)
+            *out_detail = fmt::format("Host graphics pause unavailable (stage {}); no save file was written",
+                static_cast<int>(host_pause.failure_reason()));
+        return SaveStateResult::ErrorGraphicsNotReady;
+    }
+    KernelSnapshotGuard snapshot(kernel);
+    snapshot_reason.clear();
     if (!snapshot.acquire(kernel, mem, emuenv.gxm, snapshot_reason)) {
         LOG_WARN("Savestate: save refused before writing: {}", snapshot_reason);
         if (out_detail)
@@ -748,6 +852,31 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             *out_detail = std::move(reason);
         return SaveStateResult::ErrorThreadNotSafe;
     }
+
+    // Logical records first: no audio reconstruction. Refuse
+    // unsafe scenes/commands before opening the output.
+    const auto graphics = gxm::capture_context_records(emuenv, host_pause);
+    if (!graphics) {
+        if (out_detail)
+            *out_detail = fmt::format("Graphics capture refused (reason {}, context 0x{:08X}); no save file was written",
+                static_cast<int>(graphics.error), graphics.offending_address);
+        return SaveStateResult::ErrorGraphicsNotReady;
+    }
+    const auto graphics_bytes = gxm::encode_context_records(graphics.records);
+    if (!graphics_bytes) {
+        if (out_detail)
+            *out_detail = "Logical graphics records are invalid or exceed the capture limit";
+        return SaveStateResult::ErrorGraphicsNotReady;
+    }
+    const auto image_bytes = emuenv.renderer->capture_snapshot_image_section(host_pause,
+        std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    if (!image_bytes || image_bytes->size() < 16 || image_bytes->size() > MAX_IMAGE_SECTION_BYTES) {
+        if (out_detail)
+            *out_detail = "GPU image capture unsupported, busy or incomplete; the previous save was not replaced";
+        return SaveStateResult::ErrorGraphicsNotReady;
+    }
+    LOG_INFO("Savestate: {} logical contexts and {} image-section bytes encoded for v9; restoration remains unsupported.",
+        graphics.records.size(), image_bytes->size());
 
     // Keep snapshot locks until disk serialization ends, including on errors.
     // This avoids another ~450 MB copy on Android. The worker must not call
@@ -824,14 +953,21 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
 
     fs::create_directories(path.parent_path());
 
-    fs::ofstream out(path, std::ios::out | std::ios::binary | std::ios::trunc);
-    if (!out)
+    SavestateFile file(path);
+    if (!file.open()) {
+        if (out_detail)
+            *out_detail = "Could not open a temporary save file; the previous slot was not replaced";
         return SaveStateResult::ErrorIO;
+    }
+    auto &out = file.stream();
 
     out.write(SAVESTATE_MAGIC, sizeof(SAVESTATE_MAGIC));
     write_pod(out, SAVESTATE_FORMAT_VERSION);
     write_string(out, emuenv.io.title_id);
     write_pod(out, static_cast<uint64_t>(emuenv.frame_count));
+    out.write(reinterpret_cast<const char *>(graphics_bytes->data()), graphics_bytes->size());
+    write_pod(out, static_cast<uint32_t>(image_bytes->size()));
+    out.write(reinterpret_cast<const char *>(image_bytes->data()), image_bytes->size());
 
     // -- Memory --
     // Defensive, redundant re-check of get_allocated_regions()'s own null-guard
@@ -886,16 +1022,56 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         write_pod(out, rec);
     write_host_state(out, io_files, object_sets, gxm_counts);
 
-    const bool ok = static_cast<bool>(out);
-    out.close();
-
-    if (!ok) {
+    if (!file.commit()) {
+        if (out_detail)
+            *out_detail = "Save write or replacement failed; the previous slot was not replaced";
         LOG_ERROR("Savestate: write to {} failed.", path.string());
         return SaveStateResult::ErrorIO;
     }
 
     LOG_INFO("Savestate: saved {} memory region(s), {} thread(s) ({} waiting) to {}.", regions.size(), thread_records.size(), waiting_thread_count, path.string());
     return SaveStateResult::Success;
+}
+
+// Diagnostic only. Always return before thread abort/replay or saved RAM writes.
+static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
+    const std::vector<uint8_t> &bytes, std::string *out_detail) {
+    auto &kernel = emuenv.kernel;
+    auto &mem = emuenv.mem;
+    if (!kernel.is_threads_paused()) return SaveStateResult::ErrorNotPaused;
+    if (!emuenv.renderer) return SaveStateResult::ErrorGraphicsNotReady;
+    DisplayQueueDrainScope display_drain(kernel.get_thread(emuenv.gxm.display_queue_thread));
+    std::string reason;
+    {
+        KernelSnapshotGuard drain_snapshot(kernel);
+        if (!drain_snapshot.acquire(kernel, mem, emuenv.gxm, reason)) {
+            if (out_detail) *out_detail = reason;
+            return SaveStateResult::ErrorThreadNotSafe;
+        }
+    }
+    auto host_pause = emuenv.renderer->pause_host_workers_until(
+        std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    if (!host_pause) return SaveStateResult::ErrorGraphicsNotReady;
+    KernelSnapshotGuard snapshot(kernel);
+    if (!snapshot.acquire(kernel, mem, emuenv.gxm, reason)) {
+        if (out_detail) *out_detail = reason;
+        return SaveStateResult::ErrorThreadNotSafe;
+    }
+    reason = find_unsafe_thread_reason(kernel, mem, false, true);
+    if (!reason.empty()) {
+        if (out_detail) *out_detail = reason;
+        return SaveStateResult::ErrorThreadNotSafe;
+    }
+    const auto result = emuenv.renderer->validate_snapshot_image_section(bytes, host_pause,
+        std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    const char *stage = result == renderer::SnapshotImageValidation::Prepared ? "prepared"
+        : result == renderer::SnapshotImageValidation::InvalidData ? "invalid-data"
+        : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
+    LOG_INFO("Savestate load diagnostic: image preparation {}; no upload submitted or saved RAM applied.", stage);
+    if (out_detail) *out_detail = fmt::format(
+        "Image preparation: {}. Diagnostic only; no saved state was applied. Full graphics/audio restoration is not implemented", stage);
+    return result == renderer::SnapshotImageValidation::InvalidData
+        ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
 }
 
 SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::string *out_detail) {
@@ -920,6 +1096,28 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     if (title_id != emuenv.io.title_id) {
         LOG_ERROR("Savestate: title mismatch ({} != running {}).", title_id, emuenv.io.title_id);
         return SaveStateResult::ErrorMismatch;
+    }
+
+    const auto saved_graphics = gxm::read_context_records(in);
+    if (!saved_graphics) {
+        if (out_detail)
+            *out_detail = "Invalid or truncated logical graphics section";
+        return SaveStateResult::ErrorMismatch;
+    }
+    uint32_t image_section_size = 0;
+    if (!read_pod(in, image_section_size)) return SaveStateResult::ErrorMismatch;
+    const auto image_section = read_savestate_image_section(in, image_section_size, MAX_IMAGE_SECTION_BYTES);
+    if (!image_section) {
+        if (out_detail) *out_detail = "Invalid or truncated saved GPU image section";
+        return SaveStateResult::ErrorMismatch;
+    }
+    // Diagnostic is an unconditional early return. Even successful preparation
+    // must never reach RAM writes or wait replay until full restore is supported.
+    if (!image_section->empty()) return diagnose_saved_images(emuenv, *image_section, out_detail);
+    if (!saved_graphics->empty()) {
+        if (out_detail)
+            *out_detail = "This save contains logical graphics records; GPU/audio restoration is not implemented";
+        return SaveStateResult::ErrorUnsupportedHostState;
     }
 
     // -- Memory --
@@ -995,19 +1193,37 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     if (!kernel.is_threads_paused())
         return SaveStateResult::ErrorNotPaused;
 
-    // A waiting thread is restored by re-executing its `svc #0`, which sits one
-    // instruction before the saved PC. That only works for ARM-mode import stubs;
-    // save_state() only ever stores such threads, so anything else is a corrupt
-    // or incompatible file.
+    // Reject malformed thread records before starting even the bounded drain.
+    std::set<SceUID> saved_thread_ids;
     for (const auto &rec : thread_records) {
-        if (static_cast<ThreadStatus>(rec.status) == ThreadStatus::wait && ((rec.ctx.cpsr & 0x20) != 0 || rec.ctx.get_pc() < 4))
+        const auto status = static_cast<ThreadStatus>(rec.status);
+        if (!saved_thread_ids.insert(rec.id).second
+            || (status != ThreadStatus::wait && status != ThreadStatus::suspend && status != ThreadStatus::dormant)
+            || rec.resume_status > static_cast<uint8_t>(ThreadStatus::wait)
+            || rec.in_condvar > 1
+            || (rec.in_condvar && status != ThreadStatus::wait)
+            || (status == ThreadStatus::wait && ((rec.ctx.cpsr & 0x20) != 0 || rec.ctx.get_pc() < 4))) {
+            if (out_detail)
+                *out_detail = "Invalid or duplicate thread record in saved state";
             return SaveStateResult::ErrorMismatch;
+        }
     }
 
-    // The set of threads must be identical -- see the file header comment.
     std::vector<ThreadStatePtr> thread_handles; // parallel to thread_records
     {
-        const std::lock_guard<std::mutex> lock(kernel.mutex);
+        // Load needs the same preparation as save: otherwise a currently
+        // blocked GXM producer cannot be stopped while its callback is parked.
+        // Pending callbacks may finish, but no saved bytes or abort requests
+        // are applied in this preflight scope.
+        DisplayQueueDrainScope display_drain(kernel.get_thread(emuenv.gxm.display_queue_thread));
+        KernelSnapshotGuard snapshot(kernel);
+        std::string reason;
+        if (!snapshot.acquire(kernel, mem, emuenv.gxm, reason)) {
+            if (out_detail)
+                *out_detail = reason;
+            LOG_WARN("Savestate load preflight refused: {}", reason);
+            return SaveStateResult::ErrorThreadNotSafe;
+        }
         if (kernel.threads.size() != thread_records.size())
             return SaveStateResult::ErrorThreadSetChanged;
         thread_handles.reserve(thread_records.size());
@@ -1017,30 +1233,57 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 return SaveStateResult::ErrorThreadSetChanged;
             thread_handles.push_back(it->second);
         }
-    }
 
-    // This loader does not restore allocator bookkeeping. Refuse a different
-    // allocation layout before aborting waits or touching the running session.
-    const auto current_regions = get_allocated_regions(mem);
-    bool same_layout = current_regions.size() == pending_regions.size();
-    for (size_t i = 0; same_layout && i < current_regions.size(); ++i)
-        same_layout = current_regions[i].first == pending_regions[i].addr
-            && current_regions[i].second == pending_regions[i].bytes.size();
-    if (!same_layout) {
-        if (out_detail)
-            *out_detail = "Guest memory allocation layout changed since saving; load refused before memory restore";
-        LOG_WARN("Savestate fix21: refusing changed guest memory allocation layout.");
-        return SaveStateResult::ErrorMismatch;
-    }
+        reason = compare_object_sets(saved_object_sets, collect_kernel_object_sets(kernel, true));
+        if (!reason.empty()) {
+            if (out_detail)
+                *out_detail = reason;
+            LOG_WARN("Savestate load preflight refused: {}", reason);
+            return SaveStateResult::ErrorMismatch;
+        }
+        if (!records_match_object_set(sema_records, "semaphores", saved_object_sets)
+            || !records_match_object_set(mutex_records, "mutexes", saved_object_sets)
+            || !records_match_object_set(lwmutex_records, "lwmutexes", saved_object_sets)
+            || !records_match_object_set(eventflag_records, "eventflags", saved_object_sets)
+            || !records_match_object_set(simple_event_records, "simple_events", saved_object_sets)) {
+            if (out_detail)
+                *out_detail = "Synchronization records do not match saved object identities";
+            return SaveStateResult::ErrorMismatch;
+        }
 
-    // Nothing has been touched so far, so refusing here is free. Threads that
-    // are blocked in something that can not be aborted must be refused now,
-    // before the first one is disturbed.
-    if (auto reason = find_unsafe_thread_reason(kernel, mem, true); !reason.empty()) {
-        if (out_detail)
-            *out_detail = std::move(reason);
-        return SaveStateResult::ErrorThreadNotSafe;
-    }
+        const auto current_regions = get_allocated_regions(mem);
+        bool same_layout = current_regions.size() == pending_regions.size();
+        for (size_t i = 0; same_layout && i < current_regions.size(); ++i)
+            same_layout = current_regions[i].first == pending_regions[i].addr
+                && current_regions[i].second == pending_regions[i].bytes.size();
+        if (!same_layout) {
+            if (out_detail)
+                *out_detail = "Guest memory allocation layout changed since saving; no saved memory was applied";
+            return SaveStateResult::ErrorMismatch;
+        }
+        reason = find_unsafe_thread_reason(kernel, mem, true, true);
+        if (!reason.empty()) {
+            if (out_detail)
+                *out_detail = reason;
+            return SaveStateResult::ErrorThreadNotSafe;
+        }
+        const GxmCountsRecord current_gxm = collect_gxm_counts(emuenv.gxm);
+        if (current_gxm.sync_objects != saved_gxm_counts.sync_objects
+            || current_gxm.render_targets != saved_gxm_counts.render_targets
+            || current_gxm.deferred_contexts != saved_gxm_counts.deferred_contexts
+            || current_gxm.immediate_context != saved_gxm_counts.immediate_context) {
+            if (out_detail)
+                *out_detail = "Graphics object layout changed since saving; no saved memory was applied";
+            return SaveStateResult::ErrorMismatch;
+        }
+        reason = unsupported_host_restore_reason(emuenv);
+        if (!reason.empty()) {
+            if (out_detail)
+                *out_detail = reason;
+            LOG_WARN("Savestate load preflight refused: {}", reason);
+            return SaveStateResult::ErrorUnsupportedHostState;
+        }
+    } // release snapshot locks and revoke callback drain BEFORE aborting waits
 
     // ---- Step 1: bring every thread to a standstill (suspend or dormant) ----
     // A thread blocked in a kernel wait aborts it and unregisters itself from

@@ -1,112 +1,1292 @@
-# Experimental Android savestates — fix21
+# Bounded color readback planning checkpoint (after fix21)
 
-Target: Xperia 1 II SOG01 / FFX HD / PCSG00219.
-Apply this incremental checkpoint on the supplied fix20 sources.
-**Device validation remains save + ordinary Resume, not Load State.**
-Renderer/GPU/audio restoration is still incomplete.
+This is unfinished source work, not a device-test release or a working FFX
+load implementation. Keep using the tested fix21 build for now. No new APK
+build or device test is requested for this checkpoint.
 
-## Evidence and scope
+## Load image preparation diagnostic (latest change)
 
-The October 3 device log recorded eight save refusals, all naming thread 98,
-PhyreEngineRenderThread, as not reaching the pause barrier. No successful save
-was recorded. The user confirmed controls and audio returned on Resume after
-refusal. The log did not record the active HLE call, so the precise device
-blocking site is not yet proven.
+Load now reads the v9 image section and runs a non-restoring preparation diagnostic
+before its existing graphics-state refusal. Section length is bounded and the
+file's remaining bytes are checked before allocation; truncation returns mismatch.
+The image section is consumed exactly, leaving the RAM payload unread. Nonempty
+logical graphics with no image section still refuses without restoring anything.
 
-A concrete dependency exists in the sources: sceGxmDisplayQueueAddEntry can
-block on queue capacity or completion; sceGxmDisplayQueueFinish waits for an
-empty queue. The host consumer calls run_guest_function on the dedicated
-display thread and pops the queue only after callback completion, sync
-notifications and freeing callback data. fix20's session gate also parks that
-guest display callback. A producer can therefore remain inside HLE with status
-run while waiting for a consumer held by the pause.
+For nonempty images, diagnose_saved_images requires a paused session, drains
+current display producers with a temporary kernel guard, releases those locks,
+acquires the renderer host pause, then acquires the final kernel guard. Unsafe
+waits refuse before validation. The renderer decodes SGI1 and uses the previously
+tested upload preparation endpoint, which discards all unsubmitted work before
+returning. Prepared, invalid-data, unsupported-backend and not-ready are reported
+in the log. Even Prepared returns ErrorUnsupportedHostState, never Load success.
+There is no queue submission, saved RAM write, wait abort/replay, or graphics/
+audio restoration from this diagnostic path. Ordinary current display work can
+finish during the existing drain protocol; this is not a zero-activity snapshot.
 
-## Change
+Tests exercise production framing and the early diagnostic return without
+consuming RAM, truncated/bounded sections, actual diagnostic pause/lock ordering,
+all refusal paths and exception cleanup. Existing renderer gate and combined
+image-section tests pass. Six native translation units and the Vulkan renderer
+pass host syntax checks. Android build and device behavior remain unverified.
 
-Only while preparing a save, DisplayQueueDrainScope grants the registered GXM
-display callback thread permission to complete its pending guest work despite
-the session pause. All ordinary guest threads retain their gates. Only a thread
-parked by the session is woken; debugger suspensions and still-blocked waits are
-not forcibly completed. The grant is revoked on success, refusal and exception.
-It does not fake successful completion, discard queue contents or abort a wait.
+Device validation can now distinguish preparation readiness from completed
+restoration: make a fresh v9 Save, invoke Load, capture the message/log, then
+check Resume controls and sound. The expected Load outcome is a diagnostic
+refusal even when image preparation says prepared. This is still a development
+build; full CPU/kernel/GXM/audio and GPU restore transaction remains unfinished.
 
-KernelSnapshotGuard still tries the kernel/primitive/thread locks without
-blocking on a second lock. It now also requires the display queue to be empty
-and retains its mutex for the entire snapshot, excluding new submissions or
-consumption. This is checked with Queue::try_lock_empty(), not unlocked size().
-All guest threads must be non-running and supported before the capture begins.
-The original three-second preparation deadline is unchanged. On contention,
-partial locks are released so the producer/consumer can progress.
+## Renderer upload preparation validation (previous checkpoint)
 
-The drain scope is declared before the snapshot guard so snapshot locks are
-destroyed before the drain scope takes the callback thread mutex to revoke its
-grant. A callback that needs a paused ordinary thread still causes a bounded
-refusal. This is not a general scheduler or renderer pause implementation.
+VKState::validate_snapshot_image_upload joins the real renderer state to the
+upload preparation pipeline. It requires this renderer's acknowledged host lease,
+a live idle readback service, a valid graphics queue family, no render abort and
+an unexpired deadline. Existing readback work is polled and any retained job
+blocks preparation. Cancellation is also checked throughout the inner pipeline.
 
-ThreadState now publishes the currently executing HLE NID atomically. Nested
-imports restore their previous diagnostic NID on return. A running-thread save
-refusal includes this NID without reading that thread's live CPU registers.
-Zero means no published HLE call at observation time; the diagnostic is not
-used as synchronization or as permission to capture a running thread.
+This is a development validation endpoint, not a restore operation: it creates
+and records an upload, then destroys the unsubmitted job before returning. No
+prepared command or image pin can escape the supplied host pause and later use
+stale layouts. Normal return, rejection and exceptions all unwind local ownership.
+There is no live upload service to drain because this endpoint never submits.
 
-File version is 6 to reject older snapshots that did not require the drained
-display queue. It does not indicate a complete renderer snapshot.
+Tests extract the production method and exercise foreign leases, missing/busy
+service, invalid/non-graphics family, deadline, abort, preparation rejection,
+exception and final cancellation with destruction counts. Real renderer syntax
+checking covers the VKSurfaceCache/Vulkan/VMA preparation integration.
 
-## Inherited behavior and unresolved work
+This endpoint is not called by Load or the UI. No actual GPU restoration,
+Android build or FFX device test was performed. Full restore ordering, cache
+bookkeeping, GPU-write failure handling and CPU/kernel/GXM/audio restoration
+remain unfinished; Save v9 and Load refusal are unchanged.
 
-fix20's persistent session pause, bounded kernel snapshot locks, protected-GXM
-write exclusions, region bounds checks and allocation-layout refusal remain.
-fix19's Android worker, operation gate and replay-wait barrier remain unchanged.
+## Joined upload preparation (previous checkpoint)
 
-The main unresolved areas are renderer/GPU workers and resources, pending
-renderer command lists, typed GXM logical state, NGS objects and audio queues,
-allocation identity/bookkeeping, kernel object reconstruction, remaining wait
-timeouts/FIFO order, transactional load failures, host file side effects and
-strong session identity. A matching allocation bitmap is not proof of identity.
-GXM protected ranges do not cover every host object or command buffer in guest
-RAM. The separate pre-save shutdown crash has not been fixed.
+prepare_snapshot_upload_job now joins saved/current metadata matching, CPU pixel
+validation, actual cache target collection, mapped/flushed buffer creation and
+command recording. Color and depth subsets are pinned separately, then merged
+back into current-inventory order. Both empty subsets are rejected by preflight;
+a single populated subset is supported. Duplicate live handles across subsets
+are rejected before allocation. The production resource factory copies exactly
+the bytes validated and passed to the recorder, eliminating separate caller
+buffer/payload association in this path.
 
-Keeping live GXM objects can still leave current state.active beside old guest
-RAM. This patch does not claim to resolve NOT_WITHIN_SCENE or successful FFX
-Load State. A save may still be refused when another unsupported dependency is
-present. No claim is made of a globally atomic machine snapshot.
+Cancellation checkpoints cover entry, CPU preparation, each subset, allocation
+and recording. Every failure or exception unwinds unsubmitted resources and pins.
+The result can be passed directly to enqueue_prepared_snapshot_upload, which
+registers ownership before queue submission without recording the commands again.
+Existing upload orchestration uses the same submission helper.
+
+Tests use actual cache collectors, preparation and recording with mock commands
+and allocation. They cover reordered mixed inventories, color-only/depth-only,
+shape mismatch, missing destination capability, partial collection, cross-subset
+aliases, allocation/record failures, invalid queues and all six cancellation
+checkpoints. Existing submission ownership tests pass. Explicit instantiation of
+the complete real VKSurfaceCache/Vulkan/VMA preparation-to-submit path passes
+host syntax checking; the syntax test does not execute that GPU path.
+
+This path still requires continuous renderer/cache exclusion, actual queue
+ownership, and device lifetime through retirement. Matching guest addresses and
+shape does not prove historical cache identity or restore cache bookkeeping.
+There is no GPU-write rollback or full CPU/kernel/GXM/audio restore transaction.
+Load is not connected, and no Android build or FFX device test was performed.
+Save format v9 and conservative Load refusal remain unchanged.
+
+## Cache upload target collection (previous checkpoint)
+
+vkutil::Image now tracks TRANSFER_DST capability from successful image creation,
+transfers it on move and clears it on destruction/moved-from objects. Cache target
+collectors require this actual capability before pinning each allocation and
+report TRANSFER_DST to the upload recorder. They reuse existing whole-subset,
+format, shape, layout, uniqueness and derived-image checks. This is deliberately
+conservative: readback capability remains required too.
+
+VKSurfaceCache exposes color and depth/stencil target collection separately.
+Partial failure unwinds acquired pins. Caller must still provide continuous cache
+exclusion, actual queue ownership and device lifetime. Allocation pins do not
+restore cache metadata or prove logical identity across save/load times.
+
+Tests verify both target types, missing destination capability, partial unwind,
+readback compatibility, and actual Image move/destroy allocation ownership.
+Renderer syntax checking instantiates the real cache collectors successfully.
+No live upload or Load integration was enabled. Save v9 is unchanged; complete
+FFX restoration and Android/device validation remain outstanding.
+
+## GPU upload submission ownership (previous checkpoint)
+
+SnapshotUploadJob retains target allocation tokens and prepared upload resources.
+The new enqueue_snapshot_upload helper records validated commands, registers the
+job in the persistent transfer service, then submits its command and fence.
+Recording refusal/exception and service capacity rejection release prepared
+resources without submission. Uncertain submission retains resources until
+confirmed idle; abandoning an in-flight job retains it until fence completion.
+Completion acknowledgement uses the service fence gate before retiring the job.
+
+Caller must supply genuine allocation pins, accurate TRANSFER_DST metadata,
+resources created from exactly the supplied upload bytes, matching queue family,
+queue synchronization and renderer quiescence. This helper does not itself collect
+cache targets or prove these caller contracts. It is not called by Load or the
+live renderer. GPU writes cannot be rolled back by this ownership layer, and a
+successful fence is not proof of a complete emulator restore.
+
+Mock tests cover normal/uncertain submission, pending retention, recording refusal
+and exceptions, missing pins, capacity rejection and completion acknowledgement.
+Explicit instantiation of the real Vulkan queue/resource/recorder path passes
+syntax checking. No Android build or actual GPU/FFX restoration was tested.
+Save v9 and Load refusal are unchanged.
+
+## GPU upload resource preparation (previous checkpoint)
+
+SnapshotUploadResources owns a mapped host-visible TRANSFER_SRC buffer, a
+transient command pool with one primary command buffer, and an unsignaled fence.
+Creation copies the immutable input span and flushes its allocation before
+returning. Empty/over-budget input and reserved queue families are rejected.
+There is no exposed mapped pointer or rewrite API. Exceptions at buffer creation,
+flush, pool creation, command allocation and fence creation release owned resources.
+
+The caller must retain this resource and target allocation pins in a persistent
+transfer owner before submission, and keep device/allocator alive until completion.
+Tests cover copying before flush, exact flush range, five injected failure stages,
+unmapped memory, invalid queue families and pending/abandoned transfer retention.
+Driver-free tests and real Vulkan/VMA explicit template syntax checks pass.
+
+This adds preparation only. No actual GPU submission or Load connection exists.
+Target lifetime integration, failure handling after GPU writes and full emulator
+restoration remain unfinished. Android/FFX testing is still outstanding.
+Save format v9 and Load refusal are unchanged.
+
+## GPU upload command recording (previous checkpoint)
+
+record_snapshot_upload validates the whole CPU upload description and target
+metadata before command.begin. It requires a graphics queue, unique live target
+handles, exact dimensions/formats/family, single samples, transfer-destination
+usage and known color/combined-depth layouts. Every required aspect must occur
+exactly once, with full base-level extents, one layer, aligned/nonoverlapping
+bounded buffer ranges. D32 depth range and canonical D24 bytes are rechecked.
+
+The recorder emits a host-write to transfer-read buffer barrier, transitions
+targets to TRANSFER_DST_OPTIMAL, records buffer-to-image copies, and restores
+each original layout. Both aspects transition together for combined depth formats.
+Recording exceptions require discarding the command without submission.
+
+This function records only and is not called by Load. Caller still must supply
+an allocated/flushed transfer-source GPU buffer with matching bytes and retain
+verified targets through completion. Target identity/lifetime integration, mapped
+upload resources, submission ownership, failures after GPU writes and the full
+emulator restore transaction are unfinished. No rollback is implied.
+
+Tests cover color plus D16/D24/D32, every aspect, layout restoration, host barrier,
+missing usage, duplicate targets, wrong family/layout/sample count, short buffers,
+missing/repeated/overlapping regions, bad subresources, invalid depth values and
+recording exceptions. Driver-free tests and explicit real vk::CommandBuffer
+template instantiation pass. No GPU submission, Android build or FFX restoration
+tested. Save framing stays v9 and the Load refusal remains unchanged.
+
+## CPU upload buffer preparation (previous checkpoint)
+
+prepare_snapshot_upload_data matches saved records to the current inventory,
+validates depth payloads, then constructs one bounded CPU buffer and copy regions
+indexed by current inventory position. Color and depth/stencil planes keep their
+separate aspect copies with aligned offsets. All padding is initialized to zero.
+The combined buffer (including its extra inter-subset alignment) is capped at
+256 MiB. Only little-endian hosts are currently accepted.
+
+D32 upload data must be finite in [0,1]. Integer IEEE-754 bit checks reject NaN,
+infinities, negatives except negative zero, and values above one even under
+fast-math; accepted bit patterns are preserved. D24 unused high bytes must already
+be zero, while all D16 UNORM patterns are representable. This is intentionally
+conservative regardless of unrestricted-depth extension support.
+
+No GPU allocation, command recording, submission or guest-memory writes occur.
+This does not solve target allocation identity, transfer-destination usage,
+layout/queue ownership, rollback or complete emulator reconstruction. The
+prepared data is not a restore authorization and has no Load caller yet.
+
+Tests pass with normal optimization and -ffast-math: exact offsets and padding,
+reordered target mapping, D16/D24/D32, accepted boundary/negative-zero bits,
+NaN/infinity/out-of-range rejection, truncated payload and shape mismatch.
+Format remains v9; Load continues refusing graphics restoration. No Android
+build, hardware GPU upload or FFX restore validation performed.
+Vulkan upload depth-range requirement: VUID-vkCmdCopyBufferToImage-pRegions-07931
+https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdCopyBufferToImage.html
+
+## Read-only saved/live image matching (previous checkpoint)
+
+preflight_snapshot_images validates saved dimensions/formats/payload lengths and
+aggregate staging budget, then matches the complete live inventory by typed
+guest addresses and exact shape/format. Cache order need not equal saved order.
+The returned index mapping is all-or-nothing. Missing/extra images, duplicate
+same-aspect registrations, derived resources and shape changes are refused.
+Cross-aspect address aliases remain separate image records. The check never
+changes saved pixels, cache descriptions, guest RAM or GPU resources.
+
+VKState exposes preflight_snapshot_image_records under its own host lease and
+rejects foreign/empty leases or shutdown. It inspects the real cache and invokes
+the matcher. It has no Load caller yet. Address/shape equality is NOT allocation
+identity: an image destroyed and recreated at the same address can still match.
+Separate identity/recreation strategy, transfer-destination usage, layout/queue
+checks and full state reconstruction are mandatory before enabling restoration.
+Saved data must first pass decoding; this metadata check does not replace pixel
+canonicalization or integrity validation.
+
+Tests cover reordered inventories, shape/format changes, missing aspects,
+duplicate/current-invalid entries, malformed saved lengths, overflow, derived
+resources, cross-aspect aliases and no partial result/mutation on failure.
+Tests and renderer.cpp host syntax check pass. Format remains v9; Load refusal
+remains unchanged. No Android build, GPU writeback or FFX device test performed.
+
+## Detached SGI1 bundle decoding (previous checkpoint)
+
+decode_snapshot_image_sections now validates the outer SGI1 magic/version,
+bounded lengths and exact section boundaries, then delegates to the SCR1/SDR1
+decoders. At least one subset must be present. It rebuilds temporary descriptions
+to check the writer's aggregate aligned staging budget. Those temporary transfer
+flags authorize no GPU operation and are never returned. The result contains only
+detached CPU color/depth records, never handles, image ownership or guest writes.
+
+Malformed inner sections refuse the entire result, even after another section
+decoded successfully. A valid first section may be allocated temporarily before
+the second is rejected; no partial records are exposed. Same-aspect duplicates
+are rejected by the inner codecs. Cross-aspect guest address aliasing is allowed
+and does not imply shared GPU allocation. Pixel integrity/checksums and restore
+identity checks are separate, still unfinished requirements.
+
+Tests cover combined and single-subset roundtrips, all truncation lengths,
+trailing bytes, overflowing lengths, corrupted outer/inner headers, a bad depth
+section after valid color data, entirely empty bundles and 5,000 mutations.
+The test and renderer.cpp host syntax check pass. This decoder is NOT yet used
+to apply Load; the early unsupported-graphics refusal remains. Format stays v9.
+No Android build, GPU execution or FFX restore validation was performed.
+
+## Combined color/depth Save capture and v9 (previous checkpoint)
+
+Save now calls capture_snapshot_image_section. Vulkan inspects one inventory
+under the continuous host/kernel/session exclusion, splits color/depth subsets,
+validates both plans before any submission, and caps their summed staging bytes
+at 256 MiB. This is not a total process/peak CPU memory cap. Empty subsets are
+skipped; an entirely empty inventory is refused. Each nonempty subset acquires
+cache allocation pins, records/submits through the persistent service, waits on
+its own fence and encodes detached bytes. Both phases share one deadline. Failed
+depth capture discards already encoded color output; unfinished GPU work remains
+owned. There is no file open/commit until the complete provider succeeds.
+
+SGI1 v1 has four LE u32 header fields: magic, version, SCR1 length, SDR1 length;
+then the two sections (zero length for an absent subset). Save format v9 writes
+GCR1 followed by a length-prefixed SGI1 before RAM. v8/v7 are incompatible and
+rejected. Load still rejects nonempty graphics before RAM; it does not decode
+SGI1 on the unsupported path. There is no GPU/audio restore implementation.
+
+The blanket refusal merely because a depth cache exists is removed. Derived
+images, unsupported formats/layouts, identity mismatches and budget/deadline
+failures still refuse Save. Anonymous render targets, textures and audio are
+not captured, so successful output is NOT a complete restorable snapshot.
+
+Tests: actual section orchestration with model readback verifies both codecs,
+aggregate preflight before callbacks, each-stage failure, wrong byte length,
+empty subsets and exceptions. Production Save-order/load-gate extraction and
+existing real-file commit protection tests pass. Six native translation units
+and renderer.cpp pass host syntax checking. No real GPU, Android build or FFX
+device test has been performed; no APK replacement is requested yet.
+
+## Detached depth/stencil codec (previous checkpoint)
+
+SDR1 version 1 uses a 12-byte magic/version/count header followed by records with
+seven little-endian u32 fields: depth address, stencil address, width, height,
+Vulkan format, depth byte length and stencil byte length. Depth bytes precede
+stencil bytes, with no buffer alignment gaps on disk. Combined formats retain
+both planes even for a single registered guest aspect. The encoder supports
+little-endian hosts only. D24 depth is X8_D24_UNORM_PACK32 in buffer copies;
+its unused high byte is set to zero. D16 and D32 bit patterns are preserved.
+
+Decode validates all metadata and spans before allocating pixel arrays, caps
+records at 20 and total pixels at 256 MiB, rejects duplicated same-aspect addresses,
+missing/trailing data, invalid lengths/formats and noncanonical D24 X8 bytes.
+Decoded records contain no live image ownership. No checksum or D32 value/range
+validation is provided; structural acceptance does not authorize future upload.
+
+Tests pass for all three formats, mixed ordering, stencil-only registration,
+canonical D24 equivalence, alignment-gap omission, every truncation boundary,
+duplicate/malformed fields and 9,000 mutations. No GPU is used. The codec remains
+separate from the v8 file framing; Save still refuses depth-bearing inventories.
+Depth capture orchestration/file integration and FFX restoration remain pending.
+Vulkan format reference for D24 bit positions:
+https://docs.vulkan.org/spec/latest/chapters/formats.html
+
+## Depth-cache allocation pin collection (previous checkpoint)
+
+VKSurfaceCache::pin_snapshot_depth_images now resolves a complete depth-only
+inventory against both depth and stencil lookup maps. Registrations must match
+the cache entries' guest addresses; both aspects of a combined entry resolve to
+one object and one allocation pin. Inventory order is preserved; shared-aspect
+lookups do not produce duplicate image pins. Missing/extra registrations,
+mismatched dimensions/format, duplicate handles, derived read views, unknown
+layouts and unavailable allocation pins reject the entire result. Partial pins
+unwind on failure. A stencil-only registered combined image is supported by the
+collector and still requires both planes in the existing depth copy plan.
+
+The caller must continuously exclude cache mutation and establish actual queue
+ownership, session/device lifetime and GPU synchronization. Pins retain only
+allocations, not views, contents or the allocator. This method does not silently
+include colors, nor authorize a full snapshot. Save still does not call depth
+readback; depth encoding and integration with the color section remain pending.
+
+Validation: model tests cover shared aspects, inventory reorder, missing/extra
+entries, wrong/null references, duplicate handles, partial pin failure, layouts,
+size/usage/derived/budget refusal and last-reference retention. Production Image
+pin/move/destroy extraction and existing depth recorder tests pass. renderer.cpp
+passes host syntax checking with the real cache collector instantiated. No real
+GPU execution, Android build or FFX restore validation. Format remains v8.
+
+## Depth/stencil command recording (previous checkpoint)
+
+record_snapshot_depth_copies validates the full plan and every live source before
+beginning a command buffer. It requires a graphics-capable queue family,
+single-sample transfer-source images, matching dimensions/format/family, unique
+handles and known combined depth/stencil layouts. It transitions both aspects
+together for combined formats (depth only for D16), emits one buffer copy per
+aspect, restores each original layout, then adds the host-read buffer barrier.
+No separate-depth-stencil-layout feature is assumed; separate-aspect layouts
+are refused. Recording exceptions require discarding the unsubmitted command.
+
+enqueue_snapshot_depth_copy connects this recorder to the existing persistent
+transfer ownership path. It is NOT invoked by Save yet: allocation pins from
+the depth cache and depth file encoding are still required. No depth image bytes
+have been captured on a real GPU. Existing v8 depth-cache refusal is unchanged.
+
+Tests cover D32/S8, D24/S8 and D16, mixed images, five original layouts, combined
+barrier aspect masks, split-copy image selection/offsets, exact restoration,
+undersized buffers, nongraphics queues, duplicates, unsupported layouts, missing
+usage, multisampling and recording exceptions. Real Vulkan command and enqueue/
+resource/service template instantiations pass; renderer.cpp passes host syntax.
+Android build, hardware GPU execution and FFX restoration remain unverified.
+
+## Depth/stencil plane planning (previous checkpoint)
+
+describe_snapshot_depth_planes describes depth-only inventories for the three
+formats selected by this renderer: D32_SFLOAT_S8_UINT, D24_UNORM_S8_UINT and
+D16_UNORM. Combined formats produce separate 4-byte depth and 1-byte stencil
+planes, preserving both even when only one guest address is registered. D16
+produces a 2-byte depth plane and refuses a declared stencil address.
+Each plane starts at a 16-byte aligned offset, with tightly packed rows.
+
+The planner caps aggregate storage at 256 MiB and 20 surfaces, rejects duplicate
+same-aspect addresses, invalid dimensions, unknown formats, derived resources
+and missing transfer-source usage. Arithmetic is checked before multiplying.
+D24's X8 bits are undefined and must be normalized in a future file encoder.
+This is only a plan: no depth pins, barriers, GPU copies, encoding or restoration
+are enabled. Existing v8 Save still refuses depth/stencil inventories.
+
+Driver-free tests pass for all three formats, exact offsets/size, budget refusal,
+combined-aspect retention, duplicate addresses and dimension overflow.
+No Android build or device validation was performed.
+Reference: Vulkan Copy Commands, Depth/Stencil Aspect Copy table:
+https://docs.vulkan.org/spec/latest/chapters/copies.html
+
+## Color image layout transitions (previous checkpoint)
+
+Color readback now accepts GENERAL, COLOR_ATTACHMENT_OPTIMAL,
+SHADER_READ_ONLY_OPTIMAL, TRANSFER_SRC_OPTIMAL and TRANSFER_DST_OPTIMAL.
+The collector maps only known vkutil tracked color layouts. The recorder validates
+every source before beginning, transitions all to TRANSFER_SRC_OPTIMAL, copies,
+then restores each exact original layout in the same submission. Cache metadata
+is never changed. Same-family queue ordering and the retained host lease remain
+required. Undefined, presentation and depth/stencil layouts remain rejected.
+
+This removes the former GENERAL-only restriction for actual Save captures. It
+does NOT implement depth/stencil readback: inspection found those images use
+DepthStencilReadOnly/DepthStencilAttachment and require aspect-specific copies
+and their own transitions. Their current rejection remains in place.
+
+Recorder tests verify before/copy/after layouts across all five accepted Vulkan
+layouts; collector tests cover all six mapped vkutil states and rejection of
+unknown/depth state. Existing metadata remains unchanged. renderer.cpp (including
+real Vulkan command recording instantiation) passes host syntax checking. No GPU
+execution, Android build or FFX restore validation is claimed. Save format is v8.
+
+Reference checked: Vulkan vkCmdCopyImageToBuffer requires the source subresources
+to be in the supplied copy layout (VUID 00189/01397):
+https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdCopyImageToBuffer.html
+
+## Save-path GPU color capture and v8 framing (previous checkpoint)
+
+Save now invokes the renderer's encoded-color-section provider after final kernel
+quiescence and successful GXM context capture/encoding, while retaining the host
+lease. Vulkan performs the supported color readback and SCR1 encoding. Unknown
+backends fail closed. Missing, too small or oversized output refuses before
+SavestateFile is opened; the previous slot remains intact. The provider checks
+its 3-second deadline again after encoding. Exceptions unwind through existing
+JNI handling and snapshot guards. Timed-out GPU jobs remain service-owned.
+
+Format version is now 8: existing header/title/frame, GCR1 logical records,
+u32 color-section byte length, SCR1 bytes, then the previous RAM/kernel payload.
+v7 files are rejected by the version check; do not call this backward compatible.
+Load continues rejecting nonempty GCR1 records. With empty GCR1, nonempty color
+sections are rejected before allocating the pixel payload or touching guest RAM;
+only the declared length bounds are checked on that rejection path. SCR1 decoding
+does not grant restore support, and malformed rejected pixels are not parsed.
+
+This activates GPU copy calls from Save for the small supported color-only subset.
+It does NOT make a complete/restorable snapshot: depth/stencil/derived caches
+still refuse capture, textures/anonymous targets/audio remain unimplemented, and
+FFX can therefore still refuse Save. Successful v8 saves containing graphics are
+not loadable yet. No Android or actual GPU validation is claimed.
+
+Validation: extracted production save-order tests cover color refusal/exception
+and guard release; extracted load preflight tests verify color length bounds and
+no pixel/RAM reads; existing real-file transactional replacement test passes.
+Six native translation units and Vulkan renderer.cpp pass host syntax checks
+(dependency deprecation warnings remain). No new APK/device test requested.
+
+## Detached color-image section codec (previous checkpoint)
+
+SCR1 version 1 encodes a bounded 1..20 base-color set: a 12-byte magic/version/count
+header, then per-image five little-endian u32 fields (guest address, width, height,
+Vulkan format, payload length) and tightly packed pixels. Only the existing four
+RGBA8/BGRA8 formats are accepted, with a 256 MiB pixel budget. Encoder validates
+the copy plan and exact readback buffer length. Crucially, alignment gaps between
+GPU buffer regions are omitted; those gaps need not have been initialized by GPU
+copies and must not enter a save file.
+
+Decoder validates all records, byte arithmetic, unique nonzero addresses, count,
+dimensions, formats, payload sizes, truncation and trailing data before allocating
+pixel arrays. Decoded records have no Vulkan handles, layouts, usage, queues or
+lifetime pins. They cannot authorize a restore. This is structural validation,
+not a checksum: mutations to otherwise valid pixel bytes are not detected.
+
+Tests cover exact roundtrips for four formats, little-endian fields, omitted
+padding, every truncation offset, invalid/duplicate/zero metadata, count limit,
+dimension overflow and 20,000 bounded mutations. No Vulkan device is used.
+The codec is not yet inserted into v7 files; existing save/load framing is unchanged.
+Save wiring, complete GPU state coverage and FFX restoration remain unfinished.
+
+## Vulkan color readback entry (previous checkpoint)
+
+VKState::capture_snapshot_colors now joins cache inspection, supported-copy
+planning, allocation pins, destination allocation, enqueue and completed-byte
+collection against VKState's persistent one-job service. Busy/quarantined jobs
+refuse another capture. Expired deadlines, stop requests, missing service and
+foreign/empty host leases refuse before submission. Failed submissions remain
+owned; timeout/cancel follows the existing deferred-release path. Successful
+results pair the inventory with detached CPU bytes; failures publish no inventory.
+
+HostQuiescence now identifies its RenderPause owner, including move/release
+semantics. The new entry requires that renderer's acknowledged lease. Caller must
+also hold session lifetime and guest/kernel quiescence, reject active/pending
+scenes, and exclude lifecycle operations. The API does not establish those
+additional conditions itself and has NO Save-button caller yet.
+
+Queue audit: all render_frame/swap_window call sites are in batch.cpp render_loop;
+normal presentation submit/present runs on the same worker that acknowledges
+RenderPause. Context/texture commands run in process_batches on that worker.
+Initialization and device teardown are separately excluded by session lifetime.
+The entry uses general_queue/general_family_index; it does not create a new queue
+or infer a cross-family ownership transfer. This is a source audit, not a GPU run.
+
+Validation: renderer.cpp host syntax check; 300 real host-pause cycles with foreign,
+moved and released lease checks; job recording/submission ownership regression;
+collector/source tests and extracted production lifecycle test. No Android build
+or end-to-end GPU readback test. Depth/stencil/derived images, broader GPU state,
+image file encoding and restore remain unsupported. FFX Load is unfinished.
+
+## Vulkan transfer ownership lifecycle (previous checkpoint)
+
+VKState now owns a one-job snapshot transfer service. late_init creates it only
+when absent, so repeated initialization cannot discard outstanding ownership.
+Successful host-worker pause polls abandoned jobs for fence-confirmed release.
+cleanup releases/reset the service after successful device.waitIdle and before
+surface caches, allocator and device destruction. A throwing idle wait does not
+reach this release block. A subsequent successful cleanup may retry it.
+
+The production submission path remains absent. In particular, presentation uses
+general_queue.submit and presentKHR as well; host-worker pause alone has not been
+established to exclude every queue user. This needs auditing/serialization before
+enabling snapshot submission. Likewise, retaining jobs on device-wait failure is
+not a complete device-loss recovery strategy: the service must not be destroyed
+with outstanding quarantined jobs (its existing owner guard terminates).
+
+An extraction test compiles the actual late_init/cleanup ownership blocks with
+the real transfer service and simulated device. It covers repeated init, repeated
+wait failure, successful retry, ambiguous submissions, second session and repeated
+cleanup. context.cpp, renderer.cpp and batch.cpp pass host syntax checks; existing
+fmt/spdlog deprecation warnings remain. No Android build or GPU execution tested.
+Save still does not submit/capture GPU images and FFX restoration remains unfinished.
+
+## Completed readback collection (previous checkpoint)
+
+collect_snapshot_bytes joins the per-request wait to job.read_completed_pixels
+and returns detached CPU bytes only after completion. It rejects zero/over-budget
+expected lengths, mismatched output lengths, cancellation and results arriving
+after the deadline. Completed GPU resources are retired through consume before
+the successful CPU result is returned. Read/invalidation/allocation exceptions
+abandon the request then propagate, ensuring the completed job is released.
+Timeout and cancellation preserve in-flight resources in the persistent service.
+
+Tests cover exact bytes, pending timeout, cancellation, read exceptions, length
+mismatch, late CPU results and destruction counts. Existing wait/service tests
+pass. Instantiation with real Vulkan SnapshotReadbackJob/Resources passes host
+syntax checking, including mapped-memory invalidation/readback methods.
+
+This helper is not called by Save yet. Device lifecycle, service serialization,
+full GPU resource coverage, file encoding and restoration are still outstanding.
+Host tests are not GPU execution or an Android build. FFX Load remains disabled
+for saved graphics state. No new device test is requested at this checkpoint.
+
+## Bounded transfer completion wait (previous checkpoint)
+
+SnapshotTransferService now supports per-request status and polling.
+wait_snapshot_transfer uses a steady-clock deadline, cancellation and at most
+1 ms pause slices. It queries only the requested fence. Timeout/cancellation
+abandons the result while retaining unfinished resources in the long-lived
+service. Query failures quarantine resources; callback exceptions abandon the
+request before propagation. Completed results remain for explicit consumption.
+Missing requests return without invoking GPU queries. Callbacks must not reenter
+the service; queries must be nonblocking and pauses must honor their deadline.
+
+Deterministic tests cover completion, deadline already expired, pending timeout,
+cancellation, query errors/exceptions, pause exceptions, request isolation and
+late resource release. Existing service and Vulkan job tests pass, including
+real queue/resource template syntax instantiation. These are host/model checks,
+not real GPU execution or Android validation.
+
+Inspection confirmed VKState::cleanup waits device idle before cache teardown,
+but the transfer service is NOT yet attached there or to Save. Production wiring
+must serialize service access, retain it across timed-out requests, and establish
+safe teardown even on device errors. No full GPU snapshot or FFX load is enabled.
+
+## Cache allocation-pin collection (previous checkpoint)
+
+VKSurfaceCache now exposes pin_snapshot_sources. Under caller-held renderer
+exclusion it checks a complete color-only inventory against current cache entries
+and acquires actual vkutil::Image allocation pins. Depth/stencil caches, derived
+images, duplicate addresses/handles, missing entries, changed dimensions/format,
+unknown transfer usage, unsupported tracked layouts and budget overflow refuse
+the entire collection. Earlier pins unwind on failure. Empty collections refuse.
+Only ColorAttachmentReadWrite and StorageImage are accepted (both map to GENERAL).
+
+The queue family is supplied by the caller, not discovered or proven by this
+method. Caller must guarantee actual ownership and GPU synchronization. Pins do
+not freeze image contents or retain views/device; drain before allocator teardown.
+Metadata inventory has no historical image identity, so exclusion must span its
+inspection and collection. This is not a complete GPU resource snapshot.
+
+Validation: collector model test with real Vulkan types; production Image
+pin/move/destroy extraction test; job lifecycle regression and real queue/resource
+template instantiation; renderer.cpp host syntax check (instantiates real cache
+collector). All passed. Full surface_cache.cpp compilation remains unverified due
+to the previously missing FFmpeg headers. No Android build or GPU execution.
+Save does not call the collector or submit a readback yet. Load remains gated.
+
+## Allocation-owning image pins (previous checkpoint)
+
+vkutil::Image now offers lazy allocation-owning snapshot pins for owned,
+transfer-source images. The wrapper retains a shared reference; destroying the
+wrapper releases its reference and the allocation remains until the last pin is
+released. Views and samplers are not pinned. Borrowed images, missing allocations
+and unknown transfer usage refuse pins. The pin retains the allocator handle but
+does not extend the allocator/device lifetime: all pins must drain before teardown.
+The existing deinitialized-allocator guard remains a fallback, not lifecycle proof.
+
+Image moves now explicitly transfer fields and ownership instead of memcpy on a
+shared_ptr. Move assignment releases its former image through normal destruction;
+self-move is harmless. Default dimensions/format are initialized. make_shared
+creates ownership atomically with respect to allocation failure, avoiding a
+failure-path deleter destroying an image still owned by its wrapper.
+
+run_image_pin_test.py extracts actual Image methods with mock allocator/handles.
+It verifies multiple pins, wrapper destruction, moving pinned images, replacement,
+self-move, refusal and exactly-once release. Three earlier inventory/planning/copy
+regressions pass. objects.cpp and renderer.cpp pass host syntax checking; the
+additional surface_cache.cpp check remains blocked by missing libswscale/swscale.h.
+Pins are not yet collected by the cache/readback caller or submitted to the GPU.
+No Android build, GPU execution or FFX restore test is claimed.
+
+## Record/submit/service orchestration (previous checkpoint)
+
+SnapshotReadbackJob bundles source lifetime tokens with destination resources.
+enqueue_snapshot_copy records commands before registration, then registers the
+whole job before queue.submit. Submission exceptions leave it quarantined in the
+service; timeout abandonment retains both source and destination until completion.
+Destination resources are destroyed before source tokens. Rejected recording
+never reaches submission. Caller still owns external queue synchronization.
+
+The current surface cache does NOT supply allocation-owning source tokens yet.
+A nonnull shared token is necessary but not proof it owns the correct allocation;
+never fabricate tokens around raw/no-op image pointers. This API is not called
+from Save State, and no GPU submission was enabled in the application. Existing
+cache pinning, layout/metadata stability and session shutdown must be integrated.
+
+Tests use a mock recorder/queue with real Vulkan submit structures to verify
+record-before-submit, retention through timeout and uncertain submission, failed
+shutdown retention and post-completion release. The full production template is
+syntax-instantiated with actual readback resources and vk::Queue. Tests and host
+syntax checks pass. No driver/Android/device execution has taken place.
+
+## Record conservative image-to-buffer copy commands (previous checkpoint)
+
+record_snapshot_copies records a fresh one-time command buffer for the supported
+color subset. It validates every source and all buffer ranges before begin(),
+requires GENERAL layout, transfer-source usage, one sample and the same queue
+family, and rejects repeated live image handles. Barriers order earlier writes
+before transfer reads, transfer reads before subsequent image use, and destination
+transfer writes before host reads. GENERAL remains GENERAL: unsupported layouts
+are refused rather than transitioned or guessed.
+
+This does not submit commands, allocate resources, resolve source handles or
+retain source lifetimes. Caller must supply accurate live metadata and queue/
+resource ownership, a transfer-destination buffer and a fresh command buffer.
+A recording exception requires discarding the unsent command buffer. Completion,
+VMA invalidation and source-image retention are still separate requirements.
+
+Mock-command tests verify copy/barrier order, access masks, buffer sizes and
+pre-recording refusal for insufficient capacity, undefined layout, multisampling,
+wrong queue family/extent, absent usage and null image. Explicit instantiation
+with vk::CommandBuffer passes host syntax checks. No GPU execution took place.
+The allowed layout/usage/sample subset was checked against the official reference:
+https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdCopyImageToBuffer.html
+
+## Vulkan destination-resource implementation (previous checkpoint)
+
+SnapshotReadbackResources now implements a mapped transfer-destination buffer,
+a dedicated transient command pool/primary buffer and an initially unsignaled
+fence using actual Vulkan/VMA APIs. The factory bounds allocations to 256 MiB,
+uses host-visible random-access mapped memory with cached preference, and owns
+partially created resources before each subsequent allocation. Reading checks
+fence completion and invalidates the VMA allocation before copying mapped bytes.
+
+This class owns DESTINATION resources only. Before actual queue submission it
+must be held by the completion service and all source image lifetimes must be
+retained independently. Its destructor requires no GPU access and a live device/
+allocator. It does not record barriers/copies, submit, cancel, synchronize device
+shutdown, or solve source-image retirement. It is not called by Save State yet.
+
+Tests inject failure at buffer/pool/command/fence creation and a missing mapping;
+all earlier allocations are reclaimed. They also verify allocation flags, pending
+read refusal, invalidation before CPU copy, size bounds, and retention/reaping via
+the service with a mock backend. Explicit instantiation against real vk::Device
+and vma::Allocator passes host syntax checks. No driver, GPU or device test ran.
+
+## Bounded transfer completion service (previous checkpoint)
+
+SnapshotTransferService retains owners independently of request lifetime. It
+registers ownership before submission, limits outstanding job count, uses stable
+non-reused service-local IDs, polls only in-flight jobs and reaps abandoned jobs
+only after completion. Non-abandoned completed jobs remain for consume; a throwing
+read retains the completed resource for retry. Query exceptions quarantine jobs.
+Shutdown stops new submissions and retains all jobs if the supplied device-idle
+wait returns false or throws; a successful retry retires them.
+
+This remains a generic, single-threaded model, not a Vulkan completion thread.
+Callbacks may not reenter it. Its host must keep it alive after failed shutdown;
+destroying pending owners still terminates as a programming-error check. No actual
+application shutdown or submission uses this component yet. Job-count bounds are
+not byte-allocation bounds. Tests cover capacity, timeout retention, read retry,
+submission/query exceptions, shutdown failure/retry and exactly-once destruction.
+Service and owner host tests pass with warnings treated as errors. Real GPU,
+Android and FFX restore validation remain unperformed.
+
+## Retained transfer resource owner (previous checkpoint)
+
+SnapshotTransferOwner now couples the lifecycle decision gate with unique resource
+ownership. It marks submission before calling the supplied submit operation,
+quarantines false/throwing submission, retains ownership after abandonment, and
+permits reads only after non-abandoned completion. Retirement destroys the owned
+resource once. Normal pre-submit scope exit also releases it.
+
+This is a generic component tested with destructor-counted model resources, not
+Vulkan allocations. It is not integrated with save or GPU submission. A future
+long-lived completion service must hold owners across request timeout and drain
+them after proven completion before shutdown. Destroying an in-flight owner is
+currently a programming error that terminates the process rather than freeing
+GPU-used resources; this path is NOT reachable from the application today because
+the component has no production callers. Integration must resolve shutdown and
+resource lifetime coverage before enabling actual submissions.
+
+Tests exercise successful completion, timeout/abandonment, false submission,
+submission exceptions, pending read/retire refusal, empty resources and exactly-once
+destruction. Host warning-as-error compilation and tests pass. No Vulkan execution
+or device test occurred; all earlier restore limitations remain.
+
+## Transfer lifetime decision gate (previous checkpoint)
+
+SnapshotTransferState models prepared, submitting, in-flight, complete,
+quarantined and retired phases for a future transfer owner. Submission must be
+marked before invoking the queue API. Timeout abandons the result without making
+resources releasable. Ambiguous submission/device errors quarantine the transfer.
+Only its own successful fence completion or confirmed device-idle success permits
+release. Unacknowledged submission followed by idle permits cleanup but never
+pixel consumption. Pre-submit cancellation does not require GPU completion.
+
+This component does NOT own buffers, command pools, fences or source images and
+is NOT wired to Vulkan submission. It cannot itself prevent premature destruction;
+the future owner must retain all referenced resources and consult it. It is a
+single-host-thread decision gate, not a GPU synchronization primitive. Tests
+exercise normal completion, pending timeout, ambiguous submit failure, device
+error, idle cleanup, cancellation and invalid transitions. Host tests compile
+with warnings treated as errors and pass. No Vulkan/device execution occurred.
+
+## Track image transfer-source creation usage (previous checkpoint)
+
+vkutil::Image records whether init_image created it with eTransferSrc. The flag
+starts false, is set only after successful image allocation, travels with the
+existing Image move representation, and is cleared in moved-from/destroyed
+wrappers. Surface inventory carries this value; the readback planner refuses
+unknown/non-transfer-source entries. Existing image allocation usage is unchanged.
+
+This is one prerequisite only: a future executor must still validate the live
+handle, format, samples, ownership, layout and synchronization. No transfer buffer
+or in-flight transfer is created by this change. It does not solve timeout resource
+retention or permit image destruction while the GPU uses it.
+
+Inventory, layout-plan and real Vulkan copy-description regression tests pass,
+including refusal for missing transfer-source usage. objects.cpp and renderer.cpp
+pass host syntax checks. An additional surface_cache.cpp check could not compile
+because the cached dependencies lack libswscale/swscale.h; it is not reported as
+passing. No Android build or real GPU/device test has been performed. v7 and the
+existing graphics/audio load refusal remain unchanged.
+
+## Vulkan copy-region descriptions (previous checkpoint)
+
+snapshot_copy.h now builds real vk::BufferImageCopy values for the bounded base
+color plan. It centralizes the four-format whitelist and rejects duplicate guest
+addresses. Regions use tightly packed rows, color aspect, mip zero, one layer,
+zero image offset and the recorded width/height. Save-side diagnostics build these
+descriptions, but allocate no buffer and submit no commands. The inventory order
+maps regions to sources; it is not a persistent identity or live-image handle.
+
+Real Vulkan-type tests cover all four formats, independent offset/extent/aspect
+fixtures, insufficient capacity, duplicate addresses, depth/compressed formats,
+derived entries and invalid inventory. The renderer passes host syntax checking.
+Image usage, sample count, ownership/layout, GPU synchronization, buffer allocation,
+host invalidation and actual pixel copying remain prerequisites for execution.
+Format stays v7; graphics/audio load remains disabled. No real GPU/device test.
+
+## Bounded base-color readback planning (previous checkpoint)
+
+The Vulkan save pause path now diagnoses a possible packed readback layout for
+its guest-backed inventory. Its explicit initial whitelist is RGBA8/BGRA8 UNORM
+and SRGB. Plans contain source inventory indices, 16-byte-aligned buffer offsets,
+row byte counts and image byte counts, with a 256 MiB aggregate budget. Arithmetic
+checks precede multiplication/addition; an unsupported or oversized entry discards
+the whole plan. Depth/stencil, derived entries and other formats are unsupported.
+
+Planning is diagnostic only and does not make save fail when the plan is unsupported:
+existing v7 behavior and graphics/audio load refusal are unchanged. No transfer
+buffer allocation, Vulkan copy command, layout transition, transfer-usage check,
+CPU cache invalidation or pixel serialization occurs. Anonymous render targets,
+textures and presentation resources are still outside the inventory. A successful
+plan therefore cannot be treated as a complete GPU snapshot or copy authorization.
+
+Tests cover independent row/offset fixtures, alignment padding, exact/insufficient
+budgets, maximum-dimension overflow, unsupported formats/resources, zero dimensions,
+invalid inventory and empty input. The actual Vulkan renderer translation unit
+passes host syntax checking. No driver or device validation has been performed.
+
+## Enumerate guest-backed cached surfaces (previous checkpoint)
+
+After host pause and submitted-frame fence checks, Vulkan now inspects the
+surface cache's color/depth/stencil address maps. It records guest addresses,
+actual image dimensions, Vulkan format and counts of derived cache entries.
+Depth and stencil map entries sharing one cache object are combined into one
+description retaining both addresses. Null entries, missing images, zero dimensions
+and mismatched lookup keys refuse capture and discard partial results.
+
+The save log reports color, depth/stencil and derived entry counts. No Vulkan
+handle or host pointer is persisted. The temporary pointer-based deduplication
+index is used only while the renderer is excluded. This inventory neither copies
+pixels nor estimates allocation byte sizes; derived entry counts are not unique
+GPU allocation counts. Anonymous render-target attachments, ordinary textures,
+presentation images and other caches remain outside this inventory. Do not treat
+it as a complete list of resources required for restoration.
+
+Model tests cover shared depth/stencil objects, stencil-only objects, derived
+entries, empty cache, invalid handles/dimensions/keys and all-or-nothing failure.
+The production helper is instantiated with real Vulkan cache types in the native
+syntax checks. Three renderer translation units passed; the final renamed field
+was rechecked in renderer.cpp. No real GPU readback or Android/device load is
+implemented or validated. Format remains v7 and graphics/audio load refusal stays.
+
+## Wait for tracked submitted frame fences (previous checkpoint)
+
+VKState::pause_host_workers_until now waits for every frames[].rendered_fences
+group after acquiring host render/writeback exclusion. These fences are recorded
+following scene submission even when memory mapping is disabled, whereas the
+writeback request queue receives them only with memory mapping enabled. Parking
+CPU workers alone therefore did not prove these submissions had completed.
+
+The wait shares the original host-pause deadline; each Vulkan wait uses at most
+100 ms and no more than the remaining time. Timeout retries until that deadline;
+other errors or vk::SystemError refuse the capture. Local RAII releases the host
+lease on failure. Fences are observed without resetting, clearing or destroying
+them; normal frame reuse remains responsible for that lifecycle.
+
+This does NOT wait for every GPU submission or presentation, submit open command
+buffers, serialize cached color/depth/stencil images, or guarantee device-wide
+idle. It depends on the caller's session lifetime and the parked render worker
+excluding frame-fence reset. Graphics/audio load refusal and format v7 remain.
+
+Tests cover multiple frame groups, empty groups, bounded retries, shared deadline,
+error/exception propagation and unchanged fence lists using a simulated clock
+and wait callback. The existing 300-cycle host-quiescence regression passes.
+Three renderer translation units pass host syntax checking. No real Vulkan
+fence behavior, Android build or device state restoration has been tested.
+
+## Preserve the previous slot on save errors (previous checkpoint)
+
+Save now uses SavestateFile instead of truncating the destination. It creates an
+exclusive random staging directory beside the destination, writes a payload on
+the same filesystem, flushes and closes the stream, checks both results, then
+renames the completed payload over the slot. The old slot is never deleted first.
+The existing session operation gate serializes slot access. Format remains v7.
+
+The scoped helper removes only its own payload and empty staging directory on
+normal return or exception. It never recursively deletes and never removes the
+destination. Failed open, write, close or rename returns ErrorIO and preserves
+the previous slot. Process termination may leave a staging directory; no stale
+cleanup or file/directory fsync is implemented. This is not a power-loss durability
+guarantee and it does not make the unfinished graphics/audio restore usable.
+
+Tests link the actual helper against the cached Boost.Filesystem implementation
+and operate on real temporary files. They cover first save, replacement, uncommitted
+partial output, injected stream badbit, serialization exception, missing parent,
+rename refusal against a nonempty directory, repeated calls and cleanup. They do
+not simulate disk exhaustion or hardware failure. Save acquisition/cleanup tests
+also pass. Native host syntax checks cover the integrated save path; no Android
+linking or device test has been performed.
+
+## v7 logical context file section (previous checkpoint)
+
+Save format is now v7; this build rejects v6 files with ErrorMismatch. GCR1
+schema 1 follows frame_count and precedes RAM. Its 12-byte header contains magic,
+schema and count as little-endian words. Each record is 3,412 bytes: 88 bytes of
+explicit address/identity/type/allocator/ring/flag fields and length, followed by
+the 3,324-byte GXL1 payload. No native padding or host pointers are serialized.
+The encoder validates all records before opening the output file. The maximum
+is 1,024 records (3,493,900 section bytes including header).
+
+Decoder bounds the count before allocation and requires exact per-record payload
+lengths, valid logical schema, inactive scenes, nonzero unique context identities
+and addresses, matching context types, canonical booleans, valid dirty masks,
+program-address/identity presence agreement and empty-ring invariants. It reads
+exactly the section, preserving the following RAM field. This is structural
+validation, not a checksum or complete semantic validation of guest references.
+
+Load parses this section before RAM allocation. Nonempty sections currently
+return ErrorUnsupportedHostState immediately: the records must not be ignored
+even when the current session has no graphics resources. Empty sections continue
+through existing kernel and host-state preflight. No live graphics restoration
+is added; process-local IDs still cannot authorize cross-process restoration.
+
+Tests cover a golden byte header/address fixture, exact size, lossless roundtrip,
+every truncated prefix of a two-context section, invalid headers/count/type/bools/
+length, duplicate contexts, encoder refusal and the next-section boundary. The
+actual production load graphics block is tested for invalid-section rejection,
+nonempty-section refusal and empty-section continuation. Updated save-order tests
+cover encoder failure cleanup. All tests and six native syntax checks pass.
+No Android linking, GPU restore or device validation has been performed.
+
+## Save-side host pause and GXM capture integration (previous checkpoint)
+
+Save State now calls the host pause and logical context capture providers. It
+first acquires a temporary kernel snapshot guard to drain guest/display work,
+releases that entire guard, then requests the renderer/writeback pause. It
+reacquires the kernel snapshot guard before reading graphics or serializing RAM.
+The first kernel guard must not survive the host-pause acquisition: host workers
+can need those locks to finish. Declaration order releases final kernel/display
+locks before the host lease, and revokes the display callback grant last.
+
+State provides a virtual pause entry point; Vulkan uses HostQuiescence and
+unsupported backends return no lease. Missing renderer, timeout, nonempty host
+queues, active scenes, retained/pending commands or unknown program bindings
+cause ErrorGraphicsNotReady before the output file is opened. Kernel refusal
+still reports ErrorThreadNotSafe. Failure does not fall back to an unprotected
+save. This deliberately makes some saves previously accepted by fix21 fail.
+
+Successful capture holds the host lease through v6 serialization and logs the
+number of staged logical contexts. The logical records are NOT written to v6
+and there is no live graphics restore. Host worker exclusion is not device-wide
+GPU idle or audio quiescence. The unsupported graphics/audio LOAD refusal remains.
+This checkpoint is not a complete or device-validated save/load implementation.
+
+Validation: the production save capture block is extracted by
+run_save_capture_order_test.py and tested with instrumented lock/worker models.
+It checks acquisition/release order, both kernel refusal stages, absent renderer,
+host pause failure, unsafe thread refusal, capture refusal and exception cleanup.
+Actual host-pause regressions pass 300 render/writeback cycles; the Vulkan worker
+and render-loop regression tests pass, as does the context/provider test suite.
+Six native and three renderer translation units pass host syntax checks. These
+are not Android linking or real-driver/device tests. No device test is requested
+until a more useful restore path is available.
+
+## Read-only context restore preflight (previous checkpoint)
+
+check_context_restore_prerequisites captures the live context set under the
+caller-owned host pause, then checks saved context identities, shader lifetimes,
+scene inactivity, dirty-mask widths, ring invariants and unchanged allocator
+bindings. Both saved and current records are checked. Fully free ring tickets
+may advance without rejection; allocation pointers, sizes and callback bindings
+must remain unchanged until allocator reconstruction is implemented.
+
+This is a read-only prerequisite check, not a restore plan or authorization to
+write RAM. Its success is valid only within the caller's continuous guest/host
+quiescence and session lifetime protection. It does not validate texture/sync
+objects, mapped ranges, GPU contents, shader contents, reference counts or audio.
+Save/Load remains unconnected; the unsupported-host load refusal is unchanged.
+
+The production entry point and helper pass host regression tests covering absent
+pause, context replacement, allocator changes, malformed ring/mask data, active
+scenes and stale saved programs. A changed current shader binding is accepted
+when the saved shader still exists. Inputs remain unchanged on failure. The
+complete SceGxm.cpp passes host syntax checking. No Android build/device restore
+is claimed.
+
+## Bound program lifetime validation (previous checkpoint)
+
+The shader patcher allocation/free paths now track vertex and fragment program
+identities outside guest RAM. Reference-counted releases remove identities only
+when the existing code actually frees the program; cache hits keep the identity.
+Session cleanup clears both registries without resetting the identity sequence.
+Registries are separated by program type and never dereference saved addresses.
+
+Context capture now rejects unknown non-null program bindings and stages both
+program identities. validate_program_instances checks the SAVED bindings against
+live registries: switching the current context binding is permitted, but freeing
+or recreating the saved program at the same address causes rejection. Null
+bindings require zero identities. This checks lifetime/type only, not mutable
+program contents, asynchronous compilation, backend caches or GPU resources.
+It does not restore program reference counts or authorize guest RAM writes.
+
+The production-provider model test now exercises wrong-type bindings, missing
+programs, valid vertex/fragment identities, a changed current binding, release,
+same-address recreation and registry clearing. Host syntax checks cover the
+actual allocation/free hooks in SceGxm.cpp and related native translation units.
+The existing Save/Load path remains unconnected and the host-state refusal stays
+in place. No Android build or real-device load success is claimed.
+
+## GXM context capture and lifetime identity (previous checkpoint)
+
+gxm::capture_context_records now stages logical records from the real immediate
+and deferred contexts. It requires a valid host pause lease and a paused session;
+the future caller must additionally own session lifetime and the kernel snapshot
+guard proving all guest threads are parked. The public pause flag alone cannot
+prove that. This function does not acquire those prerequisites itself.
+
+Creation and destruction now maintain a context identity registry outside guest
+RAM. A recreated object at the same guest address gets a new ID. IDs are unique
+within this process, even across registry resets, but are not persistent session
+UUIDs. same_context_instances validates logical payloads and compares address,
+instance and context type independent of ordering. This is not validation of
+shader/texture identities, allocator bindings, or restore suitability.
+
+Capture rejects active scenes, pending command-list endpoints, retained deferred
+lists, inconsistent registries and outstanding immediate ring commands. The ring
+is fully free when last >= next and last-next == capacity-1; last is the last
+available ticket, not a count of completed commands. Capacity zero and deferred
+contexts do not read immediate-only counters. Failure discards all staged records.
+Successful records include the existing logical codec plus guest allocator
+addresses, ring counters and texture/uniform/precomputed flags. No native pointer
+or command payload is copied into the records.
+
+The capture API is not called by Save State/Load State yet. There is no live
+restore setter, GPU image snapshot, audio reconstruction or on-disk record change.
+The unsupported-host load refusal remains enabled. Even a successful capture is
+only a conservative logical subset and cannot authorize restoring guest RAM.
+
+Validation: tests/savestate/run_gxm_capture_test.py compiles the unmodified
+production provider function with model context/backend storage, actual project
+GXM and memory types, and real host pause gates. Tests cover prerequisite refusal,
+wrong/missing identities, sorted records, duplicate addresses and discarding a
+partial multi-context capture. Production extraction helpers additionally cover
+scene/command refusal, ring boundaries, unchanged output on refusal, context
+replacement and 800 concurrent registry allocations. The complete SceGxm.cpp and
+six related native translation units passed host syntax checks; existing dependency
+warnings remain. Codec regression tests also passed. These checks do not replace
+Android linking or real-device/GPU validation.
+
+## Logical GXM state codec (previous checkpoint)
+
+renderer/gxm_state_codec.h now encodes and decodes all 53 current top-level
+GxmContextState fields, including nested surfaces, viewport/stencil settings,
+uniform buffers, vertex streams, texture descriptors, guest program/callback
+references and the logical active flag. This is a detached logical record, not
+serialization of the whole SceGxmContext or its renderer/backend objects.
+
+The GXL1 record uses an explicit schema version 1 and exactly 3,324 bytes. Scalar
+words, enum representations, bools, float bit patterns and guest addresses are
+encoded little-endian; size_t counters use explicit 64-bit words. Named bitfield
+values are encoded individually, and texture dimension union aliases share the
+whblock representation. Compiler padding, unnamed bits, mutexes, containers and
+host pointers are never dumped by this codec. Record length is checked before
+decoding. Invalid magic/version, bools, bitfield widths, narrow integer ranges,
+non-fixed context-type enum values and counters too wide for the host fail
+decoding. No record-controlled dynamic allocation is needed for decoding.
+
+SceGxmContext now value-initializes its logical state with state{}. Previously,
+some unused primitive fields could remain indeterminate after construction.
+Encoding still requires a fully initialized, stable input value: this helper
+does not acquire any pause or protect concurrent changes.
+
+decode_gxm_logical_state returns an optional detached GxmContextState. It does
+not mutate live memory, dereference guest references, bind shader resources or
+update renderer caches. Structural decoding is NOT complete semantic validation:
+the future restore provider must check resource/session identity, addresses,
+enum compatibility and scene/allocator constraints before applying anything.
+In particular, preserving active=true in a record does not make setting it on a
+live context safe. GPU images, command payloads and audio remain outside it.
+
+The codec is not yet called by Save State/Load State and is not inserted into
+the existing v6 save files. The unsupported-host load refusal remains enabled.
+Full capture needs guest/host/GPU quiescence and the remaining resource providers;
+full restore needs reconstruction and validation of those providers first.
+
+Validation uses actual project GXM types and the production codec:
+
+- A golden byte prefix and a separate 64-bit counter fixture check endian order,
+  field offsets and scalar widths independently of roundtrip symmetry.
+- Guest address patterns, signed values, negative zero, a NaN payload, array
+  tails and overlapping texture dimension fields survive roundtrips.
+- Every truncated prefix, trailing data, wrong headers, out-of-range bitfields,
+  invalid bools and invalid non-fixed context-type enum values are rejected.
+- 100 generated logical states and 5,000 single-bit mutations were exercised;
+  any accepted mutated record must re-encode canonically. This is not a complete
+  semantic/resource-validity or hostile-input fuzzing proof.
+- tests/savestate/check_gxm_codec_fields.py checks that all current top-level
+  declarations have schema entries. It guards field omissions, not C++ semantics.
+- tests/savestate/gxm_state_codec_test.cpp compiled and ran with host g++ C++23
+  and warnings treated as errors. The complete modified SceGxm.cpp also passed
+  host syntax checking; existing dependency warnings remain there. No Android
+  linking, real-driver rendering or device load has been tested for this change.
+
+## Coordinated host pause (previous checkpoint)
+
+VKState::pause_host_workers_until(deadline) now joins the two pause primitives
+in one scoped HostQuiescence result. It parks the render producer first, drains
+and parks the writeback workers second, then nonblockingly acquires both queue
+mutexes only if both queues are empty. The same absolute deadline is used for
+both pause stages. An aborted queue or an expired final deadline rejects the
+result. Leftover commands are preserved; this operation does not discard them
+or attempt to run them while workers are parked.
+
+All partial failures release acquired resources before returning. On scope exit,
+explicit release, or replacement by move assignment, queue locks are released
+first, then writeback workers, then the renderer. This matters because render
+commands can synchronously wait for writeback. The result reports the failed
+stage (render pause, writeback pause, either queue, shutdown, or deadline).
+
+The result owns mutexes, so acquisition, moves, release and destruction must all
+occur on the SAME host thread. The caller must protect session lifetime and
+must release the result before queue abort, joins or renderer destruction. Do
+not hold kernel/display or other locks needed by those workers while acquiring.
+The final queue locks also exclude a late producer, but guest threads must still
+be quiescent to capture their CPU/memory state. This API does not pause guests.
+
+This provides host-worker/queue exclusion, NOT a complete GPU idle barrier. It
+does not cover GPU submissions untracked by the writeback workers, unsubmitted
+GXM scenes, device images/caches, NGS or audio. Save State and Load State do not
+call it yet, and successful acquisition must not authorize raw memory restore.
+The unsupported-host load refusal remains in place.
+
+The standalone test is tests/savestate/host_quiescence_test.cpp. It includes the
+production gates and queues, with simulated renderer/writeback jobs. It tests
+300 cycles where rendering synchronously depends on writeback, exclusive empty
+queues, preserved pending commands, writeback timeout/retry, exception cleanup,
+move/replacement cleanup, late queued work and an aborted queue. This is a host
+concurrency test, not an FFX or GPU-driver test. It can be compiled independently
+with C++23, thread support, and the vita3k/renderer/include and
+vita3k/threads/include directories; it is not wired into the APK workflow yet.
+
+Full Vulkan context.cpp, Vulkan renderer.cpp and batch.cpp passed host syntax
+checking with the new API. The previous writeback-worker and render-loop tests
+also passed. Android linking and device restoration remain unverified.
+
+## GPU writeback worker pause (previous checkpoint)
+
+VKState now owns WorkerGroupPause. Every VKContext wait worker registers before
+processing requests. A pause is acknowledged only when every registered worker
+has completed its current request, reached an empty-queue boundary and waited
+for its own accumulated GPU fences. One callback/sentinel on the shared queue
+would not establish this: other workers may still be executing dequeued work.
+
+Queue::pop_interruptible drains existing items and can leave an idle wait on an
+external atomic pause flag. wake_interruptible synchronizes its notification
+with the queue mutex, avoiding the predicate-check/condition-wait lost wakeup.
+Queue::abort now takes that same mutex before notifying, for the same reason.
+Ordinary idle workers still sleep without periodically polling.
+
+The coordinator API is writeback_pause.acquire_until(deadline, wake), with wake
+calling request_queue.wake_interruptible(). It returns a move-only scoped Lease.
+An empty worker group is rejected. All earlier per-worker fence waits must
+succeed before acknowledgement. Timeout cancels the request and leaves pending
+fences for normal processing or a retry. Snapshot fence errors (including Vulkan
+SystemError exceptions) close the pause gate and do not yield a successful lease.
+This does not provide general recovery from GPU device loss.
+
+Changing worker membership during an unacknowledged request cancels it. A worker
+starting during an acquired lease waits before accessing the queue or memory.
+Closing the group cancels pending requests, but cannot revoke an acquired lease:
+its owner must release it before worker joins, renderer cleanup or device
+destruction. Cleanup reinitializes the gate only after the old contexts/workers
+have been destroyed by the application shutdown path.
+
+This is still NOT a device-wide GPU idle guarantee. It covers the fences known
+to these workers, not every GPU submission or unsubmitted command buffer. Queue
+producers must be quiescent; otherwise new items can be queued while workers are
+parked. The future coordinator must hold the host-render lease and establish
+guest/display quiescence, separately cover other GPU work, and verify queue
+emptiness without deadlocking kernel/renderer locks. It must not equate a
+writeback lease with a complete snapshot.
+
+No Save State/Load State caller acquires these leases yet. The v6 format, lack of
+graphics/audio serialization and unsupported-host load refusal are unchanged.
+
+Validation of the latest change:
+
+- The actual wait_thread_function body was compiled and exercised with simulated
+  Vulkan/device types, the production Queue and WorkerGroupPause. Tests covered
+  500 two-worker drain/pause/resume cycles, callbacks still executing when pause
+  is requested, work queued while leased, pending fences, timeout/retry, fence
+  error returns and exceptions, membership changes, shutdown/restart and a
+  throwing wake callback. A deterministic queue test covers abort at the exact
+  predicate/condition-wait boundary.
+- Full Vulkan context.cpp, Vulkan renderer.cpp and batch.cpp passed host g++
+  C++23 syntax checks against actual project headers and the pinned Vulkan/VMA
+  dependency revisions from the fork. This does not validate Android linking
+  or an actual GPU driver. Existing fmt/spdlog warnings remain.
+- Existing display-drain, snapshot-lock and render-loop regression tests passed,
+  including 30 timed-wait cycles and 2,000 completion/resume races.
+
+## Host render-loop pause (previous checkpoint)
+
+renderer::RenderPause now provides a bounded, acknowledged pause of the host
+render thread. render_loop registers a Worker for its lifetime and reaches
+checkpoints before frame work and after process_batches. process_batches returns
+to that checkpoint on a pending pause, between complete command batches. Shader
+precompilation or a blocked backend command can still delay the checkpoint; the
+requester then times out without leaving a pending pause behind.
+
+An acquired, move-only Lease keeps the worker parked until release or scope
+exit, including exception unwinding. A second requester, a request from the
+render thread itself, an expired deadline or a missing worker is rejected.
+Closing the gate cancels unacknowledged requests and rejects new ones, but does
+not revoke an acquired lease. Release a held lease before joining the render
+thread. prepare_start is called before starting a replacement thread; late
+worker registration cannot reopen a gate already closed during shutdown.
+
+The API is render_state.render_pause.acquire_until(steady_clock_deadline).
+Do not wait for a lease while holding locks that the renderer needs. A failed
+acquisition is not a stopped renderer. A successful acquisition only excludes
+that host loop: pending command lists are retained, unsubmitted scenes remain
+unsubmitted, GPU commands may still execute, and Vulkan memory-writeback workers
+can still run. This API must not yet be used to authorize guest RAM restoration.
+
+Save State and Load State do not invoke this new gate yet. In particular, this
+change does not make existing v6 files complete snapshots. The unsupported-host
+load refusal below remains in place. The next integration needs a separate GPU
+completion/writeback barrier and a coordinated order with the kernel/display
+locks, followed by actual graphics/audio capture and reconstruction.
+
+Validation of this change:
+
+- 1,000 acknowledged pause/resume cycles with exclusion assertions, move and
+  exception cleanup, timeout followed by a late checkpoint, self/concurrent
+  request rejection, worker exit, shutdown cancellation and thread restart.
+- Extracted production render_loop/process_batches/start/stop bodies exercised
+  with simulated backend and overlay dependencies: no acknowledgement inside a
+  batch, no frame or command execution while leased, successful resume, restart
+  and early-exit cleanup. This is not a GPU or Android runtime test.
+- Full batch.cpp passed host g++ C++20 syntax checking against real project
+  headers, as did the six existing translation units listed below. An unused
+  Vulkan types include was removed from batch.cpp; the new gate is independent
+  of Vulkan headers. Existing fmt/spdlog deprecation warnings remain.
+
+No Android link/build or device load test has been performed for this change.
+
+## Verified baseline
+
+On Xperia 1 II SOG01 with FFX HD PCSG00219, fix21 saved twice. Logs show display
+queue preparation completed in about 8 ms and 38 ms, with total saves taking
+about 2.3 s and 2.5 s. The user confirmed normal controls and audio on Resume.
+This validates those two save/resume attempts, not restoration of the snapshot.
+
+## Implemented here
+
+DisplayQueueDrainScope is shared by save and load. Load previously skipped the
+fix21 producer/consumer preparation and could attempt to abort a GXM producer
+while its display consumer remained session-parked. The new load preflight
+drains the dedicated display callback and acquires KernelSnapshotGuard, including
+the empty display queue lock, before examining current thread/queue state.
+
+Under that guard the loader checks the exact thread set, canonical kernel
+object UID sets, synchronization-record membership and allocation region layout.
+Duplicates, invalid thread statuses and malformed wait records are rejected.
+GXM counts/context address are checked before any old memory is copied; this
+comparison is not a proof of full object identity.
+
+All these checks precede request_restore_suspend, memory writes, CPU context
+replacement, sync-value restoration and file reconciliation. The guard is
+released and the callback grant revoked before any old wait-unwind code runs.
+Pending callbacks can progress during preparation: refusal does not mean the
+current paused state is bit-for-bit unchanged. It means saved memory has not
+been applied and existing waits have not been aborted by the loader.
+
+An explicit ErrorUnsupportedHostState result now stops the old destructive load
+path when active GXM resources, NGS systems or audio ports are present. FFX
+therefore cannot load in this checkpoint. It is intentionally not presented as
+a completed fix. The file format remains v6 because this is validation work,
+not a new host-state serialization format.
+
+The guard avoids repeating the known unsupported host-state restore path. It
+does not prove that every other minimal/non-GXM state is loadable. Strong
+session identity, allocator object identity, unsupported kernel contents and
+transactional recovery remain unfinished.
+
+## Why graphics/audio remain a separate implementation
+
+SceGxmContext contains guest logical state, a renderer Context, C++ containers,
+command allocation positions and live pointers. Restoring only state.active
+does not reconstruct its renderer command lists or backend state.
+
+renderer::Command embeds host pointers. SetContext payloads own color/depth
+surface copies and destroy_command_payload deletes them after consumption.
+Raw restoration would revive already-freed payloads. Skipping GXM object ranges
+does not cover or reconstruct all this command storage.
+
+The Vulkan backend tracks images, framebuffers, render passes, pipeline/dynamic
+state and surfaces outside guest RAM. scene.cpp's surface-sync path returns
+early for Vulkan; a CPU RAM dump cannot be assumed to contain every GPU surface.
+renderer::finish orders queued commands and some Vulkan wait-worker requests;
+it is not a complete snapshot or a persistent freeze of all GPU workers.
+
+NGS System/Rack/Voice objects are placement-constructed in guest memory. They
+contain vectors, unique_ptrs and mutexes, while module logical/runtime states
+live outside that memory. Neither copying their old bytes nor retaining their
+entire current state constitutes an audio restoration.
+
+## Required next implementation
+
+1. A coordinated renderer/GPU/wait-worker checkpoint after guest/display
+   quiescence, with bounded failure and an explicit acknowledgement.
+2. Typed GXM logical records with resource identity, separate from host pointers.
+   Either serialize commands semantically or require a defined drained scene
+   boundary. Serialize/read back required GPU surfaces and reconstruct caches.
+3. NGS logical/module records and rebuilding runtime decoder/container state;
+   define backend audio queue/timing restoration rather than preserving it.
+4. Capture/validate all required providers before allowing the destructive load
+   phase. Only remove the unsupported-host refusal when those providers work.
+   Introduce a corresponding file version/session identity at that point.
+5. Exercise save, advance, load and resume on device only after this is in place.
 
 ## Validation
 
-Six C++ translation units passed host g++ C++20 syntax checks with project
+Six translation units passed host g++ C++20 syntax checks using actual project
 headers: session_controller.cpp, native_session.cpp, kernel.cpp, thread.cpp,
-savestate.cpp and SceAudio.cpp. JNI used Android declarations. fmt/spdlog
-deprecation warnings remain. This is not an NDK build/link/APK or device test.
+savestate.cpp and SceAudio.cpp. fmt/spdlog deprecation warnings remain. Android
+NDK linking and APK generation have not been performed.
 
-Isolated tests extract production method bodies and use the actual Queue
-template, with test doubles for CPU/HLE and other surrounding services:
+Production helper bodies were tested for equal-count UID replacement, harmless
+record reordering, duplicate/missing identities, synchronization membership,
+GXM/NGS/audio refusal and nonblocking audio lock contention. These are helper
+tests, not a full load-state integration test.
 
-- Reproduced a queue-waiting producer and session-parked display consumer.
-  Granting only the consumer drained the queue and parked the producer without
-  executing another ordinary guest instruction; ordinary Resume then worked.
-- The actual drain scope revoked its grant both normally and on exception.
-- 30 timed-wait/run_loop pause-resume cycles and 2,000 completion/resume races.
-- Snapshot waited for queue drain, then excluded a concurrent producer while
-  held. A permanently pending callback refused within the preparation bound
-  without discarding its item. Existing contention/audio/error cleanup tests
-  also passed.
-- fix19 replay-barrier regression tests including 2,000 completion/resume races.
-
-## Next device check
-
-Apply all five changed files together on fix20, retaining paths, and use the
-existing Android CI. Start a fresh game session, check ordinary pause/Resume,
-then try Save State once and Resume. Check controls/audio for 30 seconds.
-Do not test Load State yet. If saving is refused, provide the new error/log;
-repeated attempts in the same state are unnecessary.
-
-Log markers:
-- Savestate fix21: preparing display queue drain
-- Savestate fix21: display queue drained and kernel snapshot locks acquired
-- active HLE NID=0x... (on a running-thread refusal)
-
-Relevant NIDs from this source tree:
-- sceGxmDisplayQueueAddEntry: 0xEC5C26B5
-- sceGxmDisplayQueueFinish: 0xB98C5B0D
-- sceGxmFinish: 0x0733D8AE
-- sceGxmNotificationWait: 0x9F448E79
+The existing extracted run_loop/real Queue tests passed after moving the drain
+scope: display dependency/drain, exception cleanup, 30 timed-wait cycles and
+2,000 completion/resume races. Snapshot lock/drain/refusal tests also passed.
+No full FFX load success has been demonstrated.

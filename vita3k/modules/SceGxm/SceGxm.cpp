@@ -19,6 +19,8 @@
 
 #include <modules/module_parent.h>
 
+#include <algorithm>
+#include <type_traits>
 #include <span>
 #include <stack>
 #if defined(__x86_64__) && !defined(__APPLE__)
@@ -31,6 +33,8 @@
 #include <display/functions.h>
 #include <display/state.h>
 #include <gxm/functions.h>
+#include <gxm/context_snapshot.h>
+#include <gxm/context_preflight.h>
 #include <gxm/state.h>
 #include <gxm/types.h>
 #include <kernel/state.h>
@@ -39,6 +43,7 @@
 #include <io/state.h>
 #include <mem/mempool.h>
 #include <renderer/functions.h>
+#include <renderer/host_quiescence.h>
 #include <renderer/state.h>
 #include <renderer/types.h>
 #include <util/align.h>
@@ -989,7 +994,9 @@ struct SceGxmCommandList {
 static_assert(sizeof(SceGxmCommandList) - sizeof(std::stack<CommandListRange>) <= 32);
 
 struct SceGxmContext {
-    GxmContextState state;
+    // Give unused logical fields defined values as well. A future snapshot
+    // capture must not read indeterminate settings from a newly created context.
+    GxmContextState state{};
 
     std::unique_ptr<renderer::Context> renderer;
 
@@ -1285,6 +1292,7 @@ static int destroy_gxm_context(EmuEnvState &emuenv, SceGxmContext *context, cons
         return static_cast<int>(SCE_GXM_ERROR_INVALID_VALUE);
     }
 
+    emuenv.gxm.context_identities.destroyed(context);
     context->~SceGxmContext();
     return 0;
 }
@@ -1313,6 +1321,7 @@ void destroy_all_contexts(EmuEnvState &emuenv, const bool force_backend_destroy)
         if (result < 0) {
             LOG_WARN("Failed to destroy deferred GXM context during cleanup: {}", log_hex(result));
             emuenv.gxm.deferred_contexts.erase(context);
+            emuenv.gxm.context_identities.destroyed(context);
         }
     }
 }
@@ -1351,6 +1360,57 @@ struct SceGxmRenderTarget {
 };
 
 namespace gxm {
+
+ContextCaptureResult capture_context_records(EmuEnvState &emuenv,
+    const renderer::HostQuiescence &host_pause) {
+    if (!host_pause || !emuenv.kernel.is_threads_paused())
+        return { ContextCaptureError::NotQuiescent, 0, {} };
+    auto &gxm = emuenv.gxm;
+    const auto count = gxm.deferred_contexts.size() + (gxm.immediate_context ? 1 : 0);
+    if (gxm.context_identities.size() != count)
+        return { ContextCaptureError::RegistryMismatch, 0, {} };
+
+    ContextCaptureResult result;
+    result.records.reserve(count);
+    std::set<uint32_t> addresses;
+    const auto append = [&](SceGxmContext *context, uint32_t address, SceGxmContextType type) {
+        if (!context || !address || !addresses.insert(address).second)
+            return ContextCaptureError::InvalidContext;
+        const auto identity = gxm.context_identities.find(context);
+        if (!identity)
+            return ContextCaptureError::RegistryMismatch;
+        ContextLogicalRecord record;
+        const auto error = detail::capture_context_value(*context, address, identity, type, record);
+        if (error == ContextCaptureError::None) {
+            if (!capture_program_instances(record, gxm.vertex_program_identities, gxm.fragment_program_identities))
+                return ContextCaptureError::InvalidProgram;
+            result.records.push_back(std::move(record));
+        }
+        return error;
+    };
+    if (gxm.immediate_context) {
+        const auto error = append(Ptr<SceGxmContext>(gxm.immediate_context).get(emuenv.mem),
+            gxm.immediate_context, SCE_GXM_CONTEXT_TYPE_IMMEDIATE);
+        if (error != ContextCaptureError::None)
+            return { error, gxm.immediate_context, {} };
+    }
+    for (const auto &[context, address] : gxm.deferred_contexts) {
+        const auto error = append(context, address, SCE_GXM_CONTEXT_TYPE_DEFERRED);
+        if (error != ContextCaptureError::None)
+            return { error, address, {} };
+    }
+    std::sort(result.records.begin(), result.records.end(), [](const auto &a, const auto &b) {
+        return a.address < b.address;
+    });
+    return result;
+}
+
+ContextPreflightResult check_context_restore_prerequisites(EmuEnvState &emuenv,
+    const renderer::HostQuiescence &host_pause, std::span<const ContextLogicalRecord> saved) {
+    const auto current = capture_context_records(emuenv, host_pause);
+    return preflight_context_records(saved, current, emuenv.gxm.vertex_program_identities,
+        emuenv.gxm.fragment_program_identities);
+}
 
 std::vector<std::pair<uint32_t, uint32_t>> get_host_object_ranges(EmuEnvState &emuenv) {
     std::vector<std::pair<uint32_t, uint32_t>> ranges;
@@ -2039,6 +2099,7 @@ EXPORT(int, sceGxmCreateContext, const SceGxmContextParams *params, Ptr<SceGxmCo
         return ctx->free_new_command(cmd);
     };
 
+    emuenv.gxm.context_identities.created(ctx);
     emuenv.gxm.immediate_context = context->address();
     return 0;
 }
@@ -2065,6 +2126,7 @@ EXPORT(int, sceGxmCreateDeferredContext, SceGxmDeferredContextParams *params, Pt
 
     // Create a generic context. This is only used for storing command list
     ctx->renderer = std::make_unique<renderer::Context>();
+    emuenv.gxm.context_identities.created(ctx);
     emuenv.gxm.deferred_contexts.emplace(ctx, deferredContext->address());
 
     return 0;
@@ -4496,6 +4558,10 @@ static Ptr<T> alloc_callbacked(EmuEnvState &emuenv, SceUID thread_id, const SceG
     {
         const std::lock_guard<std::mutex> lock(emuenv.gxm.host_objects_mutex);
         emuenv.gxm.host_objects[address] = sizeof(T);
+        if constexpr (std::is_same_v<T, SceGxmVertexProgram>)
+            emuenv.gxm.vertex_program_identities.created(address);
+        else if constexpr (std::is_same_v<T, SceGxmFragmentProgram>)
+            emuenv.gxm.fragment_program_identities.created(address);
     }
     return ptr;
 }
@@ -4512,6 +4578,8 @@ static void free_callbacked(EmuEnvState &emuenv, SceUID thread_id, SceGxmShaderP
     {
         const std::lock_guard<std::mutex> lock(emuenv.gxm.host_objects_mutex);
         emuenv.gxm.host_objects.erase(data);
+        emuenv.gxm.vertex_program_identities.destroyed(data);
+        emuenv.gxm.fragment_program_identities.destroyed(data);
     }
     const auto thread = emuenv.kernel.get_thread(thread_id);
     thread->run_callback(shaderPatcher->params.hostFreeCallback.address(), { shaderPatcher->params.userData.address(), data });

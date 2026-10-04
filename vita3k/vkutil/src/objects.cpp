@@ -36,20 +36,59 @@ void deinit() {
 
 Image::Image() = default;
 
-Image::Image(Image &&other) noexcept {
-    memcpy(this, &other, sizeof(Image));
-    other.sampler = nullptr;
-    other.view = nullptr;
-    other.image = nullptr;
-    other.layout = ImageLayout::Undefined;
+Image::Image(Image &&other) noexcept : Image() {
+    *this = std::move(other);
 }
 Image &Image::operator=(Image &&other) noexcept {
-    memcpy(this, &other, sizeof(Image));
+    if (this == &other) return *this;
+    destroy();
+    allocation = other.allocation;
+    image = other.image;
+    view = other.view;
+    sampler = other.sampler;
+    width = other.width;
+    height = other.height;
+    format = other.format;
+    layout = other.layout;
+    snapshot_transfer_source = other.snapshot_transfer_source;
+    snapshot_transfer_destination = other.snapshot_transfer_destination;
+    destroy_on_deletion = other.destroy_on_deletion;
+    allocation_lifetime = std::move(other.allocation_lifetime);
+    pinned_image = other.pinned_image;
+    other.allocation = nullptr;
     other.sampler = nullptr;
     other.view = nullptr;
     other.image = nullptr;
+    other.pinned_image = nullptr;
     other.layout = ImageLayout::Undefined;
+    other.snapshot_transfer_source = false;
+    other.snapshot_transfer_destination = false;
     return *this;
+}
+
+std::shared_ptr<const void> Image::pin_snapshot_allocation() {
+    if (!destroy_on_deletion || !allocator || !image || !allocation || !snapshot_transfer_source)
+        return {};
+    if (allocation_lifetime)
+        return pinned_image == image ? allocation_lifetime : std::shared_ptr<const void>{};
+    struct AllocationPin {
+        vma::Allocator owner;
+        vk::Image image;
+        vma::Allocation allocation;
+        AllocationPin(vma::Allocator owner, vk::Image image, vma::Allocation allocation)
+            : owner(owner), image(image), allocation(allocation) {}
+        ~AllocationPin() {
+            // Integration must drain pins before teardown. As with the old
+            // Image destructor, never call a deinitialized allocator.
+            if (vkutil::allocator && vkutil::allocator == owner)
+                owner.destroyImage(image, allocation);
+        }
+    };
+    // make_shared allocates before constructing the owner, so allocation
+    // failure cannot destroy an image still owned by this wrapper.
+    allocation_lifetime = std::make_shared<AllocationPin>(allocator, image, allocation);
+    pinned_image = image;
+    return allocation_lifetime;
 }
 
 Image::Image(uint32_t width, uint32_t height, vk::Format format)
@@ -59,6 +98,8 @@ Image::Image(uint32_t width, uint32_t height, vk::Format format)
 }
 
 void Image::destroy() {
+    snapshot_transfer_source = false;
+    snapshot_transfer_destination = false;
     if (!destroy_on_deletion || !allocator)
         return;
 
@@ -72,8 +113,13 @@ void Image::destroy() {
         view = nullptr;
     }
     if (image) {
-        allocator.destroyImage(image, allocation);
+        if (allocation_lifetime && pinned_image == image)
+            allocation_lifetime.reset(); // last pin destroys the allocation
+        else
+            allocator.destroyImage(image, allocation);
         image = nullptr;
+        allocation = nullptr;
+        pinned_image = nullptr;
     }
 }
 
@@ -100,7 +146,11 @@ void Image::init_image(vk::ImageUsageFlags usage, vk::ComponentMapping mapping, 
         .initialLayout = vk::ImageLayout::eUndefined,
     };
 
+    snapshot_transfer_source = false;
+    snapshot_transfer_destination = false;
     std::tie(image, allocation) = allocator.createImage(image_info, vma_auto_alloc);
+    snapshot_transfer_source = bool(usage & vk::ImageUsageFlagBits::eTransferSrc);
+    snapshot_transfer_destination = bool(usage & vk::ImageUsageFlagBits::eTransferDst);
 
     // only create a view if one of these flags is set
     constexpr vk::ImageUsageFlags view_usages = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eStorage;

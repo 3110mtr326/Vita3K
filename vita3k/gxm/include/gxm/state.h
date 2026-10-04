@@ -18,6 +18,7 @@
 #pragma once
 
 #include <gxm/types.h>
+#include <gxm/context_identity.h>
 #include <mem/ptr.h>
 #include <threads/queue.h>
 
@@ -77,10 +78,13 @@ struct GxmState {
     // overwrite these with old bytes (see gxm::get_host_object_ranges()).
     std::mutex host_objects_mutex;
     std::map<Address, uint32_t> host_objects;
+    gxm::GuestObjectIdentityRegistry vertex_program_identities;
+    gxm::GuestObjectIdentityRegistry fragment_program_identities;
 
     std::map<Address, MemoryMapInfo> memory_mapped_regions;
     std::mutex callback_lock;
     Address immediate_context = 0;
+    gxm::ContextIdentityRegistry context_identities;
     std::unordered_map<SceGxmContext *, Address> deferred_contexts;
     std::unordered_map<SceGxmRenderTarget *, Address> render_targets;
 
@@ -105,6 +109,9 @@ struct GxmState {
         last_display_global = 0;
         notification_region = Ptr<uint32_t>(0);
         immediate_context = 0;
+        context_identities.clear();
+        vertex_program_identities.clear();
+        fragment_program_identities.clear();
         deferred_contexts.clear();
         render_targets.clear();
     }

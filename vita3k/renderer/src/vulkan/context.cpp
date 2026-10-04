@@ -30,6 +30,7 @@
 namespace renderer::vulkan {
 
 void VKContext::wait_thread_function(const MemState &mem) {
+    WorkerGroupPause::Worker pause_worker(state.writeback_pause);
     // try to wait for multiple fences at the same time if possible
     std::vector<vk::Fence> fences;
 
@@ -50,17 +51,53 @@ void VKContext::wait_thread_function(const MemState &mem) {
                 continue;
             }
             LOG_ERROR("Could not wait for fences.");
+            state.writeback_pause.close();
             assert(false);
             fences.clear();
             return;
         }
     };
 
-    while (true) {
-        auto wait_request = state.request_queue.pop();
+    // Unlike a queue sentinel, this executes in EVERY worker after that worker
+    // has finished earlier requests. A cancelled snapshot leaves pending fences
+    // intact for normal processing. Only tracked fences are covered here.
+    auto finish_fences_for_pause = [&]() {
+        while (!fences.empty()) {
+            if (!state.writeback_pause.requested() || state.request_queue.is_aborted())
+                return false;
+            vk::Result result;
+            try {
+                result = state.device.waitForFences(fences, VK_TRUE, 100'000'000ULL);
+            } catch (const vk::SystemError &error) {
+                LOG_ERROR("Cannot pause GPU writeback: {}", error.what());
+                state.writeback_pause.close();
+                return false;
+            }
+            if (result == vk::Result::eSuccess) {
+                fences.clear();
+                break;
+            }
+            if (result != vk::Result::eTimeout) {
+                LOG_ERROR("Cannot pause GPU writeback: fence wait failed.");
+                state.writeback_pause.close();
+                return false;
+            }
+        }
+        return !state.request_queue.is_aborted();
+    };
 
-        if (!wait_request)
-            break;
+    while (true) {
+        auto wait_request = state.request_queue.pop_interruptible([&] {
+            return state.writeback_pause.requested();
+        });
+
+        if (!wait_request) {
+            if (state.request_queue.is_aborted())
+                break;
+            if (finish_fences_for_pause())
+                pause_worker.checkpoint();
+            continue;
+        }
 
         std::visit(overloaded{
                        [&](FenceWaitRequest &request) {

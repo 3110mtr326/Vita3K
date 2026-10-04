@@ -91,6 +91,34 @@ public:
         condempty_.notify_one();
     }
 
+    // Drain queued items normally, but let an external request interrupt an
+    // idle consumer. The predicate must not lock this queue or a lock held by
+    // its waker (an atomic flag is appropriate). A null result means aborted
+    // or interrupted; callers must distinguish those conditions.
+    template <typename Interrupted>
+    std::unique_ptr<T> pop_interruptible(Interrupted interrupted) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        condempty_.wait(lock, [&] {
+            return aborted || !queue_.empty() || interrupted();
+        });
+        if (aborted || queue_.empty())
+            return {};
+        auto item = std::make_unique<T>(queue_.front());
+        queue_.pop();
+        lock.unlock();
+        cond_.notify_all();
+        return item;
+    }
+
+    // Publish the interrupt flag before calling this. Synchronizing with the
+    // queue mutex closes the predicate-check / condition-wait lost-wakeup gap.
+    void wake_interruptible() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+        }
+        condempty_.notify_all();
+    }
+
     size_t size() {
         return queue_.size();
     }
@@ -100,7 +128,10 @@ public:
     }
 
     void abort() {
-        aborted = true;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            aborted = true;
+        }
         condempty_.notify_all();
         cond_.notify_all();
     }
