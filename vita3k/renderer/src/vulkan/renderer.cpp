@@ -278,8 +278,53 @@ SnapshotImageValidation VKState::validate_snapshot_image_section(const std::vect
         || std::chrono::steady_clock::now() >= deadline) return SnapshotImageValidation::NotReady;
     const auto records = decode_snapshot_image_sections(bytes);
     if (!records) return SnapshotImageValidation::InvalidData;
-    return validate_snapshot_image_upload(*records, lease, deadline)
-        ? SnapshotImageValidation::Prepared : SnapshotImageValidation::NotReady;
+    if (!validate_snapshot_image_upload(*records, lease, deadline) || !snapshot_scratch_transfers)
+        return SnapshotImageValidation::NotReady;
+    snapshot_scratch_transfers->poll([](const auto &job) { return job.poll(); });
+    if (snapshot_scratch_transfers->size()) return SnapshotImageValidation::NotReady;
+    const auto stopped = [&] { return render_abort.load(std::memory_order_relaxed)
+        || std::chrono::steady_clock::now() >= deadline; };
+    // Verify creation support for the isolated diagnostic images before allocation.
+    const auto supported = [&](const auto &r) {
+        const auto props = physical_device.getImageFormatProperties(vk::Format(r.format),vk::ImageType::e2D,
+            vk::ImageTiling::eOptimal,vk::ImageUsageFlagBits::eTransferSrc|vk::ImageUsageFlagBits::eTransferDst,{});
+        return r.width <= props.maxExtent.width && r.height <= props.maxExtent.height
+            && bool(props.sampleCounts & vk::SampleCountFlagBits::e1);
+    };
+    for (const auto &r : records->colors) if (!supported(r)) return SnapshotImageValidation::NotReady;
+    for (const auto &r : records->depths) if (!supported(r)) return SnapshotImageValidation::NotReady;
+    auto job = SnapshotScratchResources<>::create(device,allocator,general_family_index,
+        physical_device_queue_families[general_family_index].queueFlags,*records);
+    if (!job || stopped()) return SnapshotImageValidation::NotReady;
+    LOG_INFO("Savestate GPU self-test: submitting isolated image upload/readback; game images are not targets.");
+    const auto submission = snapshot_scratch_transfers->submit(std::move(job),[&](auto &retained) {
+        const auto command = retained.command();
+        vk::SubmitInfo submit{};submit.setCommandBuffers(command);
+        general_queue.submit(submit,retained.fence());
+        return true;
+    });
+    if (!submission.submitted) {
+        if (submission.id) snapshot_scratch_transfers->abandon(submission.id);
+        return SnapshotImageValidation::TransferFailed;
+    }
+    const auto waited = wait_snapshot_transfer(*snapshot_scratch_transfers,submission.id,deadline,
+        [](const auto &resource) { return resource.poll(); },
+        [&] { return render_abort.load(std::memory_order_relaxed); },
+        [] { return std::chrono::steady_clock::now(); },
+        [](auto until) { std::this_thread::sleep_until(until); });
+    if (waited != SnapshotWaitResult::Complete) {
+        LOG_WARN("Savestate GPU self-test: transfer wait failed ({}); resources retained until safe release.",static_cast<int>(waited));
+        return SnapshotImageValidation::TransferFailed;
+    }
+    bool matches = false;
+    try {
+        const bool consumed = snapshot_scratch_transfers->consume(submission.id,[&](const auto &resource) {
+            matches = resource.verify_completed_pixels();
+        });
+        if (!consumed) { snapshot_scratch_transfers->abandon(submission.id); return SnapshotImageValidation::TransferFailed; }
+    } catch (...) { snapshot_scratch_transfers->abandon(submission.id); throw; }
+    LOG_INFO("Savestate GPU self-test: upload/readback {}; no game state restored.",matches ? "MATCH" : "MISMATCH");
+    return matches ? SnapshotImageValidation::RoundTripPassed : SnapshotImageValidation::RoundTripMismatch;
 }
 
 #if defined(__ANDROID__) && defined(USE_ADRENO_TOOLS)
@@ -1052,6 +1097,8 @@ void VKState::late_init(const Config &cfg, const std::string_view game_id, MemSt
     // Never replace an existing service that might still own GPU work.
     if (!snapshot_transfers)
         snapshot_transfers = std::make_unique<SnapshotJobs>(1);
+    if (!snapshot_scratch_transfers)
+        snapshot_scratch_transfers = std::make_unique<SnapshotScratchJobs>(1);
     this->mem = &mem;
 
     bool use_high_accuracy = cfg.current_config.high_accuracy;
@@ -1132,6 +1179,10 @@ void VKState::cleanup() {
         snapshot_transfers.reset();
     }
 
+    if (snapshot_scratch_transfers) {
+        snapshot_scratch_transfers->shutdown([] { return true; });
+        snapshot_scratch_transfers.reset();
+    }
     writeback_pause.close();
     request_queue.abort();
 

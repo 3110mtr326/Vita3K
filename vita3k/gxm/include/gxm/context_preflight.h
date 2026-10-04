@@ -16,6 +16,7 @@ enum class ContextPreflightError {
 struct ContextPreflightResult {
     ContextPreflightError error = ContextPreflightError::None;
     uint32_t offending_address = 0;
+    ContextCaptureError capture_error = ContextCaptureError::None;
     explicit operator bool() const { return error == ContextPreflightError::None; }
 };
 
@@ -28,7 +29,7 @@ inline ContextPreflightResult preflight_context_records(
     const GuestObjectIdentityRegistry &vertices, const GuestObjectIdentityRegistry &fragments) {
     using E = ContextPreflightError;
     if (!current)
-        return { E::CurrentCaptureFailed, current.offending_address };
+        return { E::CurrentCaptureFailed, current.offending_address, current.error };
     if (!same_context_instances(saved, current.records))
         return { E::ContextChanged, 0 };
     const auto valid = [](const ContextLogicalRecord &record) {

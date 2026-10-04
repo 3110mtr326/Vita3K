@@ -10,6 +10,7 @@
 #include <gxm/context_identity.h>
 #include <gxm/context_snapshot.h>
 #include <gxm/context_preflight.h>
+#include <gxm/context_value_transaction.h>
 #include <gxm/context_record_codec.h>
 #include <sstream>
 #include <app/savestate_image_section.h>
@@ -44,7 +45,7 @@ template <typename T> bool read_pod(std::istream &in, T &value) {
     return bool(in.read(reinterpret_cast<char *>(&value), sizeof(value)));
 }
 int diagnostic_calls=0;
-SaveStateResult diagnose_saved_images(int, const std::vector<uint8_t> &bytes, std::string*) {
+SaveStateResult diagnose_saved_images(int, const std::vector<gxm::ContextLogicalRecord>&, const std::vector<uint8_t> &bytes, std::string*) {
     assert(bytes.size()==16);++diagnostic_calls;return SaveStateResult::ErrorUnsupportedHostState;
 }
 SaveStateResult test_load_graphics(std::istream &in, std::string *out_detail) {
@@ -312,6 +313,7 @@ int main() {
         assert(check());
         current.error = E::NotQuiescent;
         assert(check().error == P::CurrentCaptureFailed);
+        assert(check().capture_error == E::NotQuiescent);
         current.error = E::None;
         current.records[1].instance++;
         assert(check().error == P::ContextChanged);

@@ -32,6 +32,7 @@
 #include <renderer/snapshot_collect.h>
 #include <renderer/vulkan/snapshot_image_preflight.h>
 #include <renderer/vulkan/snapshot_upload_prepare.h>
+#include <renderer/vulkan/snapshot_scratch.h>
 
 #include <chrono>
 
@@ -61,6 +62,8 @@ private:
     // Session lifetime excludes cleanup; callers hold host worker exclusion.
     // Submission requires this renderer's acknowledged host pause.
     std::unique_ptr<SnapshotJobs> snapshot_transfers;
+    using SnapshotScratchJobs = SnapshotTransferService<SnapshotScratchResources<>>;
+    std::unique_ptr<SnapshotScratchJobs> snapshot_scratch_transfers;
 
 
 public:

@@ -35,6 +35,7 @@
 #include <gxm/functions.h>
 #include <gxm/context_snapshot.h>
 #include <gxm/context_preflight.h>
+#include <gxm/context_value_transaction.h>
 #include <gxm/state.h>
 #include <gxm/types.h>
 #include <kernel/state.h>
@@ -1408,8 +1409,20 @@ ContextCaptureResult capture_context_records(EmuEnvState &emuenv,
 ContextPreflightResult check_context_restore_prerequisites(EmuEnvState &emuenv,
     const renderer::HostQuiescence &host_pause, std::span<const ContextLogicalRecord> saved) {
     const auto current = capture_context_records(emuenv, host_pause);
-    return preflight_context_records(saved, current, emuenv.gxm.vertex_program_identities,
+    const auto checked = preflight_context_records(saved, current, emuenv.gxm.vertex_program_identities,
         emuenv.gxm.fragment_program_identities);
+    if (!checked) return checked;
+    // Stage and discard only. Live context values are not changed here.
+    const auto values = detail::ContextValueTransaction<SceGxmContext>::prepare(saved, current,
+        emuenv.gxm.vertex_program_identities, emuenv.gxm.fragment_program_identities,
+        [&](uint32_t address) -> SceGxmContext * {
+            if (address == emuenv.gxm.immediate_context)
+                return Ptr<SceGxmContext>(address).get(emuenv.mem);
+            for (const auto &[context, registered] : emuenv.gxm.deferred_contexts)
+                if (registered == address) return context;
+            return nullptr;
+        });
+    return values ? ContextPreflightResult{} : ContextPreflightResult{ContextPreflightError::InvalidRecord, 0};
 }
 
 std::vector<std::pair<uint32_t, uint32_t>> get_host_object_ranges(EmuEnvState &emuenv) {

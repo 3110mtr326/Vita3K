@@ -172,7 +172,8 @@ struct State {
     virtual std::optional<std::vector<uint8_t>> capture_snapshot_image_section(
         const HostQuiescence &, std::chrono::steady_clock::time_point) { return std::nullopt; }
 
-    // Development-only Load diagnostic. Never submits writes or restores state.
+    // Development-only Load diagnostic. May transfer isolated scratch images;
+    // never overwrites live game images or restores game state.
     virtual SnapshotImageValidation validate_snapshot_image_section(const std::vector<uint8_t> &,
         const HostQuiescence &, std::chrono::steady_clock::time_point) { return SnapshotImageValidation::Unsupported; }
 

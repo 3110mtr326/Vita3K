@@ -1059,6 +1059,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
 
 // Diagnostic only. Always return before thread abort/replay or saved RAM writes.
 static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
+    const std::vector<gxm::ContextLogicalRecord> &saved_graphics,
     const std::vector<uint8_t> &bytes, std::string *out_detail) {
     auto &kernel = emuenv.kernel;
     auto &mem = emuenv.mem;
@@ -1086,14 +1087,23 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         if (out_detail) *out_detail = reason;
         return SaveStateResult::ErrorThreadNotSafe;
     }
+    // Both domains are inspected under the same continuous exclusion. Staging
+    // context values never applies them; even both successes are not a restore.
+    const auto contexts = gxm::check_context_restore_prerequisites(emuenv, host_pause, saved_graphics);
+    LOG_INFO("Savestate load diagnostic: context preparation reason {}, capture reason {}, address 0x{:08X}; no context values applied.",
+        static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     const auto result = emuenv.renderer->validate_snapshot_image_section(bytes, host_pause,
         std::chrono::steady_clock::now() + std::chrono::seconds(3));
-    const char *stage = result == renderer::SnapshotImageValidation::Prepared ? "prepared"
+    const char *stage = result == renderer::SnapshotImageValidation::RoundTripPassed ? "gpu-roundtrip-passed"
+        : result == renderer::SnapshotImageValidation::RoundTripMismatch ? "gpu-roundtrip-mismatch"
+        : result == renderer::SnapshotImageValidation::TransferFailed ? "gpu-transfer-failed"
+        : result == renderer::SnapshotImageValidation::Prepared ? "prepared"
         : result == renderer::SnapshotImageValidation::InvalidData ? "invalid-data"
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
-    LOG_INFO("Savestate load diagnostic: image preparation {}; no upload submitted or saved RAM applied.", stage);
+    LOG_INFO("Savestate load diagnostic: image validation {}; no game images or saved RAM restored.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Image preparation: {}. Diagnostic only; no saved state was applied. Full graphics/audio restoration is not implemented", stage);
+        "Image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state was applied. Full graphics/audio restoration is not implemented",
+        stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
 }
@@ -1137,7 +1147,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     }
     // Diagnostic is an unconditional early return. Even successful preparation
     // must never reach RAM writes or wait replay until full restore is supported.
-    if (!image_section->empty()) return diagnose_saved_images(emuenv, *image_section, out_detail);
+    if (!image_section->empty()) return diagnose_saved_images(emuenv, *saved_graphics, *image_section, out_detail);
     if (!saved_graphics->empty()) {
         if (out_detail)
             *out_detail = "This save contains logical graphics records; GPU/audio restoration is not implemented";

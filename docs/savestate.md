@@ -4,7 +4,107 @@ This is unfinished source work, not a device-test release or a working FFX
 load implementation. Keep using the tested fix21 build for now. No new APK
 build or device test is requested for this checkpoint.
 
-## Save scene-boundary advance (latest change)
+## Isolated GPU upload/readback device checkpoint (latest change)
+
+Load diagnostics now perform a real GPU transfer self-test after saved-image
+parsing and live-target preparation succeed. Saved pixels are uploaded into NEW
+scratch images, then read back into a separate buffer and compared. Live game
+images, guest RAM and context values are never transfer destinations or applied
+state. There is no game rewind. Context staging is diagnosed independently.
+
+The production upload recorder validates and records the writes. A scratch-only
+adapter initializes undefined images to GENERAL before upload, then transitions
+the restored GENERAL images to TRANSFER_SRC_OPTIMAL and records readback plus a
+host-read barrier. Color/depth/stencil aspects preserve the supported formats.
+The comparison covers every copied texel, ignores staging alignment gaps and
+D24's undefined X8 byte, and compares meaningful D16/D32/color/stencil bytes.
+Each staging buffer is limited to 64 MiB; actual image memory overhead depends
+on the device. Unsupported format creation is checked before allocation.
+
+A dedicated capacity-one persistent service owns scratch images, both mapped
+buffers, command pools and fences BEFORE queue submission. Timeouts and uncertain
+submission retain ownership. Completed jobs retire after comparison; readback
+exceptions retire completed work. Cleanup releases both transfer services only
+after successful device.waitIdle and before destroying allocator/device. This
+retention does not provide recovery from device loss or a permanently failed idle
+wait; existing device-loss teardown limitations still apply.
+
+Host verification: six native translation units and the Vulkan renderer pass
+syntax checks. Tests exercise actual recorder order, new image creation flags,
+D16/D24/D32 comparisons, all twelve injected preparation failure stages, pending
+and uncertain submission ownership, actual lifecycle cleanup, and the production
+entry's lease/deadline/format/allocation/readback/timeout cases. These are mocks,
+not GPU execution. Android compilation and Xperia driver behavior need testing.
+
+Device procedure: upload this cumulative ZIP, build and install using the usual
+workflow. Start FFX, create a fresh Save, then Load once. Expected positive result
+is `gpu-roundtrip-passed` in the message and `Savestate GPU self-test:
+upload/readback MATCH` in the log. `gpu-roundtrip-mismatch` or
+`gpu-transfer-failed` identifies a failed self-test. Load still reports unsupported
+restoration even after MATCH because no saved game state is applied. Resume and
+check controls/sound, then provide the log and visible message. Save format stays
+v9, and the previously successful scene-boundary Save fix is included.
+
+## Joint context/image Load diagnostics (previous checkpoint)
+
+Load passes the decoded GCR1 context records into its image diagnostic instead
+of discarding them. Under one continuous final kernel guard and host-renderer
+lease, it now stages/validates context values and separately prepares image
+uploads. Context failure does not suppress image diagnostics; both results are
+reported. A failed current capture retains its original capture reason and
+address in ContextPreflightResult so active scenes/pending commands can be
+distinguished from context/program/allocation mismatches.
+
+Context reason 0 means staging succeeded; 1 means current capture failed (see
+capture reason), 2 context identity mismatch, 3 invalid record, 4 active scene,
+5 program lifetime mismatch and 6 allocator mismatch. Capture reasons retain
+the existing mapping: 5 active scene, 6 pending commands, 7 outstanding ring.
+These are readiness diagnostics, not permission to apply or resume a restore.
+Load does not perform the Save-only scene advance, so normal pause timing can
+still produce an active/pending current-context refusal.
+
+Both preparations remain unsubmitted/unapplied. Even joint success returns the
+existing unsupported-restore result before saved RAM and wait replay. The new
+context rollback component is not exercised against the live game by Load.
+Production diagnostic extraction tests cover both inspections under the same
+lease, context mismatch with continued image diagnosis, early refusals and
+exception cleanup. File framing/provider tests pass; native translation units
+and the final modified Save unit pass syntax checking. No new device result or
+Android build is claimed. Format v9 and the working Save boundary fix persist.
+
+## Reversible guest-facing context values (previous checkpoint)
+
+Device checkpoint: the October 5 log confirms Save completion (13 memory
+regions, 23 threads and 20,922,892 encoded image-section bytes), followed by two
+prepared Load diagnostics. The user confirmed controls and sound returned on
+Resume. This proves capture and unsubmitted preparation for that session, not
+GPU upload or full restore. Earlier process crashes in that log remain unrelated
+by timing to this successful Save and have not been diagnosed.
+
+ContextValueTransaction is an internal component for a future full restore.
+It validates all saved/current records, resolves registered live contexts, rejects
+aliases/missing targets and re-captures values to reject stale staging. It decodes
+and allocates before any write. Apply updates guest-facing logical state, texture
+dirty masks, uniform/precomputed flags and applicable free command-ring tickets;
+allocator configuration, command lists, renderer objects and ownership remain
+untouched. Apply/rollback perform no allocations. Unless explicitly accepted,
+destruction rolls applied values back. A completed transaction cannot reapply.
+
+The caller MUST retain guest/kernel/host exclusion and context lifetime for the
+entire transaction. No running code may observe tentative state. This rollback
+covers context values only, not RAM, GPU images, backend cache/records, sync or
+audio. Do not accept this component until a future outer transaction has restored
+all domains. It is not itself a Load implementation.
+
+check_context_restore_prerequisites now builds and discards this staged component
+without applying it. Actual application is exercised only in model tests, which
+cover acceptance, explicit/exception rollback, stale and invalid data, missing or
+aliased targets, and preserved renderer identity. Existing capture/preflight
+regressions and actual SceGxm module syntax checks pass. No Android/device upload
+is requested for this checkpoint; Load remains diagnostic-only and format v9 is
+unchanged.
+
+## Save scene-boundary advance (previous checkpoint)
 
 Device evidence on 2026-10-04 showed three Save refusals: ActiveScene followed
 by PendingCommands twice. Host queue drain alone does not finish guest-generated
