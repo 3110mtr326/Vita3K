@@ -4,7 +4,39 @@ This is unfinished source work, not a device-test release or a working FFX
 load implementation. Keep using the tested fix21 build for now. No new APK
 build or device test is requested for this checkpoint.
 
-## Load image preparation diagnostic (latest change)
+## Save scene-boundary advance (latest change)
+
+Device evidence on 2026-10-04 showed three Save refusals: ActiveScene followed
+by PendingCommands twice. Host queue drain alone does not finish guest-generated
+scene work or submit the context's next command list. Do not bypass either check.
+
+For sessions with an immediate GXM context, Save now arms a kernel scene-boundary
+request and temporarily resumes guest threads using the existing menu-resume
+bookkeeping. Inputs/audio remain under the pause-menu policy. After successful
+sceGxmEndScene submits and clears its command list and clears active, it requests
+the session pause under the kernel mutex. Save waits at most 1.5 seconds for this
+acknowledgement, then disarms the request and guarantees a session pause. It
+collects pending resume states only after this new pause, then runs all existing
+thread, host-renderer, logical-graphics and image capture checks unchanged.
+
+The timeout/EndScene race is serialized by the kernel mutex. Repeated boundary
+notifications preserve the first pause bookkeeping. Timeout restores the pause
+and refuses Save before file creation; exceptions in the waiting scope also
+restore the pause. The pause is a request: the existing KernelSnapshotGuard
+still waits for threads to reach supported stopped states before capture.
+Other contexts/producers may still prevent safe capture; no success is promised.
+The save point advances beyond the button press to the next observed scene end,
+and on timeout the game may have advanced for up to the bounded wait interval.
+
+Tests exercise actual kernel methods including 200 timeout/EndScene races,
+wait-vs-run resume bookkeeping, repeated requests and normal rendering. The
+actual Save scope is tested for success, refusal, timeout, exception re-pause and
+no-graphics bypass. Existing Save lock/acquisition tests pass. Native syntax
+checks pass for session controller, JNI, kernel/thread, Save, audio and SceGxm.
+Android build and Xperia/FFX verification remain pending. Load still performs
+only the previously documented image-preparation diagnostic, never full restore.
+
+## Load image preparation diagnostic (previous checkpoint)
 
 Load now reads the v9 image section and runs a non-restoring preparation diagnostic
 before its existing graphics-state refusal. Section length is bounded and the

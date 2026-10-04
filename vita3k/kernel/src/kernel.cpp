@@ -241,6 +241,45 @@ void KernelState::resume_threads() {
     session_paused = false;
 }
 
+bool KernelState::begin_snapshot_scene_advance() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (!session_paused || snapshot_scene_pending) return false;
+    snapshot_scene_reached.store(false, std::memory_order_release);
+    snapshot_scene_pending = true;
+    // Same resume bookkeeping as menu resume, but under the same lock as arming
+    // the boundary request: a fast EndScene cannot race request publication.
+    for (auto &[_, thread] : threads) {
+        const auto pending = paused_threads_status.find(thread->id);
+        thread->resume_after_pause(pending != paused_threads_status.end() && pending->second == ThreadStatus::run);
+    }
+    paused_threads_status.clear();
+    session_paused = false;
+    return true;
+}
+
+void KernelState::pause_at_snapshot_scene_end() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (!snapshot_scene_pending || session_paused) return;
+    session_paused = true;
+    for (auto &[_, thread] : threads)
+        paused_threads_status[thread->id] = thread->pause_for_session();
+    snapshot_scene_reached.store(true, std::memory_order_release);
+}
+
+bool KernelState::finish_snapshot_scene_advance() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    const bool reached = snapshot_scene_pending && snapshot_scene_reached.load(std::memory_order_acquire);
+    snapshot_scene_pending = false;
+    // Timeout/cancellation restores the session pause too. Preserve already
+    // captured resume states if EndScene (or the controller) paused us first.
+    if (!session_paused) {
+        session_paused = true;
+        for (auto &[_, thread] : threads)
+            paused_threads_status[thread->id] = thread->pause_for_session();
+    }
+    return reached;
+}
+
 void KernelState::deinit(MemState &mem) {
     process_exit();
     threads.clear();
@@ -301,6 +340,8 @@ void KernelState::deinit(MemState &mem) {
 
     paused_threads_status.clear();
     session_paused = false;
+    snapshot_scene_pending = false;
+    snapshot_scene_reached = false;
 }
 
 SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {

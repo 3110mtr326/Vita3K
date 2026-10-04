@@ -2723,6 +2723,9 @@ EXPORT(int, sceGxmEndScene, SceGxmContext *context, SceGxmNotification *vertexNo
     renderer::reset_command_list(context->renderer->command_list);
 
     context->state.active = false;
+    // Only arms a pause during a Save request; ordinary rendering is unchanged.
+    // Called after submission/reset, so this context has no unfinished scene.
+    emuenv.kernel.pause_at_snapshot_scene_end();
     return 0;
 }
 

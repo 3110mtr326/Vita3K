@@ -189,6 +189,13 @@ struct KernelState {
     bool is_threads_paused() { return session_paused.load(std::memory_order_acquire); }
     void pause_threads();
     void resume_threads();
+    // Save-only bounded scene advance. Session controller excludes menu resume
+    // and teardown; finish must run on success, timeout and exceptions.
+    bool begin_snapshot_scene_advance();
+    void pause_at_snapshot_scene_end();
+    bool finish_snapshot_scene_advance();
+    std::atomic<bool> snapshot_scene_reached{ false };
+    bool snapshot_scene_pending = false; // protected by mutex
     // Updates the status a thread will be restored to by the next resume_threads()
     // call, without waking it immediately. Must only be called while paused (i.e.
     // between pause_threads() and resume_threads()). No-op for a thread_id that

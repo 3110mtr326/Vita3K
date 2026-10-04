@@ -788,6 +788,30 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     if (!kernel.is_threads_paused())
         return SaveStateResult::ErrorNotPaused;
 
+    if (emuenv.gxm.immediate_context) {
+        if (!kernel.begin_snapshot_scene_advance()) {
+            if (out_detail) *out_detail = "Could not arm the graphics scene boundary pause; save not written";
+            return SaveStateResult::ErrorGraphicsNotReady;
+        }
+        struct SceneAdvanceGuard {
+            KernelState &kernel;
+            bool finished = false;
+            ~SceneAdvanceGuard() { if (!finished) kernel.finish_snapshot_scene_advance(); }
+        } advance{kernel};
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+        while (!kernel.snapshot_scene_reached.load(std::memory_order_acquire)
+            && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const bool reached = kernel.finish_snapshot_scene_advance();
+        advance.finished = true;
+        if (!reached) {
+            if (out_detail) *out_detail = "No graphics scene boundary within 1.5 seconds; session paused again and save not written";
+            LOG_WARN("Savestate: scene boundary advance timed out; session pause restored.");
+            return SaveStateResult::ErrorGraphicsNotReady;
+        }
+        LOG_INFO("Savestate: stopped guest execution at graphics scene end before capture.");
+    }
+
     // KernelState::get_pending_resume_status() takes kernel.mutex itself, so
     // gather these before holding it below.
     std::map<SceUID, ThreadStatus> resume_statuses;
