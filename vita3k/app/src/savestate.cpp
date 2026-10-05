@@ -92,6 +92,8 @@
 #include <app/savestate.h>
 #include <app/savestate_file.h>
 #include <app/savestate_image_section.h>
+#include <app/savestate_stream_skip.h>
+#include <functional>
 #include <audio/state.h>
 #include <ngs/state.h>
 
@@ -1070,7 +1072,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
 // Diagnostic only. Always return before thread abort/replay or saved RAM writes.
 static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const std::vector<gxm::ContextLogicalRecord> &saved_graphics,
-    const std::vector<uint8_t> &bytes, std::string *out_detail) {
+    const std::vector<uint8_t> &bytes, std::string *out_detail, const std::function<std::string()> &session_check = {}) {
     auto &kernel = emuenv.kernel;
     auto &mem = emuenv.mem;
     if (!kernel.is_threads_paused()) return SaveStateResult::ErrorNotPaused;
@@ -1100,6 +1102,15 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         if (out_detail) *out_detail = reason;
         return SaveStateResult::ErrorThreadNotSafe;
     }
+    if (session_check) {
+        const auto mismatch = session_check();
+        if (!mismatch.empty()) {
+            LOG_INFO("Savestate session preflight: REFUSED: {}; no saved state applied.", mismatch);
+            if (out_detail) *out_detail = "Session preflight refused: " + mismatch + "; no saved state applied";
+            return SaveStateResult::ErrorMismatch;
+        }
+        LOG_INFO("Savestate session preflight: MATCH (memory layout, thread IDs, sync object IDs and graphics counts); not a full restore authorization.");
+    }
     // Continuous exclusion covers temporary context application AND rollback.
     // Successful diagnostics do not commit a game restore.
     const auto contexts = gxm::probe_context_restore_roundtrip(emuenv, host_pause, saved_graphics);
@@ -1115,7 +1126,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no game images or saved RAM restored.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
@@ -1158,12 +1169,9 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         if (out_detail) *out_detail = "Invalid or truncated saved GPU image section";
         return SaveStateResult::ErrorMismatch;
     }
-    // Diagnostic is an unconditional early return. Even successful preparation
-    // must never reach RAM writes or wait replay until full restore is supported.
-    if (!image_section->empty()) return diagnose_saved_images(emuenv, *saved_graphics, *image_section, out_detail);
-    if (!saved_graphics->empty()) {
-        if (out_detail)
-            *out_detail = "This save contains logical graphics records; GPU/audio restoration is not implemented";
+    const bool diagnostic_mode = !image_section->empty();
+    if (!diagnostic_mode && !saved_graphics->empty()) {
+        if (out_detail) *out_detail = "Logical graphics records without GPU images are unsupported";
         return SaveStateResult::ErrorUnsupportedHostState;
     }
 
@@ -1174,6 +1182,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
 
     struct PendingRegion {
         Address addr;
+        uint32_t saved_size;
         std::vector<uint8_t> bytes;
     };
     std::vector<PendingRegion> pending_regions;
@@ -1193,6 +1202,14 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         previous_end = end;
         PendingRegion region;
         region.addr = addr;
+        region.saved_size = size;
+        if (diagnostic_mode) {
+            // Index RAM without a second ~450 MiB allocation on the phone.
+            // Bounds are checked against actual file length before seeking.
+            if (!skip_savestate_bytes(in, size)) return SaveStateResult::ErrorIO;
+            pending_regions.push_back(std::move(region));
+            continue;
+        }
         region.bytes.resize(size);
         if (size) {
             in.read(reinterpret_cast<char *>(region.bytes.data()), size);
@@ -1254,6 +1271,41 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 *out_detail = "Invalid or duplicate thread record in saved state";
             return SaveStateResult::ErrorMismatch;
         }
+    }
+
+    if (diagnostic_mode) {
+        // The entire file was parsed before any scene advance or context probe.
+        // The callback runs while diagnose_saved_images holds all snapshot locks.
+        if (in.peek() != std::char_traits<char>::eof() || in.bad()) {
+            if (out_detail) *out_detail = "Unexpected data at end of saved state";
+            return SaveStateResult::ErrorMismatch;
+        }
+        return diagnose_saved_images(emuenv, *saved_graphics, *image_section, out_detail, [&]() -> std::string {
+            if (kernel.threads.size() != thread_records.size())
+                return "Thread count changed since saving";
+            for (const auto &rec : thread_records)
+                if (!kernel.threads.count(rec.id)) return "Thread IDs changed since saving";
+            auto mismatch = compare_object_sets(saved_object_sets, collect_kernel_object_sets(kernel, true));
+            if (!mismatch.empty()) return mismatch;
+            if (!records_match_object_set(sema_records, "semaphores", saved_object_sets)
+                || !records_match_object_set(mutex_records, "mutexes", saved_object_sets)
+                || !records_match_object_set(lwmutex_records, "lwmutexes", saved_object_sets)
+                || !records_match_object_set(eventflag_records, "eventflags", saved_object_sets)
+                || !records_match_object_set(simple_event_records, "simple_events", saved_object_sets))
+                return "Synchronization records do not match saved object IDs";
+            const auto regions = get_allocated_regions(mem);
+            if (regions.size() != pending_regions.size()) return "Guest memory region count changed since saving";
+            for (size_t i = 0; i < regions.size(); ++i)
+                if (regions[i].first != pending_regions[i].addr || regions[i].second != pending_regions[i].saved_size)
+                    return "Guest memory allocation layout changed since saving";
+            const auto counts = collect_gxm_counts(emuenv.gxm);
+            if (counts.sync_objects != saved_gxm_counts.sync_objects
+                || counts.render_targets != saved_gxm_counts.render_targets
+                || counts.deferred_contexts != saved_gxm_counts.deferred_contexts
+                || counts.immediate_context != saved_gxm_counts.immediate_context)
+                return "Graphics object counts changed since saving";
+            return {};
+        }); // Unconditional return: no saved RAM writes, wait aborts or replay.
     }
 
     std::vector<ThreadStatePtr> thread_handles; // parallel to thread_records

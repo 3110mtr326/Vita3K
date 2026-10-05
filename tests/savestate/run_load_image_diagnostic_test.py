@@ -7,6 +7,7 @@ t=(s/'vita3k/app/src/savestate.cpp').read_text();a=t.index('static SaveStateResu
 code=r"""
 #include <renderer/snapshot_validation.h>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -47,7 +48,7 @@ Result probe_context_restore_roundtrip(EmuEnvState &e,const Lease&,const std::ve
 std::string find_unsafe_thread_reason(Kernel&k,int&,bool,bool){return k.p->unsafe?"unsafe wait":"";}
 METHOD
 int main(){
- for(int mode=0;mode<16;++mode){Probe p;active=&p;EmuEnvState e(p);
+ for(int mode=0;mode<18;++mode){Probe p;active=&p;EmuEnvState e(p);
   if(mode==1)p.paused=false;if(mode==2)e.renderer.reset();if(mode==3)p.fail_acquire=1;
   if(mode==4)p.host_fail=true;if(mode==5)p.fail_acquire=2;if(mode==6)p.unsafe=true;
   if(mode==7)p.result=renderer::SnapshotImageValidation::InvalidData;
@@ -62,10 +63,13 @@ int main(){
   const auto expected=mode==1?SaveStateResult::ErrorNotPaused:
    mode==2||mode==4||mode==15?SaveStateResult::ErrorGraphicsNotReady:
    mode==3||mode==5||mode==6?SaveStateResult::ErrorThreadNotSafe:
-   mode==7?SaveStateResult::ErrorMismatch:SaveStateResult::ErrorUnsupportedHostState;
+   mode==7||mode==16?SaveStateResult::ErrorMismatch:SaveStateResult::ErrorUnsupportedHostState;
   std::string reason;
-  try{assert(diagnose_saved_images(e,{},{},&reason)==expected);assert(mode!=10);}
-  catch(const std::runtime_error&){assert(mode==10);}
+  try{assert(diagnose_saved_images(e,{},{},&reason,[&]() -> std::string {
+    assert(p.locks==1&&p.host&&p.display);if(mode==17)throw std::runtime_error("session inspection");
+    return mode==16?"layout mismatch":"";
+  })==expected);assert(mode!=10&&mode!=17);}
+  catch(const std::runtime_error&){assert(mode==10||mode==17);}
   assert(!p.locks&&!p.host&&!p.display);
   assert(p.validations==((mode==0||(mode>=7&&mode<15))?1:0));
   assert(p.context_calls==p.validations);

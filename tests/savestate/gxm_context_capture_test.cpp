@@ -51,8 +51,9 @@ SaveStateResult diagnose_saved_images(int, const std::vector<gxm::ContextLogical
 }
 SaveStateResult test_load_graphics(std::istream &in, std::string *out_detail) {
     using app::read_savestate_image_section;
-    const int emuenv=0;
+
     // LOAD_GRAPHICS_BODY
+    (void)diagnostic_mode;
     return SaveStateResult::Success;
 }
 struct EmuEnvState {
@@ -288,8 +289,8 @@ int main() {
         framed.append(reinterpret_cast<const char *>(&valid_size),sizeof(valid_size));
         framed+=std::string(16,'P')+"RAM";
         std::istringstream valid_gpu(framed);
-        assert(test_load_graphics(valid_gpu,nullptr)==SaveStateResult::ErrorUnsupportedHostState);
-        assert(diagnostic_calls==1 && valid_gpu.get()=='R');
+        assert(test_load_graphics(valid_gpu,nullptr)==SaveStateResult::Success);
+        assert(diagnostic_calls==0 && valid_gpu.get()=='R');
 
         assert(empty_file.get() == 'R');
 #endif

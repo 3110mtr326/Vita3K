@@ -4,7 +4,44 @@ This is unfinished source work, not a device-test release or a working FFX
 load implementation. Keep using the tested fix21 build for now. No new APK
 build or device test is requested for this checkpoint.
 
-## Context apply/rollback device checkpoint (latest change)
+## Saved-session layout device checkpoint (latest change)
+
+The preceding device test recorded one successful Save and two context
+apply/rollback MATCH plus GPU upload/readback MATCH results. The user confirmed
+normal controls, audio and rendering after Resume.
+
+Previously a valid graphics prefix returned into diagnostics before the RAM,
+thread and host-record sections were parsed. The graphics diagnostic route now
+parses those remaining sections, rejects malformed thread records and trailing
+bytes, and checks session compatibility under the existing continuous snapshot
+exclusion before any context apply/rollback or GPU scratch test.
+
+Checks cover thread count/IDs, kernel object ID sets, synchronization record IDs,
+exact allocated RAM region addresses/sizes, and GXM object counts/context address.
+A mismatch reports a specific refusal and returns without saved RAM writes or
+wait abort/replay. A match logs `Savestate session preflight: MATCH` and continues
+the existing context and GPU diagnostics. This is not full restore authorization:
+UID reuse, object contents, native waits, allocator history, backend state,
+file descriptor restoration, audio and a coordinated restore transaction remain
+unresolved. Identical IDs/counts alone do not prove identity or restorability.
+
+RAM payloads are indexed by bounded seeking rather than copied into an additional
+~450 MiB buffer for this diagnostic. Every seek checks actual file length. This
+validates framing, not RAM content: v9 has no RAM checksum. The non-graphics legacy
+path still reads payload bytes and keeps its existing restore refusals.
+
+Host checks pass: savestate.cpp syntax; production memory-parser extraction tests
+for valid payloads, all truncations, guard/overflow addresses, tail positioning
+and no diagnostic RAM allocation; 15 mismatched session cases; production Load
+pause/lock/refusal/exception tests; existing graphics provider/framing tests.
+Android compilation and this compatibility check on Xperia still need testing.
+
+Device procedure: fresh Save, Resume briefly, then Load once. Send the displayed
+message and log whether session preflight MATCH or REFUSED. If MATCH, expect the
+existing context and GPU MATCH markers. Confirm normal Resume controls/audio and
+rendering. Full Load still returns unsupported and does not rewind. Format v9.
+
+## Context apply/rollback device checkpoint (previous checkpoint)
 
 The preceding Xperia test passed two saves, two scene-boundary Load checks,
 context preparation reason 0 / capture reason 0, and two GPU roundtrip MATCH
