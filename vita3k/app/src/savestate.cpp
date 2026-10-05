@@ -1100,10 +1100,10 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         if (out_detail) *out_detail = reason;
         return SaveStateResult::ErrorThreadNotSafe;
     }
-    // Both domains are inspected under the same continuous exclusion. Staging
-    // context values never applies them; even both successes are not a restore.
-    const auto contexts = gxm::check_context_restore_prerequisites(emuenv, host_pause, saved_graphics);
-    LOG_INFO("Savestate load diagnostic: context preparation reason {}, capture reason {}, address 0x{:08X}; no context values applied.",
+    // Continuous exclusion covers temporary context application AND rollback.
+    // Successful diagnostics do not commit a game restore.
+    const auto contexts = gxm::probe_context_restore_roundtrip(emuenv, host_pause, saved_graphics);
+    LOG_INFO("Savestate load diagnostic: context preparation reason {}, capture reason {}, address 0x{:08X}; temporary context changes rolled back.",
         static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     const auto result = emuenv.renderer->validate_snapshot_image_section(bytes, host_pause,
         std::chrono::steady_clock::now() + std::chrono::seconds(3));
@@ -1115,7 +1115,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no game images or saved RAM restored.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state was applied. Full graphics/audio restoration is not implemented",
+        "Image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;

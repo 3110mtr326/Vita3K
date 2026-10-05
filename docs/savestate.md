@@ -4,7 +4,36 @@ This is unfinished source work, not a device-test release or a working FFX
 load implementation. Keep using the tested fix21 build for now. No new APK
 build or device test is requested for this checkpoint.
 
-## Load scene-boundary device checkpoint (latest change)
+## Context apply/rollback device checkpoint (latest change)
+
+The preceding Xperia test passed two saves, two scene-boundary Load checks,
+context preparation reason 0 / capture reason 0, and two GPU roundtrip MATCH
+results. The user also confirmed controls and audio resumed normally.
+
+Load now calls probe_context_restore_roundtrip under the same continuous
+guest/kernel/renderer exclusion. It preflights and stages every registered
+context, temporarily applies the saved logical values, recaptures and compares
+their encoded records, rolls back, then recaptures and compares the original
+records. A local RAII guard rolls back before any capture/encoding exception
+propagates. The transaction cannot accept after this probe. Host pointers,
+allocator configuration, backend objects, game GPU images, saved guest RAM and
+audio are not restored. No game work can observe tentative context changes while
+the caller's exclusion is held. This is a diagnostic, not a complete restore.
+
+The new log marker is `Savestate context self-test: apply/rollback MATCH`.
+MISMATCH is a failed probe and reports context reason 3. Other preflight refusals
+remain unchanged. The GPU scratch test still runs independently; both must pass.
+The UI says temporary values were tested and no saved state was retained.
+
+Host checks: SceGxm.cpp and savestate.cpp syntax pass. Production context-provider
+and Load diagnostic tests pass. Transaction tests cover success, applied/restored
+record mismatch, and exceptions in both capture phases, verifying original values
+and inability to commit afterward. These are host/model tests, not Android/GPU
+execution. Device test is now required to verify actual context behavior and
+normal controls/audio after Resume. Full graphics/backend/RAM/kernel/audio
+restoration is still incomplete. Format remains v9.
+
+## Load scene-boundary device checkpoint (previous checkpoint)
 
 The latest Xperia log confirms successful saves and three isolated GPU
 upload/readback MATCH results. Context preparation still fails with

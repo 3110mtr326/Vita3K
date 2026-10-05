@@ -63,6 +63,27 @@ int main() {
         a.last_precomputed=true;assert(!prepare());a.last_precomputed=false;
         assert(encode_context_records(capture().records)==original);
     }
+    {
+        auto tx=prepare();assert(tx && tx->probe_roundtrip(saved,current.records,capture));
+        assert(encode_context_records(capture().records)==original);
+        assert(!tx->accept());
+    }
+    for(int fail=0;fail<4;++fail) {
+        int calls=0;auto tx=prepare();assert(tx);
+        try {
+            const bool ok=tx->probe_roundtrip(saved,current.records,[&] {
+                const int call=calls++;
+                if(call==fail/2) {
+                    if(fail%2) throw std::runtime_error("capture failure");
+                    auto bad=capture();bad.records[0].vertex_texture_dirty^=1;return bad;
+                }
+                return capture();
+            });
+            assert(!ok);
+        } catch(const std::runtime_error&) {assert(fail%2);}
+        assert(encode_context_records(capture().records)==original);
+        assert(!tx->accept());
+    }
     {auto tx=prepare();assert(tx&&tx->apply()&&tx->accept());assert(!tx->accept());}
     assert(encode_context_records(capture().records)==encode_context_records(saved));
     assert(a.renderer.get()==renderer_identity);

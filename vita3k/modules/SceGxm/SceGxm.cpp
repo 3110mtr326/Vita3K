@@ -1406,13 +1406,13 @@ ContextCaptureResult capture_context_records(EmuEnvState &emuenv,
     return result;
 }
 
-ContextPreflightResult check_context_restore_prerequisites(EmuEnvState &emuenv,
+ContextPreflightResult probe_context_restore_roundtrip(EmuEnvState &emuenv,
     const renderer::HostQuiescence &host_pause, std::span<const ContextLogicalRecord> saved) {
     const auto current = capture_context_records(emuenv, host_pause);
     const auto checked = preflight_context_records(saved, current, emuenv.gxm.vertex_program_identities,
         emuenv.gxm.fragment_program_identities);
     if (!checked) return checked;
-    // Stage and discard only. Live context values are not changed here.
+    // Temporarily apply under continuous exclusion, verify, and unconditionally undo.
     const auto values = detail::ContextValueTransaction<SceGxmContext>::prepare(saved, current,
         emuenv.gxm.vertex_program_identities, emuenv.gxm.fragment_program_identities,
         [&](uint32_t address) -> SceGxmContext * {
@@ -1422,7 +1422,11 @@ ContextPreflightResult check_context_restore_prerequisites(EmuEnvState &emuenv,
                 if (registered == address) return context;
             return nullptr;
         });
-    return values ? ContextPreflightResult{} : ContextPreflightResult{ContextPreflightError::InvalidRecord, 0};
+    if (!values) return {ContextPreflightError::InvalidRecord, 0};
+    const bool matched = values->probe_roundtrip(saved, current.records,
+        [&] { return capture_context_records(emuenv, host_pause); });
+    LOG_INFO("Savestate context self-test: apply/rollback {}; no context changes retained.", matched ? "MATCH" : "MISMATCH");
+    return matched ? ContextPreflightResult{} : ContextPreflightResult{ContextPreflightError::InvalidRecord, 0};
 }
 
 std::vector<std::pair<uint32_t, uint32_t>> get_host_object_ranges(EmuEnvState &emuenv) {

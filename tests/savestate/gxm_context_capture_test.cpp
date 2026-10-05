@@ -1,3 +1,4 @@
+#define LOG_INFO(...) ((void)0)
 // Vita3K emulator project
 // Copyright (C) 2026 Vita3K team
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -119,8 +120,8 @@ void test_provider() {
         result = gxm::capture_context_records(env, lease);
         assert(result && result.records[1].vertex_program_instance != 0);
         const auto saved = result.records[1];
-        assert(gxm::check_context_restore_prerequisites(env, lease, result.records));
-        assert(gxm::check_context_restore_prerequisites(env, absent, result.records).error
+        assert(gxm::probe_context_restore_roundtrip(env, lease, result.records));
+        assert(gxm::probe_context_restore_roundtrip(env, absent, result.records).error
             == gxm::ContextPreflightError::CurrentCaptureFailed);
         assert(gxm::validate_program_instances(saved, env.gxm.vertex_program_identities,
             env.gxm.fragment_program_identities));

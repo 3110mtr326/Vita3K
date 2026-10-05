@@ -79,9 +79,10 @@ inline ContextPreflightResult preflight_context_records(
     return {};
 }
 
-// Reads the live context set under the caller-owned pause before preflight.
-// Same prerequisites and limitations as capture_context_records; no writes.
-ContextPreflightResult check_context_restore_prerequisites(EmuEnvState &emuenv,
+// Diagnostic writes saved logical values temporarily, verifies, then rolls back.
+// Caller must hold guest/kernel/host exclusion through completion, including
+// rollback on exceptions. No changes are committed; this is not a full restore.
+ContextPreflightResult probe_context_restore_roundtrip(EmuEnvState &emuenv,
     const renderer::HostQuiescence &host_pause, std::span<const ContextLogicalRecord> saved);
 
 } // namespace gxm

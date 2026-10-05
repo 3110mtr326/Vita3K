@@ -39,7 +39,7 @@ struct EmuEnvState{Kernel kernel;int mem=0;Gxm gxm;std::unique_ptr<Renderer> ren
 namespace gxm {
 struct ContextLogicalRecord{};
 struct Result{int error;unsigned offending_address;int capture_error=0;};
-Result check_context_restore_prerequisites(EmuEnvState &e,const Lease&,const std::vector<ContextLogicalRecord>&){
+Result probe_context_restore_roundtrip(EmuEnvState &e,const Lease&,const std::vector<ContextLogicalRecord>&){
  auto &p=*e.kernel.p;assert(p.locks==1&&p.host&&p.display);++p.context_calls;
  return {p.context_error,256};
 }

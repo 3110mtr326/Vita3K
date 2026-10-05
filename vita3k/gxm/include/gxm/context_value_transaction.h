@@ -94,6 +94,24 @@ public:
         for (auto &entry : entries) write(*entry.target, entry.before);
         phase = Phase::Finished;
     }
+    // Diagnostic: rollback before returning or propagating any capture exception.
+    // Caller retains the same exclusion throughout both verification captures.
+    template <typename Capture>
+    bool probe_roundtrip(std::span<const ContextLogicalRecord> saved,
+        std::span<const ContextLogicalRecord> original, Capture capture) {
+        const auto expected = encode_context_records(saved);
+        const auto before = encode_context_records(original);
+        if (!expected || !before || !apply()) return false;
+        struct Undo {
+            ContextValueTransaction &tx;
+            ~Undo() { tx.rollback(); }
+        } undo{*this};
+        const auto applied = capture();
+        const bool matches = applied && encode_context_records(applied.records) == expected;
+        rollback();
+        const auto restored = capture();
+        return matches && restored && encode_context_records(restored.records) == before;
+    }
     // Only the future outer transaction may accept after ALL domains succeed.
     bool accept() noexcept {
         if (phase != Phase::Applied) return false;
