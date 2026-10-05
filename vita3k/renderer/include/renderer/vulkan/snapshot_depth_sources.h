@@ -75,7 +75,7 @@ std::optional<std::vector<SnapshotPinnedImage>> pin_snapshot_depth_sources(
         source.format=image.format;source.queue_family=family;
         // vkutil::Image::init_image creates single-sample allocations.
         source.samples=vk::SampleCountFlagBits::e1;
-        source.usage=Upload ? vk::ImageUsageFlagBits::eTransferDst : vk::ImageUsageFlagBits::eTransferSrc;source.layout=*layout;
+        source.usage=Upload ? (vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc) : vk::ImageUsageFlags(vk::ImageUsageFlagBits::eTransferSrc);source.layout=*layout;
         pins.push_back({source,std::move(lifetime)});
     }
     return pins;

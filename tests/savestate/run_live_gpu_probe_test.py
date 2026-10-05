@@ -13,7 +13,8 @@ code=r'''
 #include <functional>
 #include <iostream>
 using namespace renderer;using namespace renderer::vulkan;
-#define LOG_INFO(...) ((void)0)
+template<class...T>void ignore_log(T&&...){}
+#define LOG_INFO(...) ignore_log(__VA_ARGS__)
 #define LOG_ERROR(...) ((void)0)
 struct Probe {int compared=0;int mode=0,created=0,destroyed=0,prepared=0,captures=0,submits=0;bool complete=true;std::function<bool()> owned;};
 Probe *active;

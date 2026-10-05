@@ -35,7 +35,7 @@ int main() {
     assert(a.texture.owner.use_count()==1);
     {
         auto targets=pin_snapshot_depth_sources<true>(depths,stencils,i,3,128);
-        assert(targets && (*targets)[0].source.usage==vk::ImageUsageFlagBits::eTransferDst);
+        assert(targets && (*targets)[0].source.usage==(vk::ImageUsageFlagBits::eTransferDst|vk::ImageUsageFlagBits::eTransferSrc));
     }
     b.texture.snapshot_transfer_destination=false;
     assert(!pin_snapshot_depth_sources<true>(depths,stencils,i,3,128));

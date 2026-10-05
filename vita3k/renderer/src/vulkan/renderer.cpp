@@ -274,32 +274,36 @@ bool VKState::validate_snapshot_image_upload(const SnapshotImageRecords &saved,
 
 SnapshotImageValidation VKState::probe_live_snapshot_rollback(const SnapshotImageRecords &saved,
     const HostQuiescence &lease, std::chrono::steady_clock::time_point deadline) {
+    const auto not_ready = [](const char *stage) {
+        LOG_INFO("Savestate live GPU preparation refused: {}", stage);
+        return SnapshotImageValidation::NotReady;
+    };
     const auto stopped = [&] { return render_abort.load(std::memory_order_relaxed)
         || std::chrono::steady_clock::now() >= deadline; };
     if (!lease.owns_renderer(render_pause) || !snapshot_live_transfers || stopped()
-        || general_family_index >= physical_device_queue_families.size()) return SnapshotImageValidation::NotReady;
+        || general_family_index >= physical_device_queue_families.size()) return not_ready("pause/service/deadline/queue");
     snapshot_live_transfers->poll([](const auto &job) { return job.poll(); });
-    if (snapshot_live_transfers->size()) return SnapshotImageValidation::NotReady;
+    if (snapshot_live_transfers->size()) return not_ready("previous transfer pending");
     const auto backup_bytes = capture_snapshot_image_section(lease, deadline);
-    if (!backup_bytes || stopped()) return SnapshotImageValidation::NotReady;
+    if (!backup_bytes || stopped()) return not_ready("backup capture");
     const auto backup = decode_snapshot_image_sections(*backup_bytes);
-    if (!backup) return SnapshotImageValidation::NotReady;
+    if (!backup) return not_ready("backup decode");
     const auto inventory = surface_cache.inspect_snapshot_surfaces();
     const auto expected = prepare_snapshot_upload_data(*backup, inventory);
-    if (!expected || expected->bytes.size() > 64ULL * 1024 * 1024) return SnapshotImageValidation::NotReady;
+    if (!expected || expected->bytes.size() > 64ULL * 1024 * 1024) return not_ready("backup upload plan");
     const auto flags = physical_device_queue_families[general_family_index].queueFlags;
     auto apply = prepare_snapshot_upload_job(saved, surface_cache, device, allocator, general_family_index, flags, stopped);
     auto undo = prepare_snapshot_upload_job(*backup, surface_cache, device, allocator, general_family_index, flags, stopped);
-    if (!apply || !undo) return SnapshotImageValidation::NotReady;
+    if (!apply || !undo) return not_ready("upload or rollback preparation");
     const auto saved_data = prepare_snapshot_upload_data(saved, inventory);
-    if (!saved_data || saved_data->bytes.size() > 64ULL*1024*1024) return SnapshotImageValidation::NotReady;
+    if (!saved_data || saved_data->bytes.size() > 64ULL*1024*1024) return not_ready("saved upload plan");
     auto observation = SnapshotReadbackResources<>::create(device, allocator, general_family_index, saved_data->bytes.size());
     std::vector<SnapshotImageSource> targets;
     for (const auto &pin:apply->targets) targets.push_back(pin.source);
     if (!record_snapshot_observation(observation->command(), observation->buffer(), observation->size(), *saved_data, targets))
-        return SnapshotImageValidation::NotReady;
+        return not_ready("intermediate readback recording");
     auto pair = SnapshotLivePair::create(std::move(apply), std::move(undo), std::move(observation));
-    if (!pair || stopped()) return SnapshotImageValidation::NotReady;
+    if (!pair || stopped()) return not_ready("batch targets or deadline");
     LOG_INFO("Savestate live GPU probe: submitting saved images, intermediate readback and rollback in one batch.");
     const auto submission = snapshot_live_transfers->submit(std::move(pair), [&](auto &retained) {
         const auto commands = retained.commands();

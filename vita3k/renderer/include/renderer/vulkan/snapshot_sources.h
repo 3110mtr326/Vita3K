@@ -60,7 +60,7 @@ std::optional<std::vector<SnapshotPinnedImage>> pin_snapshot_color_sources(
         source.queue_family = queue_family;
         // init_image creates single-sample images; only proven transfer usage is
         // reported here. Recorder restores the tracked layout before completion.
-        source.usage = Upload ? vk::ImageUsageFlagBits::eTransferDst : vk::ImageUsageFlagBits::eTransferSrc;
+        source.usage = Upload ? (vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc) : vk::ImageUsageFlags(vk::ImageUsageFlagBits::eTransferSrc);
         source.samples = vk::SampleCountFlagBits::e1;
         source.layout = *layout;
         pins.push_back({source, std::move(lifetime)});

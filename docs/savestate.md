@@ -4,7 +4,35 @@ This is unfinished source work, not a device-test release or a working FFX
 load implementation. Keep using the tested fix21 build for now. No new APK
 build or device test is requested for this checkpoint.
 
-## Live GPU intermediate verification device checkpoint (latest change)
+## Intermediate readback capability/layout fix (latest change)
+
+Latest device evidence: three attempts passed session/context/scratch checks but
+returned not-ready before the live batch was submitted. Resume was normal.
+Code inspection found a deterministic incompatibility: upload pin collectors
+verified actual source AND destination capability but exported only TransferDst.
+The new observation recorder requires TransferSrc, so those pins always failed.
+Both color and depth/stencil upload collectors now export both proven flags.
+No image capability check was removed or fabricated.
+
+A second incompatibility was also fixed: observation assumed GENERAL, while
+the existing upload recorder restores each image's tracked layout. Observation
+now transitions from each actual tracked layout and restores that same layout
+before undo. Tests cover all 25 supported color/depth layout combinations,
+including attachment, sampled, general and transfer states, plus both pin
+collectors' exported capabilities. Invalid/uninitialized layouts and missing
+read capability still refuse. The internal recorder requires the preceding
+validated upload plan and pins; it is not an arbitrary-file recording API.
+
+Every live preparation refusal now logs its stage, including backup capture,
+upload/rollback preparation and intermediate readback recording. This lets any
+remaining device-specific failure be distinguished without guessing.
+
+Device target remains live-gpu-roundtrip-passed, with saved upload MATCH and
+rollback MATCH. Full game rewind remains unimplemented and the UI still reports
+unsupported restoration. On gpu-transfer-failed restart without Resume.
+This fixes preparation; Android GPU success still requires the next device run.
+
+## Live GPU intermediate verification device checkpoint (previous checkpoint)
 
 The preceding Xperia test completed a live upload/rollback batch, verified the
 original GPU pixels after rollback, and resumed normally per the user's report.

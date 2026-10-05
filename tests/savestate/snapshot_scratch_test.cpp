@@ -57,6 +57,7 @@ struct Command {
 };
 struct ObservationCommand {
  Commands *p;
+ std::vector<vk::ImageLayout> layouts{vk::ImageLayout::eGeneral,vk::ImageLayout::eGeneral};
  void begin(const vk::CommandBufferBeginInfo&){++p->begins;}
  void pipelineBarrier(vk::PipelineStageFlags src,vk::PipelineStageFlags dst,vk::DependencyFlags,
   const std::vector<vk::MemoryBarrier>&,const std::vector<vk::BufferMemoryBarrier>&buffers,const std::vector<vk::ImageMemoryBarrier>&images){
@@ -64,9 +65,9 @@ struct ObservationCommand {
   if(p->barriers<3){
    assert(images.size()==2 && images[0].subresourceRange.aspectMask==vk::ImageAspectFlagBits::eColor);
    assert(images[1].subresourceRange.aspectMask==(vk::ImageAspectFlagBits::eDepth|vk::ImageAspectFlagBits::eStencil));
-   for(const auto &b:images){assert(b.srcQueueFamilyIndex==VK_QUEUE_FAMILY_IGNORED);
-    assert(b.oldLayout==(p->barriers==1?vk::ImageLayout::eGeneral:vk::ImageLayout::eTransferSrcOptimal));
-    assert(b.newLayout==(p->barriers==1?vk::ImageLayout::eTransferSrcOptimal:vk::ImageLayout::eGeneral));}
+   for(size_t n=0;n<images.size();++n){const auto &b=images[n];assert(b.srcQueueFamilyIndex==VK_QUEUE_FAMILY_IGNORED);
+    assert(b.oldLayout==(p->barriers==1?layouts[n]:vk::ImageLayout::eTransferSrcOptimal));
+    assert(b.newLayout==(p->barriers==1?vk::ImageLayout::eTransferSrcOptimal:layouts[n]));}
    assert(p->reads==(p->barriers==1?0:3));
   }else{assert(p->reads==3&&buffers.size()==1&&src==vk::PipelineStageFlagBits::eTransfer&&dst==vk::PipelineStageFlagBits::eHost);
    assert(buffers[0].srcAccessMask==vk::AccessFlagBits::eTransferWrite&&buffers[0].dstAccessMask==vk::AccessFlagBits::eHostRead);}
@@ -92,6 +93,12 @@ int main(){
   Commands observed;
   assert(record_snapshot_observation(ObservationCommand{&observed},output.buffer(),output.size(),data,targets));
   assert(observed.begins==1&&observed.ends==1&&observed.writes==0);
+  for(auto color:{vk::ImageLayout::eGeneral,vk::ImageLayout::eColorAttachmentOptimal,vk::ImageLayout::eShaderReadOnlyOptimal,vk::ImageLayout::eTransferSrcOptimal,vk::ImageLayout::eTransferDstOptimal})
+   for(auto depth:{vk::ImageLayout::eGeneral,vk::ImageLayout::eDepthStencilAttachmentOptimal,vk::ImageLayout::eDepthStencilReadOnlyOptimal,vk::ImageLayout::eTransferSrcOptimal,vk::ImageLayout::eTransferDstOptimal}) {
+    auto live=targets;live[0].layout=color;live[1].layout=depth;Commands trace;
+    assert(record_snapshot_observation(ObservationCommand{&trace,{color,depth}},output.buffer(),output.size(),data,live));
+    assert(trace.begins==1&&trace.ends==1);
+   }
   Commands rejected;auto invalid=data;invalid.regions[0].current_index=targets.size();
   assert(!record_snapshot_observation(ObservationCommand{&rejected},output.buffer(),output.size(),invalid,targets));
   assert(!record_snapshot_observation(ObservationCommand{&rejected},output.buffer(),1,data,targets));
