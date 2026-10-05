@@ -781,16 +781,13 @@ const char *save_state_result_to_string(SaveStateResult result) {
     return "Unknown error";
 }
 
-SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::string *out_detail) {
-    KernelState &kernel = emuenv.kernel;
-    MemState &mem = emuenv.mem;
-
-    if (!kernel.is_threads_paused())
-        return SaveStateResult::ErrorNotPaused;
-
-    if (emuenv.gxm.immediate_context) {
+// Caller holds session-operation exclusivity, with no kernel/renderer locks.
+// Both Save and Load diagnostics use the same bounded advance and re-pause.
+static SaveStateResult pause_at_snapshot_scene_boundary(KernelState &kernel,
+    bool has_context, std::string *out_detail) {
+    if (has_context) {
         if (!kernel.begin_snapshot_scene_advance()) {
-            if (out_detail) *out_detail = "Could not arm the graphics scene boundary pause; save not written";
+            if (out_detail) *out_detail = "Could not arm the graphics scene boundary pause; no saved state applied or new save written";
             return SaveStateResult::ErrorGraphicsNotReady;
         }
         struct SceneAdvanceGuard {
@@ -805,12 +802,25 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         const bool reached = kernel.finish_snapshot_scene_advance();
         advance.finished = true;
         if (!reached) {
-            if (out_detail) *out_detail = "No graphics scene boundary within 1.5 seconds; session paused again and save not written";
+            if (out_detail) *out_detail = "No graphics scene boundary within 1.5 seconds; session paused again and no saved state applied or new save written";
             LOG_WARN("Savestate: scene boundary advance timed out; session pause restored.");
             return SaveStateResult::ErrorGraphicsNotReady;
         }
-        LOG_INFO("Savestate: stopped guest execution at graphics scene end before capture.");
+        LOG_INFO("Savestate: stopped guest execution at graphics scene end before snapshot inspection.");
     }
+
+    return SaveStateResult::Success;
+}
+
+SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::string *out_detail) {
+    KernelState &kernel = emuenv.kernel;
+    MemState &mem = emuenv.mem;
+
+    if (!kernel.is_threads_paused())
+        return SaveStateResult::ErrorNotPaused;
+
+    const auto boundary = pause_at_snapshot_scene_boundary(kernel, emuenv.gxm.immediate_context != 0, out_detail);
+    if (boundary != SaveStateResult::Success) return boundary;
 
     // KernelState::get_pending_resume_status() takes kernel.mutex itself, so
     // gather these before holding it below.
@@ -1065,6 +1075,9 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     auto &mem = emuenv.mem;
     if (!kernel.is_threads_paused()) return SaveStateResult::ErrorNotPaused;
     if (!emuenv.renderer) return SaveStateResult::ErrorGraphicsNotReady;
+    const auto boundary = pause_at_snapshot_scene_boundary(kernel, emuenv.gxm.immediate_context != 0, out_detail);
+    if (boundary != SaveStateResult::Success) return boundary;
+    LOG_INFO("Savestate load diagnostic: scene boundary ready; checking contexts and GPU images.");
     DisplayQueueDrainScope display_drain(kernel.get_thread(emuenv.gxm.display_queue_thread));
     std::string reason;
     {

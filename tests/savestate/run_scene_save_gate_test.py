@@ -3,7 +3,7 @@ from pathlib import Path
 import argparse,subprocess,tempfile
 parser=argparse.ArgumentParser();parser.add_argument('--compiler',required=True);args=parser.parse_args()
 s=Path(__file__).resolve().parents[2];t=(s/'vita3k/app/src/savestate.cpp').read_text()
-a=t.index('    if (emuenv.gxm.immediate_context)',t.index('SaveStateResult save_state'));b=t.index('    // KernelState::get_pending_resume_status()',a)
+a=t.index('static SaveStateResult pause_at_snapshot_scene_boundary(');b=t.index('SaveStateResult save_state(',a)
 body=t[a:b].replace('std::chrono::steady_clock::now()','test_now()')
 code=r"""
 #include <atomic>
@@ -22,17 +22,14 @@ struct KernelState{bool paused=true,armed=false,allow=true;int begins=0,finishes
  bool begin_snapshot_scene_advance(){++begins;if(!allow)return false;armed=true;paused=false;return true;}
  bool finish_snapshot_scene_advance(){++finishes;armed=false;paused=true;return snapshot_scene_reached;}};
 struct Env{struct {bool immediate_context=true;}gxm;};
-SaveStateResult save_gate(Env &emuenv,KernelState &kernel,std::string *out_detail){
 BODY
- return SaveStateResult::Success;
-}
 int main(){for(int mode=0;mode<5;++mode){Env e;KernelState k;std::string detail;clock_calls=0;clock_throws=mode==3;
  if(mode==0)k.snapshot_scene_reached=true;if(mode==1)k.allow=false;if(mode==4)e.gxm.immediate_context=false;
- try{assert(save_gate(e,k,&detail)==((mode==0||mode==4)?SaveStateResult::Success:SaveStateResult::ErrorGraphicsNotReady));assert(mode!=3);}
+ try{assert(pause_at_snapshot_scene_boundary(k,e.gxm.immediate_context,&detail)==((mode==0||mode==4)?SaveStateResult::Success:SaveStateResult::ErrorGraphicsNotReady));assert(mode!=3);}
  catch(const std::runtime_error&){assert(mode==3);}
  assert(k.paused&&!k.armed);assert(k.finishes==((mode==0||mode==2||mode==3)?1:0));
  if(mode==2)assert(!detail.empty());
- }std::cout<<"PASS: production Save boundary scope, success/refusal/timeout, exception repause, no-graphics bypass\n";}
+ }std::cout<<"PASS: production shared Save/Load boundary scope, success/refusal/timeout, exception repause, no-graphics bypass\n";}
 """.replace('BODY',body)
 with tempfile.TemporaryDirectory(prefix='scene-save-gate-') as d:
  f=Path(d)/'test.cpp';f.write_text(code);exe=Path(d)/'test.exe'

@@ -4,7 +4,32 @@ This is unfinished source work, not a device-test release or a working FFX
 load implementation. Keep using the tested fix21 build for now. No new APK
 build or device test is requested for this checkpoint.
 
-## Isolated GPU upload/readback device checkpoint (latest change)
+## Load scene-boundary device checkpoint (latest change)
+
+The latest Xperia log confirms successful saves and three isolated GPU
+upload/readback MATCH results. Context preparation still fails with
+CurrentCaptureFailed/PendingCommands (capture reason 6).
+
+Save and Load diagnostics now share pause_at_snapshot_scene_boundary. Before
+acquiring display, kernel or renderer inspection leases, Load briefly advances
+the current session to sceGxmEndScene, then pauses it again. The 1500 ms timeout
+and exception cleanup also re-pause the session. This advances current game time;
+it does not restore saved time. Existing context validation remains mandatory.
+
+Host syntax checking of savestate.cpp and tests for the extracted production
+boundary helper, Save acquisition order and Load diagnostic refusal/cleanup pass.
+These tests use simulated dependencies. No Android build or device test of this
+change has been performed here.
+
+Device test: create a fresh Save, Resume briefly, then Load once. Look for
+`scene boundary ready`, context preparation reason 0 / capture reason 0, and
+`gpu-roundtrip-passed` / upload/readback MATCH. Other context refusals may remain
+and should be reported with the full log. Confirm controls and audio after Resume.
+Even if every check passes, Load reports unsupported restoration: saved guest RAM,
+context values and live game images are never restored by these diagnostics.
+Save format remains v9. This cumulative package includes earlier fixes.
+
+## Isolated GPU upload/readback device checkpoint (previous checkpoint)
 
 Load diagnostics now perform a real GPU transfer self-test after saved-image
 parsing and live-target preparation succeed. Saved pixels are uploaded into NEW

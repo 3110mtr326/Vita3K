@@ -15,13 +15,17 @@ code=r"""
 #include <iostream>
 #define LOG_INFO(...) ((void)0)
 namespace fmt {template<typename...T>std::string format(const char *s,T...){return s;}}
-enum class SaveStateResult{ErrorNotPaused,ErrorGraphicsNotReady,ErrorThreadNotSafe,ErrorMismatch,ErrorUnsupportedHostState};
-struct Probe{bool paused=true,display=false,host=false,host_fail=false,unsafe=false,throws=false;int locks=0,acquires=0,fail_acquire=0,validations=0,context_calls=0,context_error=0;
+enum class SaveStateResult{Success,ErrorNotPaused,ErrorGraphicsNotReady,ErrorThreadNotSafe,ErrorMismatch,ErrorUnsupportedHostState};
+struct Probe{bool paused=true,display=false,host=false,host_fail=false,unsafe=false,throws=false;int locks=0,acquires=0,fail_acquire=0,validations=0,context_calls=0,context_error=0,boundaries=0;bool boundary_fail=false;
  renderer::SnapshotImageValidation result=renderer::SnapshotImageValidation::Prepared;};
 Probe *active;
 struct Kernel{Probe *p;bool is_threads_paused()const{return p->paused;}int get_thread(int){return 1;}};
-struct Gxm{int display_queue_thread=2;};
-struct DisplayQueueDrainScope{explicit DisplayQueueDrainScope(int){assert(!active->display);active->display=true;}
+struct Gxm{int display_queue_thread=2,immediate_context=1;};
+SaveStateResult pause_at_snapshot_scene_boundary(Kernel &k,bool,std::string*) {
+ assert(!k.p->locks&&!k.p->host&&!k.p->display);++k.p->boundaries;
+ return k.p->boundary_fail?SaveStateResult::ErrorGraphicsNotReady:SaveStateResult::Success;
+}
+struct DisplayQueueDrainScope{explicit DisplayQueueDrainScope(int){assert(!active->display && active->boundaries==1);active->display=true;}
  ~DisplayQueueDrainScope(){assert(!active->locks&&!active->host);active->display=false;}};
 struct KernelSnapshotGuard{Probe*p;bool held=false;explicit KernelSnapshotGuard(Kernel&k):p(k.p){}
  bool acquire(Kernel&,int&,Gxm&,std::string &why){++p->acquires;if(p->acquires==p->fail_acquire){why="drain failed";return false;}++p->locks;held=true;return true;}
@@ -43,7 +47,7 @@ Result check_context_restore_prerequisites(EmuEnvState &e,const Lease&,const std
 std::string find_unsafe_thread_reason(Kernel&k,int&,bool,bool){return k.p->unsafe?"unsafe wait":"";}
 METHOD
 int main(){
- for(int mode=0;mode<15;++mode){Probe p;active=&p;EmuEnvState e(p);
+ for(int mode=0;mode<16;++mode){Probe p;active=&p;EmuEnvState e(p);
   if(mode==1)p.paused=false;if(mode==2)e.renderer.reset();if(mode==3)p.fail_acquire=1;
   if(mode==4)p.host_fail=true;if(mode==5)p.fail_acquire=2;if(mode==6)p.unsafe=true;
   if(mode==7)p.result=renderer::SnapshotImageValidation::InvalidData;
@@ -54,16 +58,18 @@ int main(){
   if(mode==12)p.result=renderer::SnapshotImageValidation::RoundTripPassed;
   if(mode==13)p.result=renderer::SnapshotImageValidation::RoundTripMismatch;
   if(mode==14)p.result=renderer::SnapshotImageValidation::TransferFailed;
+  if(mode==15)p.boundary_fail=true;
   const auto expected=mode==1?SaveStateResult::ErrorNotPaused:
-   mode==2||mode==4?SaveStateResult::ErrorGraphicsNotReady:
+   mode==2||mode==4||mode==15?SaveStateResult::ErrorGraphicsNotReady:
    mode==3||mode==5||mode==6?SaveStateResult::ErrorThreadNotSafe:
    mode==7?SaveStateResult::ErrorMismatch:SaveStateResult::ErrorUnsupportedHostState;
   std::string reason;
   try{assert(diagnose_saved_images(e,{},{},&reason)==expected);assert(mode!=10);}
   catch(const std::runtime_error&){assert(mode==10);}
   assert(!p.locks&&!p.host&&!p.display);
-  assert(p.validations==((mode==0||mode>=7)?1:0));
+  assert(p.validations==((mode==0||(mode>=7&&mode<15))?1:0));
   assert(p.context_calls==p.validations);
+  assert(p.boundaries==((mode==1||mode==2)?0:1));
  }
  std::cout<<"PASS: production Load diagnostic; no success return, pause/lock order, refusal and exception cleanup\n";
 }
