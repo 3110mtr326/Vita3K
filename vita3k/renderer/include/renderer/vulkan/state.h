@@ -33,6 +33,7 @@
 #include <renderer/vulkan/snapshot_image_preflight.h>
 #include <renderer/vulkan/snapshot_upload_prepare.h>
 #include <renderer/vulkan/snapshot_scratch.h>
+#include <renderer/vulkan/snapshot_rollback_pair.h>
 
 #include <chrono>
 
@@ -64,6 +65,12 @@ private:
     std::unique_ptr<SnapshotJobs> snapshot_transfers;
     using SnapshotScratchJobs = SnapshotTransferService<SnapshotScratchResources<>>;
     std::unique_ptr<SnapshotScratchJobs> snapshot_scratch_transfers;
+    using SnapshotLivePair = SnapshotRollbackPair<SnapshotUploadResources<>>;
+    using SnapshotLiveJobs = SnapshotTransferService<SnapshotLivePair>;
+    std::unique_ptr<SnapshotLiveJobs> snapshot_live_transfers;
+    SnapshotImageValidation probe_live_snapshot_rollback(const SnapshotImageRecords &saved,
+        const HostQuiescence &lease, std::chrono::steady_clock::time_point deadline);
+
 
 
 public:

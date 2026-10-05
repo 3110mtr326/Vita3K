@@ -4,7 +4,55 @@ This is unfinished source work, not a device-test release or a working FFX
 load implementation. Keep using the tested fix21 build for now. No new APK
 build or device test is requested for this checkpoint.
 
-## Saved-session layout device checkpoint (latest change)
+## Live GPU write/rollback device checkpoint (latest change)
+
+The preceding Xperia session-layout test passed twice, including context and
+scratch GPU comparisons, and the user confirmed normal motion after Resume.
+
+After the scratch test passes, Load now captures current live GPU images as a
+rollback backup, prepares BOTH the saved-image upload and backup upload, verifies
+identical pinned targets, and submits the two recorded command buffers in one
+queue submission with a fence on the complete batch. Both commands finish in
+GENERAL layout. Rollback is queued before the host begins waiting; cancellation
+cannot omit a later host-side rollback submission. This is not atomic under
+device loss. Existing full guest/kernel/host exclusion covers the entire probe.
+
+After completion, current game GPU images are captured again and compared with
+the backup, ignoring only staging padding and D24 X8 bytes. Success reports
+`live-gpu-rollback-passed` and logs `Savestate live GPU probe: rollback MATCH`.
+The saved image upload is NOT independently read back between the two commands;
+the new comparison specifically establishes return to the pre-test image data.
+Scratch comparison still independently checks saved-pixel transfers beforehand.
+
+Preparation failures submit no live writes. Once submission is attempted, an
+uncertain submission, timeout, failed recapture, exception or rollback mismatch
+sets render_abort and reports TransferFailed with a restart instruction. Pending
+or uncertain jobs retain both source buffers, command pools and allocation pins
+in a persistent capacity-one service. Cleanup releases them only after confirmed
+device.waitIdle, before allocator teardown. This does not recover a lost device
+or make a failed idle wait safe; the existing teardown limitation remains.
+Renderer abort is not a complete session recovery. The user must restart after
+failure, rather than resume and keep playing. GPU verification has an eight-second
+overall deadline. Backup staging is limited to 64 MiB; actual peak CPU/GPU memory
+also includes encoded records, upload buffers and backend allocation overhead.
+
+This is the first device checkpoint that submits writes to live game GPU images.
+Saved RAM/CPU/kernel/audio are still not restored and no rewind is committed.
+Save format stays v9. Do not interpret successful rollback as complete Load.
+
+Host syntax checks pass for renderer.cpp and savestate.cpp. Extracted production
+probe tests cover batch order, final fence, target identity, ownership before
+submission, missing backup, both preparation failures, exception, mismatch,
+timeout and uncertain-submission retention/renderer abort. Lifecycle tests cover
+all three services. Scratch entry and Load diagnostic tests also pass. These
+tests simulate a GPU; the new live writes have not been run on Android here.
+
+Device test: fresh Save, Resume briefly, Load once, send screenshot/log; on
+live-gpu-rollback-passed check normal controls/audio/rendering after Resume. If
+gpu-transfer-failed appears, restart the app and send the log; do not Resume that
+session. All-pass still displays unsupported full restoration by design.
+
+## Saved-session layout device checkpoint (previous checkpoint)
 
 The preceding device test recorded one successful Save and two context
 apply/rollback MATCH plus GPU upload/readback MATCH results. The user confirmed

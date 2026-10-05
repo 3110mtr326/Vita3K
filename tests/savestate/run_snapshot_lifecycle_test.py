@@ -31,6 +31,8 @@ struct State {
     std::unique_ptr<SnapshotJobs> snapshot_transfers;
     using SnapshotScratchJobs=SnapshotJobs;
     std::unique_ptr<SnapshotScratchJobs> snapshot_scratch_transfers;
+    using SnapshotLiveJobs=SnapshotJobs;
+    std::unique_ptr<SnapshotLiveJobs> snapshot_live_transfers;
     void init() { INIT }
     void cleanup() { CLEANUP }
 };
@@ -38,6 +40,9 @@ int main() {
     for (bool ambiguous : {false,true}) {
         State state;
         state.init();
+        auto live=state.snapshot_live_transfers->submit(std::unique_ptr<Job>(new Job{state.destroyed}),[&](auto &){return !ambiguous;});
+        assert(live.id);
+        auto *live_identity=state.snapshot_live_transfers.get();
         auto scratch=state.snapshot_scratch_transfers->submit(std::unique_ptr<Job>(new Job{state.destroyed}),[&](auto &){return !ambiguous;});
         assert(scratch.id);
         auto *scratch_identity=state.snapshot_scratch_transfers.get();
@@ -47,6 +52,7 @@ int main() {
             [&](auto &) { return !ambiguous; });
         assert(id.id && id.submitted == !ambiguous);
         state.init();
+        assert(state.snapshot_live_transfers.get()==live_identity);
         assert(state.snapshot_transfers.get() == identity && state.snapshot_scratch_transfers.get()==scratch_identity);
         for (int n=0; n<2; ++n) {
             try { state.cleanup(); assert(false); } catch (const std::runtime_error &) {}
@@ -55,15 +61,15 @@ int main() {
         }
         state.device.fail=false;
         state.cleanup();
-        assert(state.destroyed==2 && !state.snapshot_transfers && !state.snapshot_scratch_transfers && state.writeback_pause.closed);
+        assert(state.destroyed==3 && !state.snapshot_live_transfers && !state.snapshot_transfers && !state.snapshot_scratch_transfers && state.writeback_pause.closed);
         state.init();
         auto next=state.snapshot_transfers->submit(
             std::unique_ptr<Job>(new Job{state.destroyed}), [](auto &) { return true; });
         assert(next.submitted);
         state.cleanup();
-        assert(state.destroyed==3 && !state.snapshot_transfers && !state.snapshot_scratch_transfers);
+        assert(state.destroyed==4 && !state.snapshot_transfers && !state.snapshot_scratch_transfers);
         state.cleanup();
-        assert(state.destroyed==3);
+        assert(state.destroyed==4);
     }
     std::cout << "PASS: production init/cleanup, wait failure retention, retry, reset and reinit\n";
 }

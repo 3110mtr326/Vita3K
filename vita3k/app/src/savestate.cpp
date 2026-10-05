@@ -1117,14 +1117,15 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     LOG_INFO("Savestate load diagnostic: context preparation reason {}, capture reason {}, address 0x{:08X}; temporary context changes rolled back.",
         static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     const auto result = emuenv.renderer->validate_snapshot_image_section(bytes, host_pause,
-        std::chrono::steady_clock::now() + std::chrono::seconds(3));
-    const char *stage = result == renderer::SnapshotImageValidation::RoundTripPassed ? "gpu-roundtrip-passed"
+        std::chrono::steady_clock::now() + std::chrono::seconds(8));
+    const char *stage = result == renderer::SnapshotImageValidation::LiveRollbackPassed ? "live-gpu-rollback-passed"
+        : result == renderer::SnapshotImageValidation::RoundTripPassed ? "gpu-roundtrip-passed"
         : result == renderer::SnapshotImageValidation::RoundTripMismatch ? "gpu-roundtrip-mismatch"
-        : result == renderer::SnapshotImageValidation::TransferFailed ? "gpu-transfer-failed"
+        : result == renderer::SnapshotImageValidation::TransferFailed ? "gpu-transfer-failed (restart session before further use)"
         : result == renderer::SnapshotImageValidation::Prepared ? "prepared"
         : result == renderer::SnapshotImageValidation::InvalidData ? "invalid-data"
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
-    LOG_INFO("Savestate load diagnostic: image validation {}; no game images or saved RAM restored.", stage);
+    LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM applied or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
         "Session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);

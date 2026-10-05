@@ -272,6 +272,61 @@ bool VKState::validate_snapshot_image_upload(const SnapshotImageRecords &saved,
     return bool(prepared) && !stopped();
 }
 
+SnapshotImageValidation VKState::probe_live_snapshot_rollback(const SnapshotImageRecords &saved,
+    const HostQuiescence &lease, std::chrono::steady_clock::time_point deadline) {
+    const auto stopped = [&] { return render_abort.load(std::memory_order_relaxed)
+        || std::chrono::steady_clock::now() >= deadline; };
+    if (!lease.owns_renderer(render_pause) || !snapshot_live_transfers || stopped()
+        || general_family_index >= physical_device_queue_families.size()) return SnapshotImageValidation::NotReady;
+    snapshot_live_transfers->poll([](const auto &job) { return job.poll(); });
+    if (snapshot_live_transfers->size()) return SnapshotImageValidation::NotReady;
+    const auto backup_bytes = capture_snapshot_image_section(lease, deadline);
+    if (!backup_bytes || stopped()) return SnapshotImageValidation::NotReady;
+    const auto backup = decode_snapshot_image_sections(*backup_bytes);
+    if (!backup) return SnapshotImageValidation::NotReady;
+    const auto inventory = surface_cache.inspect_snapshot_surfaces();
+    const auto expected = prepare_snapshot_upload_data(*backup, inventory);
+    if (!expected || expected->bytes.size() > 64ULL * 1024 * 1024) return SnapshotImageValidation::NotReady;
+    const auto flags = physical_device_queue_families[general_family_index].queueFlags;
+    auto apply = prepare_snapshot_upload_job(saved, surface_cache, device, allocator, general_family_index, flags, stopped);
+    auto undo = prepare_snapshot_upload_job(*backup, surface_cache, device, allocator, general_family_index, flags, stopped);
+    auto pair = SnapshotLivePair::create(std::move(apply), std::move(undo));
+    if (!pair || stopped()) return SnapshotImageValidation::NotReady;
+    LOG_INFO("Savestate live GPU probe: submitting saved images followed by rollback in one batch.");
+    const auto submission = snapshot_live_transfers->submit(std::move(pair), [&](auto &retained) {
+        const auto commands = retained.commands();
+        vk::SubmitInfo submit{}; submit.setCommandBuffers(commands);
+        general_queue.submit(submit, retained.fence());
+        return true;
+    });
+    // Once submission was attempted, any unconfirmed outcome poisons rendering.
+    // Do not let normal game rendering observe a potentially partial restore.
+    const auto fail = [&] {
+        render_abort.store(true, std::memory_order_relaxed);
+        if (submission.id) snapshot_live_transfers->abandon(submission.id);
+        LOG_ERROR("Savestate live GPU probe: rollback not verified; renderer stopped, restart session required.");
+        return SnapshotImageValidation::TransferFailed;
+    };
+    if (!submission.submitted) return fail();
+    try {
+        const auto waited = wait_snapshot_transfer(*snapshot_live_transfers, submission.id, deadline,
+            [](const auto &job) { return job.poll(); },
+            [&] { return render_abort.load(std::memory_order_relaxed); },
+            [] { return std::chrono::steady_clock::now(); },
+            [](auto until) { std::this_thread::sleep_until(until); });
+        if (waited != SnapshotWaitResult::Complete) return fail();
+        if (!snapshot_live_transfers->consume(submission.id, [](const auto &) {})) return fail();
+        const auto restored_bytes = capture_snapshot_image_section(lease, deadline);
+        if (!restored_bytes) return fail();
+        const auto restored = decode_snapshot_image_sections(*restored_bytes);
+        if (!restored) return fail();
+        const auto actual = prepare_snapshot_upload_data(*restored, inventory);
+        if (!actual || !snapshot_scratch_matches(*expected, inventory, actual->bytes)) return fail();
+        LOG_INFO("Savestate live GPU probe: rollback MATCH; saved upload was not separately read back; no game rewind committed.");
+        return SnapshotImageValidation::LiveRollbackPassed;
+    } catch (...) { return fail(); }
+}
+
 SnapshotImageValidation VKState::validate_snapshot_image_section(const std::vector<uint8_t> &bytes,
     const HostQuiescence &lease, std::chrono::steady_clock::time_point deadline) {
     if (!lease.owns_renderer(render_pause) || render_abort.load(std::memory_order_relaxed)
@@ -324,7 +379,8 @@ SnapshotImageValidation VKState::validate_snapshot_image_section(const std::vect
         if (!consumed) { snapshot_scratch_transfers->abandon(submission.id); return SnapshotImageValidation::TransferFailed; }
     } catch (...) { snapshot_scratch_transfers->abandon(submission.id); throw; }
     LOG_INFO("Savestate GPU self-test: upload/readback {}; no game state restored.",matches ? "MATCH" : "MISMATCH");
-    return matches ? SnapshotImageValidation::RoundTripPassed : SnapshotImageValidation::RoundTripMismatch;
+    if (!matches) return SnapshotImageValidation::RoundTripMismatch;
+    return probe_live_snapshot_rollback(*records, lease, deadline);
 }
 
 #if defined(__ANDROID__) && defined(USE_ADRENO_TOOLS)
@@ -1099,6 +1155,8 @@ void VKState::late_init(const Config &cfg, const std::string_view game_id, MemSt
         snapshot_transfers = std::make_unique<SnapshotJobs>(1);
     if (!snapshot_scratch_transfers)
         snapshot_scratch_transfers = std::make_unique<SnapshotScratchJobs>(1);
+    if (!snapshot_live_transfers)
+        snapshot_live_transfers = std::make_unique<SnapshotLiveJobs>(1);
     this->mem = &mem;
 
     bool use_high_accuracy = cfg.current_config.high_accuracy;
@@ -1182,6 +1240,10 @@ void VKState::cleanup() {
     if (snapshot_scratch_transfers) {
         snapshot_scratch_transfers->shutdown([] { return true; });
         snapshot_scratch_transfers.reset();
+    }
+    if (snapshot_live_transfers) {
+        snapshot_live_transfers->shutdown([] { return true; });
+        snapshot_live_transfers.reset();
     }
     writeback_pause.close();
     request_queue.abort();

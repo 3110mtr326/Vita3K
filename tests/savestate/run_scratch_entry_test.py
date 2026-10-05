@@ -37,6 +37,7 @@ struct VKState {
  struct Queue{void submit(const vk::SubmitInfo&i,vk::Fence){assert(i.commandBufferCount==1&&active->owned());++active->submits;if(active->throw_submit)throw std::runtime_error("uncertain submit");}}general_queue;
  using Service=SnapshotTransferService<SnapshotScratchResources<>>;
  std::unique_ptr<Service>snapshot_scratch_transfers=std::make_unique<Service>(1);
+ SnapshotImageValidation probe_live_snapshot_rollback(const Records&,const HostQuiescence&,std::chrono::steady_clock::time_point){return SnapshotImageValidation::LiveRollbackPassed;}
  bool validate_snapshot_image_upload(const Records&,const HostQuiescence&,std::chrono::steady_clock::time_point){return active->prepare;}
  SnapshotImageValidation validate_snapshot_image_section(const std::vector<uint8_t>&,const HostQuiescence&,std::chrono::steady_clock::time_point);
 };
@@ -52,7 +53,7 @@ int main(){
  try{
   const auto result=state.validate_snapshot_image_section({},lease,deadline);
   auto expected=SnapshotImageValidation::NotReady;
-  if(mode==0)expected=SnapshotImageValidation::RoundTripPassed;
+  if(mode==0)expected=SnapshotImageValidation::LiveRollbackPassed;
   if(mode==4)expected=SnapshotImageValidation::InvalidData;
   if(mode==8||mode==11)expected=SnapshotImageValidation::TransferFailed;
   if(mode==9)expected=SnapshotImageValidation::RoundTripMismatch;
