@@ -290,9 +290,17 @@ SnapshotImageValidation VKState::probe_live_snapshot_rollback(const SnapshotImag
     const auto flags = physical_device_queue_families[general_family_index].queueFlags;
     auto apply = prepare_snapshot_upload_job(saved, surface_cache, device, allocator, general_family_index, flags, stopped);
     auto undo = prepare_snapshot_upload_job(*backup, surface_cache, device, allocator, general_family_index, flags, stopped);
-    auto pair = SnapshotLivePair::create(std::move(apply), std::move(undo));
+    if (!apply || !undo) return SnapshotImageValidation::NotReady;
+    const auto saved_data = prepare_snapshot_upload_data(saved, inventory);
+    if (!saved_data || saved_data->bytes.size() > 64ULL*1024*1024) return SnapshotImageValidation::NotReady;
+    auto observation = SnapshotReadbackResources<>::create(device, allocator, general_family_index, saved_data->bytes.size());
+    std::vector<SnapshotImageSource> targets;
+    for (const auto &pin:apply->targets) targets.push_back(pin.source);
+    if (!record_snapshot_observation(observation->command(), observation->buffer(), observation->size(), *saved_data, targets))
+        return SnapshotImageValidation::NotReady;
+    auto pair = SnapshotLivePair::create(std::move(apply), std::move(undo), std::move(observation));
     if (!pair || stopped()) return SnapshotImageValidation::NotReady;
-    LOG_INFO("Savestate live GPU probe: submitting saved images followed by rollback in one batch.");
+    LOG_INFO("Savestate live GPU probe: submitting saved images, intermediate readback and rollback in one batch.");
     const auto submission = snapshot_live_transfers->submit(std::move(pair), [&](auto &retained) {
         const auto commands = retained.commands();
         vk::SubmitInfo submit{}; submit.setCommandBuffers(commands);
@@ -315,15 +323,18 @@ SnapshotImageValidation VKState::probe_live_snapshot_rollback(const SnapshotImag
             [] { return std::chrono::steady_clock::now(); },
             [](auto until) { std::this_thread::sleep_until(until); });
         if (waited != SnapshotWaitResult::Complete) return fail();
-        if (!snapshot_live_transfers->consume(submission.id, [](const auto &) {})) return fail();
+        bool uploaded_matches = false;
+        if (!snapshot_live_transfers->consume(submission.id, [&](const auto &job) {
+            uploaded_matches = snapshot_scratch_matches(*saved_data, inventory, job.observation->read_completed_pixels());
+        })) return fail();
         const auto restored_bytes = capture_snapshot_image_section(lease, deadline);
         if (!restored_bytes) return fail();
         const auto restored = decode_snapshot_image_sections(*restored_bytes);
         if (!restored) return fail();
         const auto actual = prepare_snapshot_upload_data(*restored, inventory);
         if (!actual || !snapshot_scratch_matches(*expected, inventory, actual->bytes)) return fail();
-        LOG_INFO("Savestate live GPU probe: rollback MATCH; saved upload was not separately read back; no game rewind committed.");
-        return SnapshotImageValidation::LiveRollbackPassed;
+        LOG_INFO("Savestate live GPU probe: saved upload {}; rollback MATCH; no game rewind committed.", uploaded_matches ? "MATCH" : "MISMATCH");
+        return uploaded_matches ? SnapshotImageValidation::LiveRoundTripPassed : SnapshotImageValidation::LiveUploadMismatch;
     } catch (...) { return fail(); }
 }
 

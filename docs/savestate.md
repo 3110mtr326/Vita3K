@@ -4,7 +4,46 @@ This is unfinished source work, not a device-test release or a working FFX
 load implementation. Keep using the tested fix21 build for now. No new APK
 build or device test is requested for this checkpoint.
 
-## Live GPU write/rollback device checkpoint (latest change)
+## Live GPU intermediate verification device checkpoint (latest change)
+
+The preceding Xperia test completed a live upload/rollback batch, verified the
+original GPU pixels after rollback, and resumed normally per the user's report.
+It did not read back the saved pixels before rollback.
+
+The batch now contains THREE command buffers: saved upload, intermediate
+readback, original-image upload. All three are recorded and retained before one
+queue submission. The readback buffer's fence is attached to the complete batch,
+so mapped reading begins only after rollback has also completed. The readback
+step transitions GENERAL to TRANSFER_SRC_OPTIMAL, copies color/depth/stencil
+planes, returns images to GENERAL for rollback, and inserts a host-read barrier.
+Live image allocation pins remain held through batch completion.
+
+Load compares the intermediate pixels with the saved upload plan and then captures
+and compares the restored images with the original backup. Both comparisons use
+the existing meaningful-byte rules (ignore staging padding and D24 X8 only).
+Success is `live-gpu-roundtrip-passed` and logs `saved upload MATCH; rollback MATCH`.
+If saved-image comparison fails but rollback is independently verified, return
+`live-gpu-upload-mismatch (original images restored)` without aborting rendering.
+Unconfirmed rollback/read errors/timeout still abort rendering, retain uncertain
+resources and instruct a session restart. Device-loss and failed-idle teardown
+limitations remain. The extra readback allocation adds one staging buffer bounded
+at 64 MiB, approximately 21 MiB for the tested FFX scene.
+
+Host verification: renderer.cpp and savestate.cpp syntax pass. Extracted live
+probe tests cover three-command order and final batch fence, intermediate mismatch,
+read exception, allocation/record refusal, rollback mismatch, submission failure,
+timeout and resource ownership. Recorder tests inspect image layouts, combined
+depth/stencil aspects, copy order, host visibility, and pre-record refusals.
+Scratch entry and Load diagnostic tests pass. These are simulated GPU tests;
+Android and Xperia verification of intermediate readback remain outstanding.
+
+Device steps: fresh Save, Resume briefly, Load once; send screenshot/log. On
+live-gpu-roundtrip-passed, confirm normal Resume controls/audio/rendering. On
+gpu-transfer-failed, restart the app without resuming that session. Full game
+restore is still not implemented; saved RAM, CPU, kernel and audio are not applied.
+All-pass continues to show the unsupported full-restoration message. Format v9.
+
+## Live GPU write/rollback device checkpoint (previous checkpoint)
 
 The preceding Xperia session-layout test passed twice, including context and
 scratch GPU comparisons, and the user confirmed normal motion after Resume.

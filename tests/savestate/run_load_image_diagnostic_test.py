@@ -48,7 +48,7 @@ Result probe_context_restore_roundtrip(EmuEnvState &e,const Lease&,const std::ve
 std::string find_unsafe_thread_reason(Kernel&k,int&,bool,bool){return k.p->unsafe?"unsafe wait":"";}
 METHOD
 int main(){
- for(int mode=0;mode<19;++mode){Probe p;active=&p;EmuEnvState e(p);
+ for(int mode=0;mode<21;++mode){Probe p;active=&p;EmuEnvState e(p);
   if(mode==1)p.paused=false;if(mode==2)e.renderer.reset();if(mode==3)p.fail_acquire=1;
   if(mode==4)p.host_fail=true;if(mode==5)p.fail_acquire=2;if(mode==6)p.unsafe=true;
   if(mode==7)p.result=renderer::SnapshotImageValidation::InvalidData;
@@ -61,6 +61,8 @@ int main(){
   if(mode==14)p.result=renderer::SnapshotImageValidation::TransferFailed;
   if(mode==15)p.boundary_fail=true;
   if(mode==18)p.result=renderer::SnapshotImageValidation::LiveRollbackPassed;
+  if(mode==19)p.result=renderer::SnapshotImageValidation::LiveRoundTripPassed;
+  if(mode==20)p.result=renderer::SnapshotImageValidation::LiveUploadMismatch;
   const auto expected=mode==1?SaveStateResult::ErrorNotPaused:
    mode==2||mode==4||mode==15?SaveStateResult::ErrorGraphicsNotReady:
    mode==3||mode==5||mode==6?SaveStateResult::ErrorThreadNotSafe:
@@ -72,7 +74,7 @@ int main(){
   })==expected);assert(mode!=10&&mode!=17);}
   catch(const std::runtime_error&){assert(mode==10||mode==17);}
   assert(!p.locks&&!p.host&&!p.display);
-  assert(p.validations==((mode==0||mode==18||(mode>=7&&mode<15))?1:0));
+  assert(p.validations==((mode==0||mode>=18||(mode>=7&&mode<15))?1:0));
   assert(p.context_calls==p.validations);
   assert(p.boundaries==((mode==1||mode==2)?0:1));
  }

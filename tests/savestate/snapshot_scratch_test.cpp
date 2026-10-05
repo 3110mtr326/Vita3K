@@ -1,6 +1,7 @@
 // Vita3K emulator project
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <renderer/vulkan/snapshot_scratch.h>
+#include <renderer/vulkan/snapshot_observation.h>
 #include <renderer/snapshot_transfer_service.h>
 #include <cassert>
 #include <iostream>
@@ -54,6 +55,29 @@ struct Command {
  void copyImageToBuffer(vk::Image,vk::ImageLayout l,vk::Buffer b,const vk::BufferImageCopy&){assert(b==handle<vk::Buffer>(2)&&l==vk::ImageLayout::eTransferSrcOptimal&&p->barriers==5);++p->reads;}
  void end(){assert(p->barriers==6);++p->ends;}
 };
+struct ObservationCommand {
+ Commands *p;
+ void begin(const vk::CommandBufferBeginInfo&){++p->begins;}
+ void pipelineBarrier(vk::PipelineStageFlags src,vk::PipelineStageFlags dst,vk::DependencyFlags,
+  const std::vector<vk::MemoryBarrier>&,const std::vector<vk::BufferMemoryBarrier>&buffers,const std::vector<vk::ImageMemoryBarrier>&images){
+  ++p->barriers;
+  if(p->barriers<3){
+   assert(images.size()==2 && images[0].subresourceRange.aspectMask==vk::ImageAspectFlagBits::eColor);
+   assert(images[1].subresourceRange.aspectMask==(vk::ImageAspectFlagBits::eDepth|vk::ImageAspectFlagBits::eStencil));
+   for(const auto &b:images){assert(b.srcQueueFamilyIndex==VK_QUEUE_FAMILY_IGNORED);
+    assert(b.oldLayout==(p->barriers==1?vk::ImageLayout::eGeneral:vk::ImageLayout::eTransferSrcOptimal));
+    assert(b.newLayout==(p->barriers==1?vk::ImageLayout::eTransferSrcOptimal:vk::ImageLayout::eGeneral));}
+   assert(p->reads==(p->barriers==1?0:3));
+  }else{assert(p->reads==3&&buffers.size()==1&&src==vk::PipelineStageFlagBits::eTransfer&&dst==vk::PipelineStageFlagBits::eHost);
+   assert(buffers[0].srcAccessMask==vk::AccessFlagBits::eTransferWrite&&buffers[0].dstAccessMask==vk::AccessFlagBits::eHostRead);}
+ }
+ void copyImageToBuffer(vk::Image image,vk::ImageLayout layout,vk::Buffer buffer,const vk::BufferImageCopy&r){
+  assert(p->barriers==1&&layout==vk::ImageLayout::eTransferSrcOptimal&&buffer==handle<vk::Buffer>(2));
+  assert(image==handle<vk::Image>(p->reads==0?1:2));
+  assert(r.imageSubresource.aspectMask==(p->reads==0?vk::ImageAspectFlagBits::eColor:p->reads==1?vk::ImageAspectFlagBits::eDepth:vk::ImageAspectFlagBits::eStencil));++p->reads;
+ }
+ void end(){assert(p->barriers==3&&p->reads==3);++p->ends;}
+};
 SnapshotImageRecords saved(){SnapshotImageRecords s;s.colors.push_back({256,1,1,uint32_t(vk::Format::eR8G8B8A8Unorm),{1,2,3,4}});
  s.depths.push_back({512,768,1,1,uint32_t(vk::Format::eD24UnormS8Uint),{1,2,3,0},{9}});return s;}
 int main(){
@@ -65,6 +89,15 @@ int main(){
   Commands c;SnapshotScratchCommand wrapped{Command{&c},output.buffer(),data,std::span<const SnapshotImageSource>(targets)};
   assert(record_snapshot_upload(wrapped,input.buffer(),input.size(),3,vk::QueueFlagBits::eGraphics,data,inventory,targets));
   assert(c.begins==1&&c.ends==1&&c.writes==3&&c.reads==3);
+  Commands observed;
+  assert(record_snapshot_observation(ObservationCommand{&observed},output.buffer(),output.size(),data,targets));
+  assert(observed.begins==1&&observed.ends==1&&observed.writes==0);
+  Commands rejected;auto invalid=data;invalid.regions[0].current_index=targets.size();
+  assert(!record_snapshot_observation(ObservationCommand{&rejected},output.buffer(),output.size(),invalid,targets));
+  assert(!record_snapshot_observation(ObservationCommand{&rejected},output.buffer(),1,data,targets));
+  auto bad_targets=targets;bad_targets[0].layout=vk::ImageLayout::eUndefined;
+  assert(!record_snapshot_observation(ObservationCommand{&rejected},output.buffer(),output.size(),data,bad_targets));
+  assert(!rejected.begins);
   std::memcpy(p.output,data.bytes.data(),33);p.output[19]=0xa5;p.output[7]=0xff; // undefined X8 and alignment padding
   assert(snapshot_scratch_matches(data,inventory,std::span(p.output,33)));
   p.output[16]^=1;assert(!snapshot_scratch_matches(data,inventory,std::span(p.output,33)));p.output[16]^=1;

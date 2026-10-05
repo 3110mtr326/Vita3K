@@ -1118,7 +1118,9 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     const auto result = emuenv.renderer->validate_snapshot_image_section(bytes, host_pause,
         std::chrono::steady_clock::now() + std::chrono::seconds(8));
-    const char *stage = result == renderer::SnapshotImageValidation::LiveRollbackPassed ? "live-gpu-rollback-passed"
+    const char *stage = result == renderer::SnapshotImageValidation::LiveRoundTripPassed ? "live-gpu-roundtrip-passed"
+        : result == renderer::SnapshotImageValidation::LiveUploadMismatch ? "live-gpu-upload-mismatch (original images restored)"
+        : result == renderer::SnapshotImageValidation::LiveRollbackPassed ? "live-gpu-rollback-passed"
         : result == renderer::SnapshotImageValidation::RoundTripPassed ? "gpu-roundtrip-passed"
         : result == renderer::SnapshotImageValidation::RoundTripMismatch ? "gpu-roundtrip-mismatch"
         : result == renderer::SnapshotImageValidation::TransferFailed ? "gpu-transfer-failed (restart session before further use)"
