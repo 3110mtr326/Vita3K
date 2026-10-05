@@ -4,7 +4,48 @@ This is unfinished source work, not a device-test release or a working FFX
 load implementation. Keep using the tested fix21 build for now. No new APK
 build or device test is requested for this checkpoint.
 
-## Intermediate readback capability/layout fix (latest change)
+## CPU register apply/rollback device checkpoint (latest change)
+
+Latest Xperia evidence: three live GPU saved-upload MATCH and rollback MATCH
+results, two successful Saves, and normal resumed operation reported by the user.
+
+After session layout checks and under the same KernelSnapshotGuard/host exclusion,
+Load now probes each saved thread's CPU registers and TPIDRURO. Every current CPU
+value is captured before the first mutation. Each saved context is loaded and
+recaptured for comparison, then every touched CPU is restored to its original
+values and all original values are verified again. Floating-point registers are
+compared by bits, including NaN payloads and signed zero. No guest instruction is
+executed; native waits, statuses, timing fields and thread return bookkeeping are
+not changed. This is NOT wait reconstruction or a complete CPU execution restore.
+
+The transaction includes the target of a partially throwing write in rollback,
+attempts all rollbacks even after one fails, and distinguishes apply mismatch from
+unverified rollback. Unverified rollback sets kernel.snapshot_restore_failed under
+the kernel mutex, blocking both menu resume and scene advance until teardown.
+The message requests an app restart. An ordinary mismatch with verified original
+values returns a diagnostic refusal without poisoning the session. Allocation and
+initial capture precede mutation. The flag resets during kernel deinit.
+
+Success logs `Savestate CPU probe: saved registers MATCH; rollback MATCH; N threads`.
+The UI says `Session layout and CPU roundtrip checked`, then reports the existing
+graphics diagnostic. Passing CPU and GPU probes still never commits a game rewind.
+RAM restoration, native waits/kernel values, backend/sync/audio consistency and
+coordinated failure recovery remain incomplete. Format stays v9.
+
+Host checks: six native translation units pass syntax checks. CPU transaction tests
+cover all represented register classes/TLS, NaNs, partial writes, read exceptions,
+apply mismatch, rollback failure, continued cleanup and duplicate/null targets.
+The extracted production wrapper tests target gates and persistent resume veto.
+Production kernel resume/scene tests exercise the veto and existing boundary races.
+Session layout and Load exclusion/cleanup tests pass. These use simulated CPUs;
+the actual Android Dynarmic register roundtrip requires device testing.
+
+Device procedure: fresh Save, Resume briefly, Load once, send screenshot/log; look
+for CPU saved-register/rollback MATCH and live-gpu-roundtrip-passed. Confirm normal
+Resume operation/audio/rendering. If CPU rollback failed or gpu-transfer-failed,
+restart the app without resuming. Full restoration still reports unsupported.
+
+## Intermediate readback capability/layout fix (previous checkpoint)
 
 Latest device evidence: three attempts passed session/context/scratch checks but
 returned not-ready before the live batch was submitted. Resume was normal.

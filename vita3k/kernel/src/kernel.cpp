@@ -229,6 +229,7 @@ bool KernelState::get_pending_resume_status(SceUID thread_id, ThreadStatus &stat
 
 void KernelState::resume_threads() {
     const std::lock_guard<std::mutex> lock(mutex);
+    if (snapshot_restore_failed) return;
     for (auto &[_, thread] : threads) {
         // A replayed wait may still be blocked, or may have completed and
         // parked at the barrier. Only the latter needs an explicit wake-up.
@@ -243,7 +244,7 @@ void KernelState::resume_threads() {
 
 bool KernelState::begin_snapshot_scene_advance() {
     const std::lock_guard<std::mutex> lock(mutex);
-    if (!session_paused || snapshot_scene_pending) return false;
+    if (!session_paused || snapshot_scene_pending || snapshot_restore_failed) return false;
     snapshot_scene_reached.store(false, std::memory_order_release);
     snapshot_scene_pending = true;
     // Same resume bookkeeping as menu resume, but under the same lock as arming
@@ -342,6 +343,7 @@ void KernelState::deinit(MemState &mem) {
     session_paused = false;
     snapshot_scene_pending = false;
     snapshot_scene_reached = false;
+    snapshot_restore_failed = false;
 }
 
 SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {

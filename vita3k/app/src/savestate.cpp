@@ -93,6 +93,7 @@
 #include <app/savestate_file.h>
 #include <app/savestate_image_section.h>
 #include <app/savestate_stream_skip.h>
+#include <app/savestate_cpu_probe.h>
 #include <functional>
 #include <audio/state.h>
 #include <ngs/state.h>
@@ -441,6 +442,32 @@ struct ThreadRecord {
     uint64_t last_vblank_waited;
     uint32_t returned_value;
 };
+
+// Called only with the snapshot guard's kernel/primitive/thread locks held.
+static std::string probe_saved_cpu_contexts(KernelState &kernel,const std::vector<ThreadRecord> &records) {
+    if(kernel.snapshot_restore_failed)return "CPU rollback previously failed; restart the app";
+    std::vector<SnapshotCpuTarget<CPUState>> targets;targets.reserve(records.size());
+    for(const auto &record:records) {
+        const auto it=kernel.threads.find(record.id);
+        if(it==kernel.threads.end() || !it->second->cpu || it->second->status==ThreadStatus::run)
+            return "CPU target missing or still running";
+        targets.push_back({it->second->cpu.get(),{record.ctx,record.tpidruro}});
+    }
+    const auto result=probe_snapshot_cpu_values<CPUState>(targets,
+        [](CPUState &cpu){return SnapshotCpuValues{save_context(cpu),read_tpidruro(cpu)};},
+        [](CPUState &cpu,const SnapshotCpuValues &v){load_context(cpu,v.context);write_tpidruro(cpu,v.tpidruro);});
+    if(result==SnapshotCpuProbe::RollbackFailed) {
+        kernel.snapshot_restore_failed=true;
+        LOG_ERROR("Savestate CPU probe: rollback FAILED; guest resume blocked, restart app required.");
+        return "CPU rollback failed; restart the app without Resume";
+    }
+    if(result!=SnapshotCpuProbe::Passed) {
+        LOG_WARN("Savestate CPU probe: refused (reason {}); original CPU values retained.",static_cast<int>(result));
+        return "CPU verification failed; original CPU values retained";
+    }
+    LOG_INFO("Savestate CPU probe: saved registers MATCH; rollback MATCH; {} threads; no guest instructions executed.",targets.size());
+    return {};
+}
 
 // Plain-data copies of the sync object values that are saved/restored.
 struct SemaRecord {
@@ -1129,7 +1156,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM applied or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Session layout and CPU roundtrip checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
@@ -1307,7 +1334,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 || counts.deferred_contexts != saved_gxm_counts.deferred_contexts
                 || counts.immediate_context != saved_gxm_counts.immediate_context)
                 return "Graphics object counts changed since saving";
-            return {};
+            return probe_saved_cpu_contexts(kernel, thread_records);
         }); // Unconditional return: no saved RAM writes, wait aborts or replay.
     }
 

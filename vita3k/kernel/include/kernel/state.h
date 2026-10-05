@@ -195,6 +195,7 @@ struct KernelState {
     void pause_at_snapshot_scene_end();
     bool finish_snapshot_scene_advance();
     std::atomic<bool> snapshot_scene_reached{ false };
+    bool snapshot_restore_failed = false; // protected by mutex; blocks resume until teardown
     bool snapshot_scene_pending = false; // protected by mutex
     // Updates the status a thread will be restored to by the next resume_threads()
     // call, without waking it immediately. Must only be called while paused (i.e.

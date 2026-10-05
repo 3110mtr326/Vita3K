@@ -3,7 +3,7 @@ from pathlib import Path
 import argparse,subprocess,tempfile
 parser=argparse.ArgumentParser();parser.add_argument('--compiler',required=True);args=parser.parse_args()
 s=Path(__file__).resolve().parents[2]
-t=(s/'vita3k/kernel/src/kernel.cpp').read_text();a=t.index('bool KernelState::begin_snapshot_scene_advance()');b=t.index('void KernelState::deinit',a)
+t=(s/'vita3k/kernel/src/kernel.cpp').read_text();a=t.index('void KernelState::resume_threads()');b=t.index('void KernelState::deinit',a)
 code=r"""
 #include <atomic>
 #include <map>
@@ -17,13 +17,17 @@ struct Thread {int id=1,pauses=0,resumes=0;bool forced=false;ThreadStatus status
  ThreadStatus pause_for_session(){++pauses;return status;}
  void resume_after_pause(bool force){++resumes;forced=force;}};
 struct KernelState{
- std::mutex mutex;std::atomic<bool>session_paused{true},snapshot_scene_reached{false};bool snapshot_scene_pending=false;
+ std::mutex mutex;std::atomic<bool>session_paused{true},snapshot_scene_reached{false};bool snapshot_scene_pending=false,snapshot_restore_failed=false;
  std::map<int,std::shared_ptr<Thread>>threads{{1,std::make_shared<Thread>()}};
  std::map<int,ThreadStatus>paused_threads_status{{1,ThreadStatus::run}};
- bool begin_snapshot_scene_advance();void pause_at_snapshot_scene_end();bool finish_snapshot_scene_advance();
+ void resume_threads();bool begin_snapshot_scene_advance();void pause_at_snapshot_scene_end();bool finish_snapshot_scene_advance();
 };
 METHODS
 int main(){
+ {KernelState k;k.snapshot_restore_failed=true;k.resume_threads();assert(k.session_paused&&k.threads[1]->resumes==0);
+ assert(!k.begin_snapshot_scene_advance());assert(k.paused_threads_status.size()==1);}
+ {KernelState k;k.resume_threads();assert(!k.session_paused&&k.threads[1]->resumes==1);}
+
  {KernelState k;k.session_paused=false;k.pause_at_snapshot_scene_end();assert(!k.session_paused&&!k.threads[1]->pauses);
  assert(!k.begin_snapshot_scene_advance());}
  {KernelState k;assert(k.begin_snapshot_scene_advance());assert(!k.session_paused&&k.snapshot_scene_pending);
