@@ -55,14 +55,17 @@ int main(){
  std::istringstream in(bytes);assert((parse(in)==SaveStateResult::Success)==(mode==0));
  }
 
- for(int mode=0;mode<17;++mode){
+ for(int mode=0;mode<19;++mode){
  EmuEnvState e;Renderer r;e.renderer=&r;
  auto*sys=new(e.mem.memory.get()+4096)ngs::System;
  auto*rack=new(e.mem.memory.get()+8192)ngs::Rack;
  auto*voice=new(e.mem.memory.get()+12288)ngs::Voice;
  e.ngs.systems={sys};sys->racks={rack};rack->system=sys;rack->voices={{voice}};voice->rack=rack;
+ if(mode==17)sys->racks={nullptr,rack,nullptr};
+ if(mode==18)sys->racks={nullptr,nullptr};
  std::vector<NgsVoiceRecord> saved,current;
- assert(snapshot_ngs_voices(e,saved).empty());assert(saved.size()==1);
+ assert(snapshot_ngs_voices(e,saved).empty());assert(saved.size()==(mode==18?0:1));
+ if(mode==18){assert(snapshot_ngs_voices(e,current,&saved).empty());voice->~Voice();rack->~Rack();sys->~System();continue;}
  saved[0].frames=42;saved[0].paused=1;saved[0].state=0;
  if(mode==1)saved[0].paused=2;
  if(mode==2)saved[0].voice++;
@@ -81,12 +84,12 @@ int main(){
  if(mode==15)saved[0].state=4;
  if(mode==16)e.mem.host_page_size=3;
  auto result=snapshot_ngs_voices(e,current,&saved);
- assert(result.empty()==(mode==0));
+ assert(result.empty()==(mode==0||mode==17));
  assert(voice->frame_count==100 && !voice->is_paused && voice->state==ngs::VOICE_STATE_ACTIVE);
  assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
  voice->~Voice();rack->~Rack();sys->~System();
  }
- std::cout<<"NGS production probe: 17 capture/rollback/refusal and 5 record parsing cases passed\n";
+ std::cout<<"NGS production probe: 19 capture/rollback/refusal and 5 record parsing cases passed\n";
 }
 """.replace('FUNCTION',t[a:b]).replace('PARSER',parser)
 with tempfile.TemporaryDirectory() as d:

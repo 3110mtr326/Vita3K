@@ -760,6 +760,9 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
             || !system->voice_scheduler.operations_pending.empty()) return "NGS scheduler is busy";
         if (system->racks.size() > 256) return "Too many NGS racks";
         for (auto *rack : system->racks) {
+            // init_system resizes this list with null slots, then init_rack
+            // appends live racks. Match release_system's empty-slot handling.
+            if (!rack) continue;
             const auto rack_id = checked_address(rack);
             if (!rack_id || !seen_racks.insert(rack_id).second || rack->system != system) return "Invalid or protected NGS rack";
             if (rack->voices.size() > 4096) return "Too many NGS voices";

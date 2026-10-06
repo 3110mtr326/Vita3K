@@ -4,7 +4,22 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## NGS voice scalar checkpoint (latest change, format v10)
+## NGS empty rack fix (latest change)
+
+2026-10-07 device save was refused with Invalid or protected NGS rack.
+Source inspection found init_system uses racks.resize(max_racks), creating null
+slots, while init_rack appends live objects. release_system already skips these
+null slots. The snapshot scanner now does the same, before checking addresses.
+Non-null invalid/protected/duplicate racks and parent mismatch remain refused.
+
+Regression tests include null slots surrounding a live rack, and an entirely
+empty rack list represented by null slots. The live rack still produces one voice
+record and passes saved-scalar rollback; empty slots produce no voice records.
+Actual savestate.cpp syntax and 19 probe / 5 record parsing cases pass.
+Format stays v10. Fresh Save then Load on device is required; full rewind remains
+unsupported. Android/device success is not claimed by host tests.
+
+## NGS voice scalar checkpoint (previous checkpoint, format v10)
 
 Previous phone result: 2026-10-06 21:48 joint files/RAM/CPU/sync/context and
 separate live GPU roundtrip passed; user reported normal Resume.
