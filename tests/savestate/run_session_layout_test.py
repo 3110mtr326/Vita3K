@@ -39,7 +39,9 @@ auto get_allocated_regions(Mem&m){return m.regions;}
 auto collect_gxm_counts(Counts c){return c;}
 std::string probe_saved_cpu_contexts(Kernel&,const std::vector<Thread>&){return {};}
 std::string probe_saved_sync_values(Kernel&,int,int,int,int,int){return {};}
+template<class E,class R>std::string audit_saved_ram(E&,std::istream&,const R&){return {};}
 std::string validate(int mode){
+ std::istringstream in;
  Kernel kernel;Mem mem;struct {Counts gxm;} emuenv;
  std::vector<Thread> thread_records{{1}};
  int saved_object_sets=0,sema_records=0,mutex_records=0,lwmutex_records=0,eventflag_records=0,simple_event_records=0;

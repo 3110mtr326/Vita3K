@@ -1,10 +1,50 @@
-# Bounded color readback planning checkpoint (after fix21)
+# Vita3K save-state development checkpoints
 
-This is unfinished source work, not a device-test release or a working FFX
-load implementation. Keep using the tested fix21 build for now. No new APK
-build or device test is requested for this checkpoint.
+The current checkpoint is a diagnostic Android device test. Full FFX game rewind
+is still unsupported. Sections below record historical work; their instructions
+apply only to their own checkpoint, not the current build.
 
-## Synchronization value apply/rollback device checkpoint (latest change)
+## Bounded RAM read audit device checkpoint (latest change)
+
+Previous device result (2026-10-06 12:13): 23 CPU contexts and 349 synchronization
+fields matched on temporary apply and rollback. Live GPU upload and rollback also
+matched. The user reports normal controls, audio and rendering after Resume.
+
+Load now records file offsets for the v9 RAM payloads and reads every payload in
+64 KiB chunks under the existing final kernel/thread/renderer exclusion. It compares
+unprotected spans with current RAM, reports changed chunks, and excludes the union
+of current GXM host object ranges and complete NGS system/rack arenas. NGS uses
+placement-new in guest RAM for C++ objects with vectors, mutexes and pointers;
+ordinary byte restoration would corrupt them. Entire arenas are excluded here,
+including their guest parameters. This is deliberately broader than individual
+objects and is not a complete audio-state restore or proof of write safety.
+
+NGS object addresses, memspace bases and allocator extents must lie within allocated
+RAM before traversal. Exclusions crossing holes or lying outside RAM are refused.
+Overlap/adjacency is merged without double-counting. No saved guest RAM is written.
+Working payload buffers occupy 128 KiB instead of allocating a full second RAM copy.
+The 10-second budget is checked between chunks and after reads; it cannot interrupt
+an OS file read that itself blocks. A refusal skips the CPU/sync/GPU probes and
+releases existing exclusion scopes. Successful read audit then runs those probes.
+
+Marker: `Savestate RAM audit: READ COMPLETE` with read/compared/excluded byte counts,
+differing chunk count, GXM/NGS range counts and elapsed milliseconds. Differences
+are expected after Resume. This is neither a checksum nor payload authentication:
+v9 cannot detect same-size corruption. Current exclusions do not prove saved/current
+host identities match. Native wait reconstruction, audio logical state and committing
+RAM with the other restored domains remain unfinished. No restore gate is removed.
+
+Host verification: savestate.cpp syntax, streaming audit tests (overlapping ranges,
+holes, truncation, time limit and refused live reads), extracted production adapter
+tests (guest-backed NGS arenas and invalid pointers/extents), existing RAM indexing /
+session mismatch tests, and Load exclusion/refusal/exception cleanup tests.
+These are host model tests; Android compilation and device behavior are unverified.
+
+Device checkpoint: build this cumulative ZIP, make a fresh Save, Resume briefly,
+Load once, then report screenshot/log and Resume controls/audio/rendering. Successful
+UI includes `RAM read audit`; full-restoration-unsupported remains expected.
+
+## Synchronization value apply/rollback device checkpoint (previous checkpoint)
 
 Previous device result: CPU register/TLS apply and rollback matched for all 23
 threads twice; live GPU upload/rollback also matched. Resume was normal.

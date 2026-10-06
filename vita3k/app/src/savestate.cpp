@@ -95,9 +95,11 @@
 #include <app/savestate_stream_skip.h>
 #include <app/savestate_cpu_probe.h>
 #include <app/savestate_value_probe.h>
+#include <app/savestate_ram_audit.h>
 #include <functional>
 #include <audio/state.h>
 #include <ngs/state.h>
+#include <ngs/system.h>
 
 #include <emuenv/state.h>
 #include <kernel/state.h>
@@ -836,6 +838,55 @@ static std::string probe_saved_sync_values(KernelState &kernel,
     return {};
 }
 
+// Called only under the final kernel/thread/renderer exclusion. This audit
+// does not authorize writes: NGS arenas are deliberately excluded in full,
+// including their guest parameter data, until logical audio restoration exists.
+template<class Regions>
+static std::string audit_saved_ram(EmuEnvState &emuenv, std::istream &in, const Regions &regions) {
+    std::vector<SnapshotRamRange> exclusions;
+    for (const auto &[address,size] : gxm::get_host_object_ranges(emuenv)) {
+        if (!size) return "Empty GXM host memory range";
+        exclusions.emplace_back(address,uint64_t(address)+size);
+    }
+    const auto ngs_start = exclusions.size();
+    const auto arena = [&](const auto *object) -> bool {
+        if (!object) return false;
+        const auto base = reinterpret_cast<uintptr_t>(emuenv.mem.memory.get());
+        const auto ptr = reinterpret_cast<uintptr_t>(object);
+        if (ptr < base || uint64_t(ptr-base) >= (1ULL << 32)) return false;
+        const uint64_t address = ptr-base;
+        if (!snapshot_ram_covered(regions,address,address+sizeof(*object))) return false;
+        if (object->memspace.address() != address) return false;
+        uint64_t size = sizeof(*object);
+        for (const auto &block : object->allocator.blocks)
+            size = std::max(size,uint64_t(block.offset)+block.size);
+        if (!snapshot_ram_covered(regions,address,address+size)) return false;
+        exclusions.emplace_back(address,address+size);
+        return true;
+    };
+    for (const auto *system : emuenv.ngs.systems) {
+        if (!arena(system)) return "Invalid NGS system arena";
+        for (const auto *rack : system->racks)
+            if (rack && !arena(rack)) return "Invalid NGS rack arena";
+    }
+    SnapshotRamAudit stats;
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::seconds(10);
+    const auto error = audit_snapshot_ram(in,regions,exclusions,
+        [&](uint64_t address,uint8_t *dest,size_t size) {
+            std::memcpy(dest,emuenv.mem.memory.get()+address,size); return true;
+        }, [&] { return std::chrono::steady_clock::now() >= deadline; }, stats);
+    if (error) {
+        LOG_WARN("Savestate RAM audit: REFUSED: {}; read {} bytes; no RAM written.",error,stats.read_bytes);
+        return error;
+    }
+    LOG_INFO("Savestate RAM audit: READ COMPLETE; {} read bytes, {} compared bytes, {} excluded bytes, {} differing chunks; {} GXM and {} NGS ranges; {} ms; no RAM written. Payload authenticity and full restore remain unverified.",
+        stats.read_bytes,stats.compared_bytes,stats.excluded_bytes,stats.differing_chunks,
+        ngs_start,exclusions.size()-ngs_start,
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count());
+    return {};
+}
+
 } // namespace
 
 fs::path get_savestate_path(const EmuEnvState &emuenv, int slot) {
@@ -1210,7 +1261,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM applied or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Session layout, CPU and sync roundtrip checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "RAM read audit, session layout, CPU and sync roundtrip checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
@@ -1267,6 +1318,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     struct PendingRegion {
         Address addr;
         uint32_t saved_size;
+        std::streamoff file_offset;
         std::vector<uint8_t> bytes;
     };
     std::vector<PendingRegion> pending_regions;
@@ -1287,6 +1339,8 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         PendingRegion region;
         region.addr = addr;
         region.saved_size = size;
+        region.file_offset = in.tellg();
+        if (region.file_offset < 0) return SaveStateResult::ErrorIO;
         if (diagnostic_mode) {
             // Index RAM without a second ~450 MiB allocation on the phone.
             // Bounds are checked against actual file length before seeking.
@@ -1388,6 +1442,8 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 || counts.deferred_contexts != saved_gxm_counts.deferred_contexts
                 || counts.immediate_context != saved_gxm_counts.immediate_context)
                 return "Graphics object counts changed since saving";
+            const auto ram_result = audit_saved_ram(emuenv,in,pending_regions);
+            if (!ram_result.empty()) return ram_result;
             const auto cpu_result=probe_saved_cpu_contexts(kernel, thread_records);
             if(!cpu_result.empty())return cpu_result;
             return probe_saved_sync_values(kernel,sema_records,mutex_records,lwmutex_records,eventflag_records,simple_event_records);
