@@ -1323,7 +1323,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
 // Diagnostic only. Temporary RAM/CPU/sync/GPU probes undo their changes; no wait abort/replay.
 static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const std::vector<gxm::ContextLogicalRecord> &saved_graphics,
-    const std::vector<uint8_t> &bytes, std::string *out_detail, const std::function<std::string()> &session_check = {}) {
+    const std::vector<uint8_t> &bytes, std::string *out_detail, const std::function<std::string(const SnapshotRamJointCheck &)> &session_check = {}) {
     auto &kernel = emuenv.kernel;
     auto &mem = emuenv.mem;
     if (!kernel.is_threads_paused()) return SaveStateResult::ErrorNotPaused;
@@ -1353,18 +1353,32 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         if (out_detail) *out_detail = reason;
         return SaveStateResult::ErrorThreadNotSafe;
     }
+    gxm::ContextPreflightResult contexts;
+    bool graphics_called = false;
+    const SnapshotRamJointCheck graphics_checkpoint = [&](const std::function<bool()> &verify_ram) {
+        if (graphics_called) return false;
+        graphics_called = true;
+        contexts = {gxm::ContextPreflightError::JointCheckFailed,0};
+        contexts = gxm::probe_context_restore_joint(emuenv,host_pause,saved_graphics,verify_ram);
+        return bool(contexts);
+    };
     if (session_check) {
-        const auto mismatch = session_check();
+        const auto mismatch = session_check(graphics_checkpoint);
         if (!mismatch.empty()) {
             LOG_INFO("Savestate session preflight: REFUSED: {}; no saved state retained unless rollback failed.", mismatch);
-            if (out_detail) *out_detail = "Session preflight refused: " + mismatch + "; no saved state retained (unless rollback failed)";
+            if (out_detail) *out_detail = fmt::format(
+                "Joint preflight refused: {}; graphics called {}, context reason {}, capture reason {}, address 0x{:08X}; no saved state retained unless rollback failed",
+                mismatch,graphics_called,static_cast<int>(contexts.error),static_cast<int>(contexts.capture_error),contexts.offending_address);
             return SaveStateResult::ErrorMismatch;
         }
         LOG_INFO("Savestate session preflight: MATCH (memory layout, thread IDs, sync object IDs and graphics counts); not a full restore authorization.");
     }
     // Continuous exclusion covers temporary context application AND rollback.
     // Successful diagnostics do not commit a game restore.
-    const auto contexts = gxm::probe_context_restore_roundtrip(emuenv, host_pause, saved_graphics);
+    if (!graphics_called || !contexts) {
+        if (out_detail) *out_detail = "Joint graphics checkpoint was not reached; no saved state retained";
+        return SaveStateResult::ErrorMismatch;
+    }
     LOG_INFO("Savestate load diagnostic: context preparation reason {}, capture reason {}, address 0x{:08X}; temporary context changes rolled back.",
         static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     const auto result = emuenv.renderer->validate_snapshot_image_section(bytes, host_pause,
@@ -1380,7 +1394,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint RAM/CPU/sync roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint RAM/CPU/sync/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
@@ -1537,7 +1551,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             if (out_detail) *out_detail = "Unexpected data at end of saved state";
             return SaveStateResult::ErrorMismatch;
         }
-        return diagnose_saved_images(emuenv, *saved_graphics, *image_section, out_detail, [&]() -> std::string {
+        return diagnose_saved_images(emuenv, *saved_graphics, *image_section, out_detail, [&](const SnapshotRamJointCheck &graphics_checkpoint) -> std::string {
             if (kernel.threads.size() != thread_records.size())
                 return "Thread count changed since saving";
             for (const auto &rec : thread_records)
@@ -1570,7 +1584,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                     const auto cpu_result = probe_saved_cpu_contexts(kernel,thread_records,[&] {
                         joint_error = probe_saved_sync_values(kernel,sema_records,mutex_records,lwmutex_records,
                             eventflag_records,simple_event_records,[&] {
-                                simultaneous_check = verify_ram();
+                                simultaneous_check = graphics_checkpoint(verify_ram);
                                 return simultaneous_check;
                             });
                         return joint_error.empty();
@@ -1579,8 +1593,8 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                     return joint_error.empty();
                 });
             if (!ram_probe.empty()) return joint_error.empty() ? ram_probe : ram_probe + "; " + joint_error;
-            if (!simultaneous_check) return "Joint RAM/CPU/sync checkpoint was not reached";
-            LOG_INFO("Savestate joint probe: RAM/CPU/sync saved values coexisted; all rollbacks MATCH; no guest instructions, wait replay or game rewind.");
+            if (!simultaneous_check) return "Joint RAM/CPU/sync/context checkpoint was not reached";
+            LOG_INFO("Savestate joint probe: RAM/CPU/sync/context saved values coexisted; all rollbacks MATCH; no guest instructions, wait replay or game rewind.");
             return {};
         }); // Unconditional return: no retained RAM changes, wait aborts or replay.
     }

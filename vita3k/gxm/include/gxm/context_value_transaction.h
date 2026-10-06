@@ -46,6 +46,7 @@ class ContextValueTransaction {
     }
 
 public:
+    enum class ProbeResult { Passed, InvalidRecord, ApplyMismatch, CallbackFailed, RollbackFailed };
     ContextValueTransaction(const ContextValueTransaction &) = delete;
     ContextValueTransaction &operator=(const ContextValueTransaction &) = delete;
     ~ContextValueTransaction() { rollback(); }
@@ -111,6 +112,32 @@ public:
         rollback();
         const auto restored = capture();
         return matches && restored && encode_context_records(restored.records) == before;
+    }
+    // Nested stopped-session diagnostic. Unlike the legacy bool probe, this
+    // distinguishes an unverified undo so the outer transaction can veto Resume.
+    template<class Capture,class During>
+    ProbeResult probe_joint(std::span<const ContextLogicalRecord> saved,
+        std::span<const ContextLogicalRecord> original,Capture capture,During during) {
+        const auto expected=encode_context_records(saved),before=encode_context_records(original);
+        if(!expected||!before||!apply())return ProbeResult::InvalidRecord;
+        struct Undo {ContextValueTransaction &tx;~Undo(){tx.rollback();}} undo{*this};
+        auto result=ProbeResult::Passed;
+        const auto matches=[&](const auto &bytes) {
+            const auto value=capture();
+            return value&&encode_context_records(value.records)==bytes;
+        };
+        try {
+            if(!matches(expected))result=ProbeResult::ApplyMismatch;
+            else {
+                try {if(!during())result=ProbeResult::CallbackFailed;}
+                catch(...){result=ProbeResult::CallbackFailed;}
+                if(!matches(expected))result=ProbeResult::ApplyMismatch;
+            }
+        }catch(...){result=ProbeResult::ApplyMismatch;}
+        rollback();
+        try {if(!matches(before))return ProbeResult::RollbackFailed;}
+        catch(...){return ProbeResult::RollbackFailed;}
+        return result;
     }
     // Only the future outer transaction may accept after ALL domains succeed.
     bool accept() noexcept {

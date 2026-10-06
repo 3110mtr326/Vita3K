@@ -6,7 +6,7 @@ s=Path(__file__).resolve().parents[2]
 t=(s/'vita3k/app/src/savestate.cpp').read_text()
 a=t.index('    // -- Memory --',t.index('SaveStateResult load_state('));b=t.index('    // -- Threads --',a)
 ram=t[a:b]
-a=t.index('[&]() -> std::string {',b)+len('[&]() -> std::string {')
+a=t.index('[&](const SnapshotRamJointCheck &graphics_checkpoint) -> std::string {',b)+len('[&](const SnapshotRamJointCheck &graphics_checkpoint) -> std::string {')
 b=t.index('        }); // Unconditional return',a)
 check=t[a:b]
 code=r'''
@@ -44,6 +44,7 @@ std::string probe_saved_sync_values(Kernel&,int,int,int,int,int,const std::funct
 template<class E,class R>std::string audit_saved_ram(E&,std::istream&,const R&){return {};}
 template<class E,class R,class F>std::string probe_saved_ram(E&,std::istream&,const R&,F f){return f([]{return true;})?"":"RAM failed";}
 std::string validate(int mode){
+ const auto graphics_checkpoint=[](const std::function<bool()> &verify){return verify();};
  std::istringstream in;
  Kernel kernel;Mem mem;struct {Counts gxm;} emuenv;
  std::vector<Thread> thread_records{{1}};

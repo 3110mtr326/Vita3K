@@ -1,6 +1,9 @@
 // Vita3K emulator project
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <gxm/context_value_transaction.h>
+#include <app/savestate_ram_batch.h>
+#include <app/savestate_cpu_probe.h>
+#include <app/savestate_value_probe.h>
 #include <bitset>
 #include <cassert>
 #include <iostream>
@@ -83,6 +86,64 @@ int main() {
         } catch(const std::runtime_error&) {assert(fail%2);}
         assert(encode_context_records(capture().records)==original);
         assert(!tx->accept());
+    }
+
+    for(int mode=0;mode<9;++mode) {
+        auto tx=prepare();assert(tx);int captures=0,checks=0;
+        using R=Transaction::ProbeResult;
+        auto result=tx->probe_joint(saved,current.records,[&] {
+            const int call=captures++;
+            if(mode>=3 && call==(mode-3)/2) {
+                if(mode%2==0)throw std::runtime_error("joint capture failure");
+                auto bad=capture();bad.records[0].vertex_texture_dirty^=1;return bad;
+            }
+            return capture();
+        },[&] {
+            ++checks;assert(encode_context_records(capture().records)==encode_context_records(saved));
+            if(mode==2)throw std::runtime_error("nested RAM verification");
+            return mode!=1;
+        });
+        if(mode==0)assert(result==R::Passed&&checks==1);
+        if(mode==1||mode==2)assert(result==R::CallbackFailed);
+        if(mode>=3&&mode<=6)assert(result==R::ApplyMismatch);
+        if(mode>=7)assert(result==R::RollbackFailed);
+        assert(encode_context_records(capture().records)==original);
+        assert(!tx->accept());
+    }
+    // Real four-domain helpers, modeled backends: verify simultaneous values
+    // at the innermost checkpoint and all originals after nested exceptions.
+    for(bool fail:{false,true}) {
+        using namespace app;
+        struct Cpu{SnapshotCpuValues value{};}cpu;
+        SnapshotCpuValues saved_cpu{};saved_cpu.context.cpu_registers[0]=9;
+        std::vector<SnapshotCpuTarget<Cpu>> targets{{&cpu,saved_cpu}};
+        std::vector<uint8_t> ram(12288,'B');const auto original_ram=ram;
+        std::istringstream in(std::string(8192,'A'));int sync=10,checkpoints=0;
+        SnapshotRamProbeStats stats;
+        const auto result=probe_snapshot_ram_batch(in,{{4096,8192,0}},
+            [&](auto addr,auto out,auto size){std::memcpy(out,ram.data()+addr,size);return true;},
+            [&](auto addr,auto data,auto size){std::memcpy(ram.data()+addr,data,size);return true;},[]{return false;},
+            [&](const auto &verify_ram){
+                const auto cpu_result=probe_snapshot_cpu_values<Cpu>(targets,[](Cpu&c){return c.value;},
+                    [](Cpu&c,const auto&v){c.value=v;},[&]{
+                        SnapshotValueProbe sync_values;sync_values.stage(sync,20);
+                        return sync_values.probe_with([&]{
+                            auto tx=prepare();assert(tx);
+                            return tx->probe_joint(saved,current.records,capture,[&]{
+                                assert(cpu.value.context.cpu_registers[0]==9&&sync==20);
+                                assert(encode_context_records(capture().records)==encode_context_records(saved));
+                                assert(verify_ram());++checkpoints;
+                                if(fail)throw std::runtime_error("four-domain checkpoint");
+                                return true;
+                            })==Transaction::ProbeResult::Passed;
+                        })==SnapshotValueProbe::Result::Passed;
+                    });
+                return cpu_result==SnapshotCpuProbe::Passed;
+            },stats);
+        assert(result==(fail?SnapshotRamBatchResult::JointFailed:SnapshotRamBatchResult::Passed));
+        assert(checkpoints==1&&ram==original_ram&&sync==10);
+        assert(same_snapshot_cpu_values(cpu.value,SnapshotCpuValues{}));
+        assert(encode_context_records(capture().records)==original);
     }
     {auto tx=prepare();assert(tx&&tx->apply()&&tx->accept());assert(!tx->accept());}
     assert(encode_context_records(capture().records)==encode_context_records(saved));

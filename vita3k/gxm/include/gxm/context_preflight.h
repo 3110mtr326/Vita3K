@@ -5,12 +5,13 @@
 
 #include <gxm/context_snapshot.h>
 #include <limits>
+#include <functional>
 
 namespace gxm {
 
 enum class ContextPreflightError {
     None, CurrentCaptureFailed, ContextChanged, InvalidRecord,
-    ActiveScene, ProgramChanged, AllocatorChanged
+    ActiveScene, ProgramChanged, AllocatorChanged, ProtectedContext, JointCheckFailed, RollbackFailed
 };
 
 struct ContextPreflightResult {
@@ -84,5 +85,12 @@ inline ContextPreflightResult preflight_context_records(
 // rollback on exceptions. No changes are committed; this is not a full restore.
 ContextPreflightResult probe_context_restore_roundtrip(EmuEnvState &emuenv,
     const renderer::HostQuiescence &host_pause, std::span<const ContextLogicalRecord> saved);
+
+// Joint diagnostic only: caller additionally owns MemState generation_mutex and
+// protect_mutex, as well as kernel/thread/host exclusion. Refuses inaccessible
+// contexts rather than invoking fault callbacks while those mutexes are pinned.
+ContextPreflightResult probe_context_restore_joint(EmuEnvState &emuenv,
+    const renderer::HostQuiescence &host_pause,std::span<const ContextLogicalRecord> saved,
+    const std::function<bool()> &during);
 
 } // namespace gxm

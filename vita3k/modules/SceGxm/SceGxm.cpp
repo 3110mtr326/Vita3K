@@ -1429,6 +1429,71 @@ ContextPreflightResult probe_context_restore_roundtrip(EmuEnvState &emuenv,
     return matched ? ContextPreflightResult{} : ContextPreflightResult{ContextPreflightError::InvalidRecord, 0};
 }
 
+ContextPreflightResult probe_context_restore_joint(EmuEnvState &emuenv,
+    const renderer::HostQuiescence &host_pause,std::span<const ContextLogicalRecord> saved,
+    const std::function<bool()> &during) {
+    // Caller pins allocation/protection metadata. Do not call is_protecting()
+    // here: that would attempt to take the same nonrecursive mutex again.
+    auto &mem=emuenv.mem;
+    const uint64_t page=mem.host_page_size;
+    if(!page||(page&(page-1))||!mem.memory||!host_pause||!emuenv.kernel.is_threads_paused())
+        return {ContextPreflightError::ProtectedContext,0};
+    if(emuenv.kernel.snapshot_restore_failed||!emuenv.renderer||emuenv.renderer->render_abort.load())
+        return {ContextPreflightError::JointCheckFailed,0};
+    // Validate LIVE registry addresses before capture dereferences a context.
+    const auto accessible=[&](uint64_t address) {
+        const uint64_t end=address+sizeof(SceGxmContext);
+        if(address<page||end>(1ULL<<32))return false;
+        const auto overlaps=[&](uint64_t base,uint64_t size) {
+            const auto first=base&~(page-1),last=(base+size+page-1)&~(page-1);
+            return address<last&&end>first;
+        };
+        for(const auto &[base,segment]:mem.protect_tree)
+            if(overlaps(base,segment.size))return false;
+        for(const auto &[host,mapping]:mem.external_mapping)
+            if(overlaps(mapping.address,mapping.size))return false;
+        for(const auto &[base,mapping]:emuenv.gxm.memory_mapped_regions)
+            if(overlaps(base,mapping.size))return false;
+        for(uint64_t a=address&~uint64_t(4095);a<end;a+=4096) {
+            const auto index=a/4096;
+            if(index>=mem.allocator.max_offset||index/32>=mem.allocator.words.size()
+                ||((mem.allocator.words[index/32]>>(31-index%32))&1))return false;
+            if(mem.use_page_table&&(!mem.page_table||mem.page_table[index]!=mem.memory.get()))return false;
+        }
+        return true;
+    };
+    if(emuenv.gxm.immediate_context&&!accessible(emuenv.gxm.immediate_context))
+        return {ContextPreflightError::ProtectedContext,emuenv.gxm.immediate_context};
+    for(const auto &[context,address]:emuenv.gxm.deferred_contexts) {
+        if(!accessible(address)||reinterpret_cast<const uint8_t *>(context)!=mem.memory.get()+address)
+            return {ContextPreflightError::ProtectedContext,address};
+    }
+    const auto current=capture_context_records(emuenv,host_pause);
+    const auto checked=preflight_context_records(saved,current,emuenv.gxm.vertex_program_identities,
+        emuenv.gxm.fragment_program_identities);
+    if(!checked)return checked;
+    using Transaction=detail::ContextValueTransaction<SceGxmContext>;
+    const auto values=Transaction::prepare(saved,current,emuenv.gxm.vertex_program_identities,
+        emuenv.gxm.fragment_program_identities,[&](uint32_t address)->SceGxmContext * {
+            if(address==emuenv.gxm.immediate_context)return Ptr<SceGxmContext>(address).get(mem);
+            for(const auto &[context,registered]:emuenv.gxm.deferred_contexts)
+                if(registered==address)return context;
+            return nullptr;
+        });
+    if(!values)return {ContextPreflightError::InvalidRecord,0};
+    const auto result=values->probe_joint(saved,current.records,
+        [&]{return capture_context_records(emuenv,host_pause);},[&]{return during&&during();});
+    if(result==Transaction::ProbeResult::RollbackFailed) {
+        emuenv.kernel.snapshot_restore_failed=true;
+        emuenv.renderer->render_abort.store(true);
+        LOG_ERROR("Savestate context joint probe: rollback FAILED; Resume blocked; restart app required.");
+        return {ContextPreflightError::RollbackFailed,0};
+    }
+    if(result!=Transaction::ProbeResult::Passed)return {ContextPreflightError::JointCheckFailed,0};
+    LOG_INFO("Savestate context joint probe: saved logical values MATCH; nested checkpoint MATCH; rollback MATCH; {} contexts.",saved.size());
+    return {};
+}
+
 std::vector<std::pair<uint32_t, uint32_t>> get_host_object_ranges(EmuEnvState &emuenv) {
     std::vector<std::pair<uint32_t, uint32_t>> ranges;
     GxmState &gxm = emuenv.gxm;

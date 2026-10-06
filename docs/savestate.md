@@ -4,7 +4,66 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Joint RAM/CPU/synchronization device checkpoint (latest change)
+## Joint logical graphics checkpoint (latest change)
+
+Previous device result (2026-10-06 15:06): RAM/CPU/sync simultaneous checkpoint and
+all rollbacks passed. 311,733,448 eligible RAM bytes inspected; 15,604,196 bytes
+staged in 281 chunks, 180 ms. CPU 23 threads and sync 349 fields matched. Separate
+context/GPU probes also passed, and Resume controls/audio/rendering were normal.
+
+Load now nests the logical GXM context transaction inside the existing stopped
+RAM -> CPU -> sync transaction. At the innermost point all four domains contain
+saved values, and the saved RAM verifier runs there. Context values are captured
+and compared before and after this callback, then undone and verified. Outer sync,
+CPU and RAM domains undo and verify in that order. The GPU image transfer probe
+runs only AFTER all four domains have returned to their current-session originals.
+This integrates guest-facing context values, not GPU pixels or backend draw state.
+
+The new GXM entry requires the same continuous kernel/thread/host exclusion PLUS
+the generation/protection metadata locks already held by the RAM probe. It reads
+the pinned protection metadata directly; it never calls lock-taking is_protecting
+or unprotects memory. Live context addresses must be allocated, outside the null
+guard, have ordinary page-table backing and not overlap host-page-rounded protected,
+external or GXM-mapped ranges. Deferred registry pointers must agree with their guest
+addresses. These checks precede context capture, so an inaccessible context cannot
+trigger a fault callback that waits for the already held memory mutex. Existing
+identity/program/allocator and idle-scene checks remain required before any write.
+
+The new context transaction distinguishes saved-value mismatch, callback failure
+and unverified rollback. Capture/encoding exceptions while applied still cause undo;
+a failed or throwing original-value verification is a rollback failure and persistently
+sets kernel resume veto plus renderer abort. Preparation allocation exceptions occur
+before context writes and unwind through the existing outer-domain rollback handlers.
+An exception before the GXM result is assigned leaves an explicit failed-attempt
+diagnostic, never a default context-success code. Any refused or failed joint graphics
+checkpoint skips GPU probing and reports context/capture reason and address.
+
+New success markers:
+- `Savestate context joint probe: saved logical values MATCH; nested checkpoint MATCH; rollback MATCH`
+- `Savestate joint probe: RAM/CPU/sync/context saved values coexisted; all rollbacks MATCH`
+UI: `Joint RAM/CPU/sync/context roundtrip checked`.
+Zero live contexts is an empty domain; the context count in the log distinguishes it
+from an exercised context. The targeted FFX scene normally has an immediate context.
+
+No guest instructions execute, no waits are replayed, no game rewind is committed.
+NGS/audio, excluded/mapped RAM, backend rendering and complete native-wait restoration
+remain unresolved. Format stays v9. The 64 MiB combined RAM backup budget is unchanged.
+
+Host verification: syntax of savestate.cpp and actual SceGxm.cpp; real context-value
+helper tests for nested success/false/exception and capture failures before, during
+and after undo; simultaneous four-domain modeled-backend test with the real helpers;
+extracted GXM adapter tests for protected, mapped, freed, alternate and mismatched
+addresses before capture, and persistent rollback veto. Production Load-flow tests
+cover missing/duplicate/failed graphics checkpoints, GPU skip on joint refusal,
+pause cleanup and exceptions. Existing session layout tests pass. These checks are
+not an Android build or phone verification.
+
+Device: fresh Save, Resume for several seconds, Load once. Send screenshot/log and
+report Resume controls/audio/rendering. A protection refusal is a valid safe refusal,
+not a request to disable guards. On rollback-failed or gpu-transfer-failed messages,
+restart without Resume. Unsupported full restoration remains the expected UI result.
+
+## Joint RAM/CPU/synchronization device checkpoint (previous checkpoint)
 
 Previous device result (2026-10-06 14:09): 311,730,824 eligible RAM bytes inspected;
 17,435,872 bytes in 376 differing chunks temporarily changed and restored in 460 ms.
