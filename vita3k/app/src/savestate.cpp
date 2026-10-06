@@ -698,6 +698,63 @@ bool read_host_state(fs::ifstream &in, std::vector<IoFileRecord> &io_files,
 // What is only logged: kernel objects (semaphores, ...) that were created or
 // destroyed since the save, and GXM object counts. A game that uses an
 // object destroyed after the save will see errors; see docs/savestate.md.
+// Runs only under the final kernel/thread/renderer exclusion. Never opens or writes files.
+static std::string probe_saved_file_positions(EmuEnvState &emuenv, const std::vector<IoFileRecord> &saved) {
+    struct Target { const FileStats *file; int64_t before, after; };
+    std::vector<Target> targets;
+    std::set<SceUID> ids;
+    size_t regular_count = 0;
+    for (const auto &[fd, file] : emuenv.io.std_files)
+        if (file.is_regular_file()) ++regular_count;
+    if (regular_count != saved.size()) return "Open file count changed since saving";
+    // Finish all validation and allocation before the first seek.
+    for (const auto &rec : saved) {
+        if (!ids.insert(rec.fd).second || rec.offset < 0) return "Invalid saved file record";
+        const auto it = emuenv.io.std_files.find(rec.fd);
+        if (it == emuenv.io.std_files.end()) return "Open file ID changed since saving";
+        const auto &file = it->second;
+        if (!file.is_regular_file() || file.get_open_mode() != rec.open_mode
+            || file.get_vita_loc() != rec.vita_loc || file.get_translated_path() != rec.translated
+            || file.get_system_location().generic_string() != rec.sys_loc)
+            return "Open file identity changed since saving";
+        const auto before = file.tell();
+        FILE *stream = file.get_file_pointer();
+        if (!stream || before < 0) return "File position is unavailable";
+        // Seeking clears EOF and can flush writable streams. Neither is reversible here.
+        if (std::feof(stream) || std::ferror(stream)) return "Open file has EOF or error state; position probe refused";
+        if (can_write(rec.open_mode)) return "Writable open file requires unsupported restoration";
+        targets.push_back({&file, before, rec.offset});
+    }
+    size_t touched = 0;
+    bool applied = true;
+    for (const auto &target : targets) {
+        ++touched; // A failed seek may still have changed stream state.
+        if (!target.file->seek(target.after, SCE_SEEK_SET) || target.file->tell() != target.after) {
+            applied = false;
+            break;
+        }
+    }
+    for (size_t i = 0; i < touched; ++i)
+        if (targets[i].file->tell() != targets[i].after) applied = false;
+    bool restored = true;
+    while (touched) {
+        const auto &target = targets[--touched];
+        if (!target.file->seek(target.before, SCE_SEEK_SET)) restored = false;
+    }
+    for (const auto &target : targets) {
+        const auto stream = target.file->get_file_pointer();
+        if (target.file->tell() != target.before || std::feof(stream) || std::ferror(stream)) restored = false;
+    }
+    if (!restored) {
+        emuenv.kernel.snapshot_restore_failed = true;
+        if (emuenv.renderer) emuenv.renderer->render_abort = true;
+        return "File position rollback failed; restart the application";
+    }
+    if (!applied) return "Saved file position probe failed; original positions restored";
+    LOG_INFO("Savestate file position probe: saved offsets MATCH; rollback MATCH; {} read-only files. Separate from RAM/context probe; no file contents restored.", targets.size());
+    return {};
+}
+
 std::string reconcile_host_state(EmuEnvState &emuenv, const std::vector<IoFileRecord> &saved_files,
     const std::vector<ObjectSetRecord> &saved_sets, const GxmCountsRecord &saved_gxm) {
     int closed = 0, reopened = 0, repositioned = 0, failed = 0, skipped_writable = 0;
@@ -1394,7 +1451,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint RAM/CPU/sync/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "File positions checked; joint RAM/CPU/sync/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
@@ -1575,6 +1632,8 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 || counts.deferred_contexts != saved_gxm_counts.deferred_contexts
                 || counts.immediate_context != saved_gxm_counts.immediate_context)
                 return "Graphics object counts changed since saving";
+            const auto file_result = probe_saved_file_positions(emuenv, saved_io_files);
+            if (!file_result.empty()) return file_result;
             const auto ram_result = audit_saved_ram(emuenv,in,pending_regions);
             if (!ram_result.empty()) return ram_result;
             std::string joint_error;

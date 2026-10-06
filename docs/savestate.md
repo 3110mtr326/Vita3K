@@ -4,7 +4,35 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Joint logical graphics checkpoint (latest change)
+## Read-only file position checkpoint (latest change)
+
+Previous phone test passed the joint RAM/CPU/sync/context probe and Resume was
+normal (2026-10-06 16:23). Full game rewind remains unavailable.
+
+Before RAM probing, Load now validates the complete regular-file descriptor set,
+paths, open modes and nonnegative saved offsets against the currently open files.
+All preparation completes before seeking. Writable files and streams with EOF/error
+indicators are refused, because seeking could flush output or clear EOF state.
+The probe seeks existing read-only streams to saved offsets, verifies them, then
+seeks every touched stream back and verifies all original positions and indicators.
+A failed seek is included in rollback. Unverified rollback sets the persistent
+kernel resume veto and renderer abort. No files are opened, closed or written.
+
+This probe is SEPARATE from the RAM/CPU/sync/context transaction; offsets are back
+at their current-session values before RAM is touched. It runs under the existing
+final kernel/thread/renderer exclusion. File identity is descriptor/path/mode only;
+this does not prove unchanged file content or distinguish close/reopen reuse. It
+cannot restore directory traversal, file contents, writable handles or audio.
+Format remains v9. An empty regular-file set exercises no file seeks.
+
+Marker: Savestate file position probe: saved offsets MATCH; rollback MATCH.
+UI begins File positions checked only after successful subsequent joint probes.
+Host checks: actual savestate.cpp syntax; extracted production file-position probe
+with 10 cases including writable/EOF/identity refusal, apply failure and rollback
+failure; existing production session layout and Load diagnostic tests. No Android
+build or device result is claimed for this checkpoint.
+
+## Joint logical graphics checkpoint (previous checkpoint)
 
 Previous device result (2026-10-06 15:06): RAM/CPU/sync simultaneous checkpoint and
 all rollbacks passed. 311,733,448 eligible RAM bytes inspected; 15,604,196 bytes
