@@ -40,6 +40,7 @@ auto collect_gxm_counts(Counts c){return c;}
 std::string probe_saved_cpu_contexts(Kernel&,const std::vector<Thread>&){return {};}
 std::string probe_saved_sync_values(Kernel&,int,int,int,int,int){return {};}
 template<class E,class R>std::string audit_saved_ram(E&,std::istream&,const R&){return {};}
+template<class E,class R>std::string probe_saved_ram(E&,std::istream&,const R&){return {};}
 std::string validate(int mode){
  std::istringstream in;
  Kernel kernel;Mem mem;struct {Counts gxm;} emuenv;

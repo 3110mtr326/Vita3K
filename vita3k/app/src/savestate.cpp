@@ -18,6 +18,10 @@
 // ---------------------------------------------------------------------------
 // How savestates work here (please read before extending)
 // ---------------------------------------------------------------------------
+// The normal graphics path currently runs reversible RAM/CPU/sync/GPU probes
+// and returns unsupported; it does NOT run the legacy restore sequence below.
+// RAM probing excludes protected/mapped memory and embedded host objects.
+// A successful probe is not authorization to commit the saved game state.
 // Vita3K runs every guest (emulated) thread on its own real host OS thread.
 // A guest thread blocked in a kernel wait (sceKernelWaitSema, sceKernelLockMutex,
 // sceKernelWaitEventFlag, sceKernelWaitCond, ...) is parked several native
@@ -96,12 +100,15 @@
 #include <app/savestate_cpu_probe.h>
 #include <app/savestate_value_probe.h>
 #include <app/savestate_ram_audit.h>
+#include <app/savestate_ram_probe.h>
+#include <dialog/state.h>
 #include <functional>
 #include <audio/state.h>
 #include <ngs/state.h>
 #include <ngs/system.h>
 
 #include <emuenv/state.h>
+#include <gdbstub/state.h>
 #include <kernel/state.h>
 #include <kernel/thread/thread_state.h>
 #include <mem/functions.h>
@@ -842,13 +849,14 @@ static std::string probe_saved_sync_values(KernelState &kernel,
 // does not authorize writes: NGS arenas are deliberately excluded in full,
 // including their guest parameter data, until logical audio restoration exists.
 template<class Regions>
-static std::string audit_saved_ram(EmuEnvState &emuenv, std::istream &in, const Regions &regions) {
-    std::vector<SnapshotRamRange> exclusions;
+static std::string collect_snapshot_host_ram_ranges(EmuEnvState &emuenv, const Regions &regions,
+    std::vector<SnapshotRamRange> &exclusions, size_t &ngs_start) {
+    exclusions.clear();
     for (const auto &[address,size] : gxm::get_host_object_ranges(emuenv)) {
         if (!size) return "Empty GXM host memory range";
         exclusions.emplace_back(address,uint64_t(address)+size);
     }
-    const auto ngs_start = exclusions.size();
+    ngs_start = exclusions.size();
     const auto arena = [&](const auto *object) -> bool {
         if (!object) return false;
         const auto base = reinterpret_cast<uintptr_t>(emuenv.mem.memory.get());
@@ -869,6 +877,15 @@ static std::string audit_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
         for (const auto *rack : system->racks)
             if (rack && !arena(rack)) return "Invalid NGS rack arena";
     }
+    return {};
+}
+
+template<class Regions>
+static std::string audit_saved_ram(EmuEnvState &emuenv, std::istream &in, const Regions &regions) {
+    std::vector<SnapshotRamRange> exclusions;
+    size_t ngs_start = 0;
+    const auto preparation = collect_snapshot_host_ram_ranges(emuenv,regions,exclusions,ngs_start);
+    if (!preparation.empty()) return preparation;
     SnapshotRamAudit stats;
     const auto start = std::chrono::steady_clock::now();
     const auto deadline = start + std::chrono::seconds(10);
@@ -883,6 +900,97 @@ static std::string audit_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
     LOG_INFO("Savestate RAM audit: READ COMPLETE; {} read bytes, {} compared bytes, {} excluded bytes, {} differing chunks; {} GXM and {} NGS ranges; {} ms; no RAM written. Payload authenticity and full restore remain unverified.",
         stats.read_bytes,stats.compared_bytes,stats.excluded_bytes,stats.differing_chunks,
         ngs_start,exclusions.size()-ngs_start,
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count());
+    return {};
+}
+
+// Exclusion is deliberately conservative: never unprotect pages, remap memory,
+// touch GPU-mapped bytes or signal waits. KernelSnapshotGuard and HostQuiescence
+// remain held by the diagnostic caller throughout. No guest instructions execute
+// between apply and undo, so the original translated-code cache remains valid.
+template<class Regions>
+static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const Regions &regions) {
+    auto &mem = emuenv.mem;
+    auto &kernel = emuenv.kernel;
+    if (kernel.snapshot_restore_failed) return "Previous rollback failed; restart the app";
+    if (!emuenv.renderer || emuenv.renderer->render_abort.load()) return "Renderer is unavailable for RAM probe";
+    if (emuenv.gdb.server_thread) return "RAM probe unavailable with debugger server enabled";
+    std::unique_lock<std::recursive_mutex> dialog(emuenv.common_dialog.mutex,std::try_to_lock);
+    if (!dialog.owns_lock() || emuenv.common_dialog.type != NO_DIALOG)
+        return "RAM probe unavailable while a system dialog is active";
+    std::vector<SnapshotRamRange> exclusions;
+    size_t ngs_start = 0;
+    const auto preparation = collect_snapshot_host_ram_ranges(emuenv,regions,exclusions,ngs_start);
+    if (!preparation.empty()) return preparation;
+    for (const auto &[begin,end] : exclusions)
+        if (!snapshot_ram_covered(regions,begin,end)) return "Invalid host object exclusion for RAM probe";
+
+    std::unique_lock<std::mutex> allocations(mem.generation_mutex,std::try_to_lock);
+    if (!allocations.owns_lock()) return "Memory allocator is busy; RAM probe not started";
+    std::unique_lock<std::mutex> protection(mem.protect_mutex,std::try_to_lock);
+    if (!protection.owns_lock()) return "Memory protection is busy; RAM probe not started";
+    const uint64_t page = mem.host_page_size;
+    if (!page || (page & (page-1))) return "Invalid host page size";
+    if (!mem.memory) return "Guest RAM is unavailable";
+    const auto exclude_pages = [&](uint64_t address,uint64_t size) {
+        if (!size || address+size > (1ULL << 32)) return false;
+        exclusions.emplace_back(address & ~(page-1),(address+size+page-1) & ~(page-1));
+        return exclusions.back().second <= (1ULL << 32);
+    };
+    for (const auto &[address,segment] : mem.protect_tree)
+        if (!exclude_pages(address,segment.size)) return "Invalid protected RAM range";
+    for (const auto &[host,mapping] : mem.external_mapping)
+        if (!exclude_pages(mapping.address,mapping.size)) return "Invalid external RAM mapping";
+    for (const auto &[address,mapping] : emuenv.gxm.memory_mapped_regions)
+        if (!exclude_pages(address,mapping.size)) return "Invalid GPU RAM mapping";
+    std::vector<SnapshotRamSpan> spans;
+    if (!plan_snapshot_ram_probe(regions,exclusions,spans)) return "Invalid RAM probe plan";
+    uint64_t planned_bytes = 0;
+    for (const auto &span : spans) {
+        planned_bytes += span.size;
+        // Recheck allocation bits after pinning generation_mutex, in case
+        // anything changed between the earlier session layout check and here.
+        for (uint64_t address = span.address & ~uint64_t(4095); address < span.address+span.size; address += 4096) {
+            const auto index = address/4096;
+            if (address < page || index >= mem.allocator.max_offset || index/32 >= mem.allocator.words.size()
+                || ((mem.allocator.words[index/32] >> (31-index%32)) & 1))
+                return "Guest RAM allocation changed before probe";
+        }
+        // An untracked alternate page-table backing cannot be accessed through
+        // mem.memory. Refuse it before the first write rather than provoking a
+        // protection callback while holding protect_mutex.
+        if (mem.use_page_table) {
+            if (!mem.page_table) return "Missing guest page table";
+            for (uint64_t address = span.address & ~uint64_t(4095); address < span.address+span.size; address += 4096)
+                if (mem.page_table[address/4096] != mem.memory.get())
+                    return "Untracked external page in RAM probe plan";
+        }
+    }
+    if (!planned_bytes) return "No eligible unprotected RAM for roundtrip probe";
+    LOG_INFO("Savestate RAM probe: starting {} eligible bytes; protected, external, GPU-mapped and host-object ranges excluded.",planned_bytes);
+    SnapshotRamProbeStats stats;
+    const auto start = std::chrono::steady_clock::now();
+    const auto result = probe_snapshot_ram(in,spans,
+        [&](uint64_t address,uint8_t *data,size_t size) noexcept {
+            std::memcpy(data,mem.memory.get()+address,size); return true;
+        }, [&](uint64_t address,const uint8_t *data,size_t size) noexcept {
+            std::memcpy(mem.memory.get()+address,data,size); return true;
+        }, [&] { return std::chrono::steady_clock::now()-start >= std::chrono::seconds(10); },stats);
+    if (result == SnapshotRamProbeResult::RollbackFailed) {
+        kernel.snapshot_restore_failed = true;
+        emuenv.renderer->render_abort.store(true);
+        LOG_ERROR("Savestate RAM probe: rollback FAILED; Resume blocked; restart app required.");
+        return "RAM rollback failed; restart the app without Resume";
+    }
+    if (result != SnapshotRamProbeResult::Passed) {
+        LOG_WARN("Savestate RAM probe: incomplete (reason {}), {} compared bytes, {} changed chunks restored; no saved RAM retained.",
+            static_cast<int>(result),stats.compared_bytes,stats.changed_chunks);
+        return result == SnapshotRamProbeResult::NoChanges
+            ? "RAM probe inconclusive: no changed eligible bytes; no saved RAM retained"
+            : "RAM probe incomplete; original RAM retained; see log";
+    }
+    LOG_INFO("Savestate RAM probe: saved bytes MATCH; rollback MATCH; {} compared bytes, {} temporarily changed bytes in {} chunks; {} ms; exclusions retained; no game rewind committed.",
+        stats.compared_bytes,stats.changed_bytes,stats.changed_chunks,
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count());
     return {};
 }
@@ -1201,7 +1309,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     return SaveStateResult::Success;
 }
 
-// Diagnostic only. Always return before thread abort/replay or saved RAM writes.
+// Diagnostic only. Temporary RAM/CPU/sync/GPU probes undo their changes; no wait abort/replay.
 static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const std::vector<gxm::ContextLogicalRecord> &saved_graphics,
     const std::vector<uint8_t> &bytes, std::string *out_detail, const std::function<std::string()> &session_check = {}) {
@@ -1237,8 +1345,8 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     if (session_check) {
         const auto mismatch = session_check();
         if (!mismatch.empty()) {
-            LOG_INFO("Savestate session preflight: REFUSED: {}; no saved state applied.", mismatch);
-            if (out_detail) *out_detail = "Session preflight refused: " + mismatch + "; no saved state applied";
+            LOG_INFO("Savestate session preflight: REFUSED: {}; no saved state retained unless rollback failed.", mismatch);
+            if (out_detail) *out_detail = "Session preflight refused: " + mismatch + "; no saved state retained (unless rollback failed)";
             return SaveStateResult::ErrorMismatch;
         }
         LOG_INFO("Savestate session preflight: MATCH (memory layout, thread IDs, sync object IDs and graphics counts); not a full restore authorization.");
@@ -1259,9 +1367,9 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Prepared ? "prepared"
         : result == renderer::SnapshotImageValidation::InvalidData ? "invalid-data"
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
-    LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM applied or game rewind committed.", stage);
+    LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "RAM read audit, session layout, CPU and sync roundtrip checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "RAM, CPU and sync roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
@@ -1444,10 +1552,12 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 return "Graphics object counts changed since saving";
             const auto ram_result = audit_saved_ram(emuenv,in,pending_regions);
             if (!ram_result.empty()) return ram_result;
+            const auto ram_probe = probe_saved_ram(emuenv,in,pending_regions);
+            if (!ram_probe.empty()) return ram_probe;
             const auto cpu_result=probe_saved_cpu_contexts(kernel, thread_records);
             if(!cpu_result.empty())return cpu_result;
             return probe_saved_sync_values(kernel,sema_records,mutex_records,lwmutex_records,eventflag_records,simple_event_records);
-        }); // Unconditional return: no saved RAM writes, wait aborts or replay.
+        }); // Unconditional return: no retained RAM changes, wait aborts or replay.
     }
 
     std::vector<ThreadStatePtr> thread_handles; // parallel to thread_records

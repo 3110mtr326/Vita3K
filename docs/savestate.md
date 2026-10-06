@@ -4,7 +4,67 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Bounded RAM read audit device checkpoint (latest change)
+## Excluded-range RAM apply/rollback device checkpoint (latest change)
+
+Previous device result (2026-10-06 13:12): RAM read audit completed 450,912,256
+bytes in 520 ms, with 45,880 excluded bytes (337 GXM and 3 NGS ranges) and 501
+differing chunks. CPU (23 threads), synchronization (349 fields), context and
+live GPU temporary apply/rollback matched; Resume controls/audio/rendering normal.
+
+Load now performs an actual temporary RAM apply/rollback after the read audit,
+before CPU/sync/context/GPU probes. A shared collector identifies embedded GXM
+objects and full NGS system/rack arenas. In addition, the RAM probe excludes ALL
+tracked protection segments, external mappings and GXM-mapped guest ranges,
+rounded outward to host pages. These extra exclusions are intentionally broader
+than the previous read audit; its compared-byte count is not write coverage.
+
+The existing final kernel/primitive/thread/display and renderer/writeback exclusion
+remains held. New nonblocking allocation/protection locks pin metadata throughout
+planning and execution. Allocation bits are rechecked under the allocation lock;
+alternate or absent page-table backing is refused before any write. Active GDB
+servers or common dialogs refuse the probe; the common-dialog mutex stays held.
+No pages are unprotected, no mappings changed, no protection callbacks invoked,
+no guest instructions executed and no wait queues signalled. SDL/cubeb output
+callbacks consume host buffers; existing snapshot acquisition already excludes
+threads still submitting guest audio buffers. NGS guest execution is parked and
+its entire host-object arenas remain untouched.
+
+Fixed buffers total 192 KiB. Each eligible chunk (at most 64 KiB) is backed up,
+temporarily changed only if different, read back against saved bytes, restored,
+and read back against original bytes. Undo is attempted after partial/throwing
+callbacks too. No file I/O, allocation, deadline check or next chunk occurs while
+a chunk differs. A failed/unverifiable undo sets persistent kernel resume veto
+AND renderer abort, requiring restart. Other failures return only after successful
+undo of prior writes. OS faults are not C++ exceptions; avoiding inaccessible pages
+depends on the pinned exclusion/allocation/page-table checks, not exception recovery.
+The ten-second deadline is checked between chunks; blocking OS reads cannot be
+interrupted by it. Since no CPU executes and original bytes are restored before
+release, the original JIT cache is retained.
+
+Marker: `Savestate RAM probe: saved bytes MATCH; rollback MATCH`, with eligible
+compared bytes, temporarily changed bytes/chunks and elapsed time. Changed byte
+count measures lengths of changed chunks, not individual differing bytes. An empty
+eligible plan or zero changed chunks is inconclusive, not a successful write test.
+The UI includes `RAM, CPU and sync roundtrip checked` only on successful preflight.
+
+This is NOT whole-memory restoration: excluded areas are not tested, and only one
+chunk is changed at a time. No saved state persists and no game rewind is committed.
+Audio logical state, native waits and an atomic full restore remain unfinished.
+Format v9 remains unchanged and does not authenticate same-size payload corruption.
+
+Host checks: production savestate.cpp syntax; RAM planner and chunk transaction
+tests with overlap, holes, truncation, read/write/match faults, partial writes,
+rollback failure and timeout; extracted production adapter tests of exclusions,
+allocation/page-table gates, persistent failure veto and lock release; existing
+RAM audit adapter, session preflight, Load cleanup and kernel resume-veto tests.
+No local Android build or real GPU/phone execution was performed for this change.
+
+Device test: install the Android APK built from this cumulative ZIP; fresh Save,
+Resume for several seconds, Load once. Send screenshot/log and report controls,
+audio and rendering after Resume. If `RAM rollback failed` or `gpu-transfer-failed`
+appears, restart without Resume. Full-restoration-unsupported is still expected.
+
+## Bounded RAM read audit device checkpoint (previous checkpoint)
 
 Previous device result (2026-10-06 12:13): 23 CPU contexts and 349 synchronization
 fields matched on temporary apply and rollback. Live GPU upload and rollback also

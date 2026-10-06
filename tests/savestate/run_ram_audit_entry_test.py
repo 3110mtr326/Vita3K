@@ -4,8 +4,8 @@ import argparse,subprocess,tempfile
 p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args()
 s=Path(__file__).resolve().parents[2]
 t=(s/'vita3k/app/src/savestate.cpp').read_text()
-begin=t.index('template<class Regions>\nstatic std::string audit_saved_ram(')
-end=t.index('\n} // namespace',begin)
+begin=t.index('template<class Regions>\nstatic std::string collect_snapshot_host_ram_ranges(')
+end=t.index('// Exclusion is deliberately conservative:',begin)
 code=r'''
 #include <app/savestate_ram_audit.h>
 #include <memory>
