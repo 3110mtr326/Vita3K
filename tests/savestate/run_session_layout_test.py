@@ -44,7 +44,10 @@ std::string probe_saved_sync_values(Kernel&,int,int,int,int,int,const std::funct
 template<class E,class R>std::string audit_saved_ram(E&,std::istream&,const R&){return {};}
 template<class E,class R,class F>std::string probe_saved_ram(E&,std::istream&,const R&,F f){return f([]{return true;})?"":"RAM failed";}
 template<class E,class F>std::string probe_saved_file_positions(E&,int,F f){return f([]{return true;})?"":"files failed";}
+struct NgsVoiceRecord{};
+template<class E>std::string snapshot_ngs_voices(E&,std::vector<NgsVoiceRecord>&,const std::vector<NgsVoiceRecord>*){return {};}
 std::string validate(int mode){
+ std::vector<NgsVoiceRecord> saved_ngs_records;
  int saved_io_files=0;
  const auto graphics_checkpoint=[](const std::function<bool()> &verify){return verify();};
  std::istringstream in;

@@ -4,7 +4,45 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Joint file-position checkpoint (latest change)
+## NGS voice scalar checkpoint (latest change, format v10)
+
+Previous phone result: 2026-10-06 21:48 joint files/RAM/CPU/sync/context and
+separate live GPU roundtrip passed; user reported normal Resume.
+
+Save now captures bounded NGS voice logical records: system/rack/voice guest
+addresses, module count, state, pending/paused/keyed-off flags and frame count.
+Format v10 appends a count and nine uint32 fields per voice after host records.
+Readers reject other versions, counts above 4096, truncated records, duplicate
+voice IDs, invalid states/booleans and excessive module counts before probing.
+A fresh Save is required; v9 files are intentionally incompatible.
+
+Capture and probe run under the existing kernel/thread/renderer exclusion, with
+try-locked allocator/protection metadata, every scheduler and every voice mutex.
+An updating scheduler or pending operation refuses capture. System/rack/voice
+addresses are checked against allocated pages, ordinary backing and rounded
+protected/external/GPU mapped ranges BEFORE dereferencing. Duplicate objects,
+broken parent relationships and bounded inventory overflows are refused.
+
+Load first checks live inventory/identity/module counts. It stages five scalar
+fields per voice with SnapshotValueProbe, temporarily applies saved values,
+compares, undoes and verifies originals. Unverified rollback vetoes Resume and
+aborts rendering. No callbacks, scheduler operations, audio output or guest
+instructions run during this probe. This is a SEPARATE transaction before the
+existing joint RAM probe, so NGS metadata locks do not overlap RAM's lock acquisition.
+
+This does not capture/restore decoders, module buffers/parameters, queued audio,
+patch graphs or scheduler queues. Address identity cannot detect object reuse.
+Empty voice inventories exercise no fields. Full rewind remains unsupported.
+
+Success marker: Savestate NGS voice probe: saved scalars MATCH; rollback MATCH.
+UI begins NGS voice scalars checked if subsequent diagnostics also pass.
+
+Host validation: real savestate.cpp syntax; extracted production NGS capture/probe
+with actual scalar transaction (17 success/refusal/rollback cases), five production
+record-reader cases, and existing session-layout/Load-flow tests. These do not
+substitute for the Android build or phone verification.
+
+## Joint file-position checkpoint (previous checkpoint)
 
 Phone evidence at 2026-10-06 19:04: three read-only files passed the separate
 saved-offset/rollback probe; RAM/CPU/sync/context and live GPU probes passed,

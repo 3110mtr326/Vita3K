@@ -139,7 +139,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 9; // v9: GCR1 then length-prefixed SGI1 image sections before RAM
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 10; // v10: adds bounded NGS voice scalar records after host state
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -698,6 +698,114 @@ bool read_host_state(fs::ifstream &in, std::vector<IoFileRecord> &io_files,
 // What is only logged: kernel objects (semaphores, ...) that were created or
 // destroyed since the save, and GXM object counts. A game that uses an
 // object destroyed after the save will see errors; see docs/savestate.md.
+
+// NGS logical scalars only. No decoder, queue or audio backend restoration.
+struct NgsVoiceRecord {
+    uint32_t system, rack, voice, state, pending, paused, keyed_off, frames, modules;
+};
+static_assert(sizeof(NgsVoiceRecord) == 9 * sizeof(uint32_t));
+
+static bool valid_ngs_records(const std::vector<NgsVoiceRecord> &records) {
+    if (records.size() > 4096) return false;
+    std::set<uint32_t> ids;
+    for (const auto &r : records)
+        if (!r.system || !r.rack || !r.voice || !ids.insert(r.voice).second
+            || r.state > uint32_t(ngs::VOICE_STATE_UNLOADING)
+            || r.pending > 1 || r.paused > 1 || r.keyed_off > 1 || r.modules > 256) return false;
+    return true;
+}
+
+// Caller holds final kernel/thread and renderer exclusion. This probe is separate
+// from RAM probing: its metadata locks are released before RAM acquires them.
+static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
+    std::vector<NgsVoiceRecord> &captured, const std::vector<NgsVoiceRecord> *saved = nullptr) {
+    if (saved && !valid_ngs_records(*saved)) return "Invalid saved NGS voice records";
+    auto &mem = emuenv.mem;
+    std::unique_lock<std::mutex> allocation(mem.generation_mutex, std::try_to_lock);
+    std::unique_lock<std::mutex> protection(mem.protect_mutex, std::try_to_lock);
+    if (!allocation.owns_lock() || !protection.owns_lock()) return "NGS memory metadata is busy";
+    const uint64_t page = mem.host_page_size;
+    if (!mem.memory || !page || (page & (page-1))) return "NGS memory unavailable";
+    const auto checked_address = [&](const auto *object) -> uint32_t {
+        const auto base = reinterpret_cast<uintptr_t>(mem.memory.get());
+        const auto pointer = reinterpret_cast<uintptr_t>(object);
+        if (!object || pointer < base) return 0;
+        const uint64_t begin = pointer-base, end = begin+sizeof(*object);
+        if (begin < page || end < begin || end > (1ULL << 32)) return 0;
+        const auto overlap = [&](uint64_t start, uint64_t size) {
+            return begin < ((start+size+page-1)&~(page-1)) && (start&~(page-1)) < end;
+        };
+        for (const auto &[start, segment] : mem.protect_tree) if (overlap(start,segment.size)) return 0;
+        for (const auto &[host, mapping] : mem.external_mapping) if (overlap(mapping.address,mapping.size)) return 0;
+        for (const auto &[start, mapping] : emuenv.gxm.memory_mapped_regions) if (overlap(start,mapping.size)) return 0;
+        for (uint64_t addr = begin & ~uint64_t(4095); addr < end; addr += 4096) {
+            const auto index = addr/4096;
+            if (index >= mem.allocator.max_offset || index/32 >= mem.allocator.words.size()
+                || ((mem.allocator.words[index/32] >> (31-index%32)) & 1)) return 0;
+            if (mem.use_page_table && (!mem.page_table || mem.page_table[index] != mem.memory.get())) return 0;
+        }
+        return static_cast<uint32_t>(begin);
+    };
+    std::vector<std::unique_lock<std::recursive_mutex>> schedulers;
+    std::vector<std::unique_lock<std::mutex>> voices;
+    std::vector<ngs::Voice *> targets;
+    std::set<uint32_t> seen_systems, seen_racks, seen_voices;
+    captured.clear();
+    if (emuenv.ngs.systems.size() > 64) return "Too many NGS systems";
+    for (auto *system : emuenv.ngs.systems) {
+        const auto system_id = checked_address(system);
+        if (!system_id || !seen_systems.insert(system_id).second) return "Invalid or protected NGS system";
+        schedulers.emplace_back(system->voice_scheduler.mutex,std::try_to_lock);
+        if (!schedulers.back().owns_lock() || system->voice_scheduler.is_updating
+            || !system->voice_scheduler.operations_pending.empty()) return "NGS scheduler is busy";
+        if (system->racks.size() > 256) return "Too many NGS racks";
+        for (auto *rack : system->racks) {
+            const auto rack_id = checked_address(rack);
+            if (!rack_id || !seen_racks.insert(rack_id).second || rack->system != system) return "Invalid or protected NGS rack";
+            if (rack->voices.size() > 4096) return "Too many NGS voices";
+            for (const auto voice_ptr : rack->voices) {
+                auto *voice = voice_ptr.get(mem);
+                const auto voice_id = checked_address(voice);
+                if (!voice_id || !seen_voices.insert(voice_id).second || voice->rack != rack || !voice->voice_mutex)
+                    return "Invalid or protected NGS voice";
+                voices.emplace_back(*voice->voice_mutex,std::try_to_lock);
+                if (!voices.back().owns_lock()) return "NGS voice is busy";
+                if (captured.size() >= 4096 || voice->datas.size() > 256) return "NGS voice limit exceeded";
+                captured.push_back({system_id,rack_id,voice_id,uint32_t(voice->state),uint32_t(voice->is_pending),
+                    uint32_t(voice->is_paused),uint32_t(voice->is_keyed_off),voice->frame_count,uint32_t(voice->datas.size())});
+                targets.push_back(voice);
+            }
+        }
+    }
+    if (!valid_ngs_records(captured)) return "Invalid current NGS voice values";
+    if (!saved) {
+        LOG_INFO("Savestate NGS capture: {} voices; logical scalars only, no decoder state.",captured.size());
+        return {};
+    }
+    if (saved->size() != captured.size()) return "NGS voice count changed since saving";
+    SnapshotValueProbe transaction;
+    for (size_t i=0;i<captured.size();++i) {
+        const auto &before=captured[i]; const auto &after=(*saved)[i];
+        if (before.system!=after.system || before.rack!=after.rack || before.voice!=after.voice || before.modules!=after.modules)
+            return "NGS voice layout changed since saving";
+        auto &voice=*targets[i];
+        transaction.stage(voice.state,static_cast<ngs::VoiceState>(after.state));
+        transaction.stage(voice.is_pending,bool(after.pending));
+        transaction.stage(voice.is_paused,bool(after.paused));
+        transaction.stage(voice.is_keyed_off,bool(after.keyed_off));
+        transaction.stage(voice.frame_count,after.frames);
+    }
+    const auto result=transaction.probe();
+    if (result==SnapshotValueProbe::Result::RollbackFailed) {
+        emuenv.kernel.snapshot_restore_failed=true;
+        if (emuenv.renderer) emuenv.renderer->render_abort=true;
+        return "NGS voice rollback failed; restart the application";
+    }
+    if (result!=SnapshotValueProbe::Result::Passed) return "NGS saved voice values did not match";
+    LOG_INFO("Savestate NGS voice probe: saved scalars MATCH; rollback MATCH; {} voices, {} fields; separate from RAM/GPU; no audio rewind.",captured.size(),transaction.size());
+    return {};
+}
+
 // Runs only under the final kernel/thread/renderer exclusion. Never opens or writes files.
 static std::string probe_saved_file_positions(EmuEnvState &emuenv, const std::vector<IoFileRecord> &saved,
     const std::function<bool(const std::function<bool()> &)> &during) {
@@ -1209,6 +1317,12 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         return SaveStateResult::ErrorThreadNotSafe;
     }
 
+    std::vector<NgsVoiceRecord> ngs_records;
+    if (const auto reason = snapshot_ngs_voices(emuenv, ngs_records); !reason.empty()) {
+        if (out_detail) *out_detail = reason;
+        return SaveStateResult::ErrorThreadNotSafe;
+    }
+
     // Logical records first: no audio reconstruction. Refuse
     // unsafe scenes/commands before opening the output.
     const auto graphics = gxm::capture_context_records(emuenv, host_pause);
@@ -1231,7 +1345,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             *out_detail = "GPU image capture unsupported, busy or incomplete; the previous save was not replaced";
         return SaveStateResult::ErrorGraphicsNotReady;
     }
-    LOG_INFO("Savestate: {} logical contexts and {} image-section bytes encoded for v9; restoration remains unsupported.",
+    LOG_INFO("Savestate: {} logical contexts and {} image-section bytes encoded for v10; restoration remains unsupported.",
         graphics.records.size(), image_bytes->size());
 
     // Keep snapshot locks until disk serialization ends, including on errors.
@@ -1377,6 +1491,8 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     for (const auto &rec : lwmutex_records)
         write_pod(out, rec);
     write_host_state(out, io_files, object_sets, gxm_counts);
+    write_pod(out, static_cast<uint32_t>(ngs_records.size()));
+    for (const auto &record : ngs_records) write_pod(out, record);
 
     if (!file.commit()) {
         if (out_detail)
@@ -1463,7 +1579,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU/sync/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "NGS voice scalars checked; joint files/RAM/CPU/sync/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
@@ -1590,12 +1706,20 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     std::vector<IoFileRecord> saved_io_files;
     std::vector<ObjectSetRecord> saved_object_sets;
     GxmCountsRecord saved_gxm_counts{};
+    std::vector<NgsVoiceRecord> saved_ngs_records;
     if (!read_records(sema_records) || !read_records(mutex_records) || !read_records(eventflag_records) || !read_records(simple_event_records)
         || !read_records(lwmutex_records) || !read_host_state(in, saved_io_files, saved_object_sets, saved_gxm_counts))
         return SaveStateResult::ErrorIO;
 
     if (!kernel.is_threads_paused())
         return SaveStateResult::ErrorNotPaused;
+
+    uint32_t ngs_count = 0;
+    if (!read_pod(in, ngs_count) || ngs_count > 4096) return SaveStateResult::ErrorIO;
+    saved_ngs_records.resize(ngs_count);
+    for (auto &record : saved_ngs_records)
+        if (!read_pod(in, record)) return SaveStateResult::ErrorIO;
+    if (!valid_ngs_records(saved_ngs_records)) return SaveStateResult::ErrorMismatch;
 
     // Reject malformed thread records before starting even the bounded drain.
     std::set<SceUID> saved_thread_ids;
@@ -1644,6 +1768,9 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 || counts.deferred_contexts != saved_gxm_counts.deferred_contexts
                 || counts.immediate_context != saved_gxm_counts.immediate_context)
                 return "Graphics object counts changed since saving";
+            std::vector<NgsVoiceRecord> current_ngs;
+            const auto ngs_result = snapshot_ngs_voices(emuenv,current_ngs,&saved_ngs_records);
+            if (!ngs_result.empty()) return ngs_result;
             const auto ram_result = audit_saved_ram(emuenv,in,pending_regions);
             if (!ram_result.empty()) return ram_result;
             std::string joint_error;
