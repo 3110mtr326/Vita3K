@@ -38,6 +38,7 @@ bool records_match_object_set(int records,const char*,int){return records==0;}
 auto get_allocated_regions(Mem&m){return m.regions;}
 auto collect_gxm_counts(Counts c){return c;}
 std::string probe_saved_cpu_contexts(Kernel&,const std::vector<Thread>&){return {};}
+std::string probe_saved_sync_values(Kernel&,int,int,int,int,int){return {};}
 std::string validate(int mode){
  Kernel kernel;Mem mem;struct {Counts gxm;} emuenv;
  std::vector<Thread> thread_records{{1}};

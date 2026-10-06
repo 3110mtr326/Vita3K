@@ -94,6 +94,7 @@
 #include <app/savestate_image_section.h>
 #include <app/savestate_stream_skip.h>
 #include <app/savestate_cpu_probe.h>
+#include <app/savestate_value_probe.h>
 #include <functional>
 #include <audio/state.h>
 #include <ngs/state.h>
@@ -782,6 +783,59 @@ struct SimpleEventRecord {
     uint8_t cb_wakeup_only;
 };
 
+// KernelSnapshotGuard owns ALL primitive/thread locks throughout this probe.
+// Waiting queues, condition variables and guest lwmutex workareas are untouched.
+static std::string probe_saved_sync_values(KernelState &kernel,
+    const std::vector<SemaRecord> &semas,const std::vector<MutexRecord> &mutexes,
+    const std::vector<MutexRecord> &lwmutexes,const std::vector<EventFlagRecord> &flags,
+    const std::vector<SimpleEventRecord> &events) {
+    if(kernel.snapshot_restore_failed)return "Previous rollback failed; restart the app";
+    SnapshotValueProbe values;
+    for(const auto &r:semas) {
+        const auto it=kernel.semaphores.find(r.uid);
+        if(it==kernel.semaphores.end()||!it->second||r.max<=0||r.val<0||r.val>r.max||r.init_val<0||r.init_val>r.max)
+            return "Invalid semaphore snapshot values";
+        auto &v=*it->second;values.stage(v.val,r.val);values.stage(v.max,r.max);values.stage(v.init_val,r.init_val);
+    }
+    const auto stage_mutexes=[&](const auto &records,auto &objects)->bool {
+        for(const auto &r:records) {
+            const auto it=objects.find(r.uid);
+            if(it==objects.end()||!it->second||r.lock_count<0||r.init_count<0)return false;
+            ThreadStatePtr owner;
+            if(r.owner_id!=-1) {
+                const auto thread=kernel.threads.find(r.owner_id);
+                if(thread==kernel.threads.end()||!thread->second)return false;
+                owner=thread->second;
+            }
+            if((r.lock_count==0)!=(!owner))return false;
+            auto &v=*it->second;values.stage(v.lock_count,r.lock_count);values.stage(v.init_count,r.init_count);values.stage(v.owner,owner);
+        }
+        return true;
+    };
+    if(!stage_mutexes(mutexes,kernel.mutexes)||!stage_mutexes(lwmutexes,kernel.lwmutexes))
+        return "Invalid mutex count or owner in snapshot";
+    for(const auto &r:flags) {
+        const auto it=kernel.eventflags.find(r.uid);
+        if(it==kernel.eventflags.end()||!it->second)return "Event flag missing";
+        values.stage(it->second->flags,r.flags);
+    }
+    for(const auto &r:events) {
+        const auto it=kernel.simple_events.find(r.uid);
+        if(it==kernel.simple_events.end()||!it->second||r.auto_reset>1||r.cb_wakeup_only>1)
+            return "Invalid simple event snapshot values";
+        auto &v=*it->second;values.stage(v.pattern,r.pattern);values.stage(v.last_user_data,r.last_user_data);
+        values.stage(v.auto_reset,bool(r.auto_reset));values.stage(v.cb_wakeup_only,bool(r.cb_wakeup_only));
+    }
+    const auto result=values.probe();
+    if(result==SnapshotValueProbe::Result::RollbackFailed) {
+        kernel.snapshot_restore_failed=true;
+        return "Kernel value rollback failed; restart the app without Resume";
+    }
+    if(result!=SnapshotValueProbe::Result::Passed)return "Kernel value verification failed; original values retained";
+    LOG_INFO("Savestate sync probe: saved values MATCH; rollback MATCH; {} fields; no wait queues changed or threads signalled.",values.size());
+    return {};
+}
+
 } // namespace
 
 fs::path get_savestate_path(const EmuEnvState &emuenv, int slot) {
@@ -1156,7 +1210,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM applied or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Session layout and CPU roundtrip checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Session layout, CPU and sync roundtrip checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
@@ -1334,7 +1388,9 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 || counts.deferred_contexts != saved_gxm_counts.deferred_contexts
                 || counts.immediate_context != saved_gxm_counts.immediate_context)
                 return "Graphics object counts changed since saving";
-            return probe_saved_cpu_contexts(kernel, thread_records);
+            const auto cpu_result=probe_saved_cpu_contexts(kernel, thread_records);
+            if(!cpu_result.empty())return cpu_result;
+            return probe_saved_sync_values(kernel,sema_records,mutex_records,lwmutex_records,eventflag_records,simple_event_records);
         }); // Unconditional return: no saved RAM writes, wait aborts or replay.
     }
 

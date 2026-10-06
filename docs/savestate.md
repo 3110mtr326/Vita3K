@@ -4,7 +4,44 @@ This is unfinished source work, not a device-test release or a working FFX
 load implementation. Keep using the tested fix21 build for now. No new APK
 build or device test is requested for this checkpoint.
 
-## CPU register apply/rollback device checkpoint (latest change)
+## Synchronization value apply/rollback device checkpoint (latest change)
+
+Previous device result: CPU register/TLS apply and rollback matched for all 23
+threads twice; live GPU upload/rollback also matched. Resume was normal.
+
+Load now stages and probes the saved semaphore, mutex/lwmutex, eventflag and
+simple-event scalar fields, including mutex owner shared pointers. This runs
+after session and CPU checks under the existing continuous kernel/primitive/thread
+locks. All validation, old-value capture, allocations and owner resolution precede
+the first write. Semaphore ranges, mutex counts/owner consistency and event boolean
+encodings are checked. Duplicate field targets reject before any mutation.
+
+Assignments/equality are constrained to nonthrowing operations. The whole staged
+set is applied, compared, undone and compared again without invoking any signal,
+unlock or scheduling API. A rollback mismatch sets the existing persistent kernel
+resume veto and requests an app restart. Preparation errors leave original values
+intact. Wait queues, condition variables, native stacks, thread statuses, guest
+lwmutex workareas, guest RAM and audio remain untouched. This validates host-side
+values only; it does NOT reconstruct saved waits or commit a full restore.
+
+Success marker: `Savestate sync probe: saved values MATCH; rollback MATCH; N fields`.
+UI says `Session layout, CPU and sync roundtrip checked` and then shows the existing
+GPU diagnostic. Zero staged fields is a valid empty domain, not evidence that a
+particular primitive type was exercised on the device. Use the reported field
+count alongside the model tests when interpreting results. Format remains v9.
+
+Host checks: savestate.cpp syntax; extracted production sync function tests with
+all five record categories, owner changes, invalid/duplicate values and late
+refusal before mutation; original queue/workarea preservation; generic apply and
+rollback mismatch handling. Session-layout and Load exclusion/cleanup tests pass.
+The GPU and CPU implementations are unchanged. Android device behavior of the new
+host-value probe still requires testing.
+
+Device test: fresh Save, Resume briefly, Load once; send screenshot/log and confirm
+normal Resume controls/audio/rendering. On any rollback-failed or gpu-transfer-failed
+message, restart without Resume. Full restoration remains unsupported even on pass.
+
+## CPU register apply/rollback device checkpoint (previous checkpoint)
 
 Latest Xperia evidence: three live GPU saved-upload MATCH and rollback MATCH
 results, two successful Saves, and normal resumed operation reported by the user.
