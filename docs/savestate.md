@@ -4,7 +4,67 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Excluded-range RAM apply/rollback device checkpoint (latest change)
+## Joint RAM/CPU/synchronization device checkpoint (latest change)
+
+Previous device result (2026-10-06 14:09): 311,730,824 eligible RAM bytes inspected;
+17,435,872 bytes in 376 differing chunks temporarily changed and restored in 460 ms.
+CPU (23 threads), sync (349 fields), logical graphics and live GPU probes passed.
+User reports normal controls/audio/rendering after Resume.
+
+Load now stages ALL differing eligible RAM chunks before the first RAM write.
+Both saved and original payloads are retained, capped at 64 MiB combined payload
+(at most 32 MiB changed RAM) and 4096 chunks. Metadata and fixed scratch buffers
+are additional. Exceeding the cap or failing staging I/O refuses before mutation;
+there is no fallback to partially committing the save. Exclusions and allocation /
+protection / page-table checks from the previous checkpoint remain unchanged.
+
+All staged RAM is applied and verified together. While it remains applied, the
+CPU probe applies saved registers/TLS; while those remain applied, the sync probe
+applies its saved scalar/owner values. At the innermost checkpoint RAM is verified
+again with CPU and sync saved values present simultaneously. Sync and CPU also
+recheck their saved values after the callback. Undo order is sync, CPU, then RAM;
+each domain verifies its originals. Every touched RAM chunk is attempted in reverse
+order during undo, even if another undo fails; afterward all staged chunks are
+compared with original bytes. Callback exceptions are caught within their domain.
+CPU/sync staging allocations may occur inside the outer RAM transaction; an
+allocation exception propagates to an enclosing handler that restores its domain.
+The bounded RAM backups and type-erased RAM verifier are prepared before writes.
+
+RAM I/O occurs only during staging. Deadlines may stop staging or application,
+but never interrupt rollback. As before, a blocking OS read cannot be interrupted.
+Unverifiable RAM, CPU or sync rollback persistently vetoes guest resume and aborts
+rendering. An inconclusive empty/unchanged RAM set is not a successful joint test.
+Normal failures leave originals restored. OS access faults cannot be caught by
+these C++ handlers; the pinned exclusions remain essential.
+
+Success markers:
+- `Savestate RAM batch probe: saved bytes MATCH; rollback MATCH`
+- `Savestate joint probe: RAM/CPU/sync saved values coexisted; all rollbacks MATCH`
+UI: `Joint RAM/CPU/sync roundtrip checked`.
+
+This still executes NO guest instructions or wait replay, and commits NO rewind.
+Audio and excluded RAM are not restored. Graphics/GPU probes run separately AFTER
+the joint RAM/CPU/sync transaction has fully rolled back. Full cross-domain game
+restoration remains unsupported. Save format remains v9 with its existing checksum
+limitations. This checkpoint is specifically about combined apply/undo, not playable
+restoration or proof that native waits are compatible with saved RAM.
+
+Host checks: savestate.cpp syntax; simultaneous-domain test using real transaction
+helpers and modeled CPUs/RAM/values; budget exhaustion, late truncation, stage read
+failure, partial RAM apply, apply mismatch, nested exceptions, CPU rollback failure,
+RAM rollback failure with remaining undo attempts, timeout and unchanged RAM.
+Production adapter tests cover exclusions, allocation gates, exception rollback,
+kernel veto propagation and renderer abort. Existing CPU/sync, RAM audit, session
+layout, Load pause cleanup and kernel resume-veto tests pass. The CPU read-failure
+test now targets the rollback phase instead of a read count, since a saved-state
+verification pass was added. These host checks are not an Android build or device test.
+
+Device: fresh Save, Resume several seconds, Load once. Send screenshot/log and
+report controls/audio/rendering after Resume. On any rollback-failed or
+gpu-transfer-failed result, restart without Resume. The unsupported-restoration
+message remains expected even on successful diagnostics.
+
+## Excluded-range RAM apply/rollback device checkpoint (previous checkpoint)
 
 Previous device result (2026-10-06 13:12): RAM read audit completed 450,912,256
 bytes in 520 ms, with 45,880 excluded bytes (337 GXM and 3 NGS ranges) and 501

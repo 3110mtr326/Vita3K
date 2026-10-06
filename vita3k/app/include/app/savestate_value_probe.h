@@ -43,14 +43,19 @@ public:
         fields.push_back(std::make_unique<Value<T>>(target,saved));
     }
     size_t size()const noexcept{return fields.size();}
-    Result probe()noexcept {
+    template<class During>Result probe_with(During during)noexcept {
         if(finished)return Result::AlreadyFinished;
         finished=true;applied=true;
         for(auto &f:fields)f->apply();
         bool saved_ok=true;for(auto &f:fields)saved_ok=f->matches(true)&&saved_ok;
+        if(saved_ok) {
+            try {saved_ok=bool(during());}catch(...){saved_ok=false;}
+            for(auto &f:fields)saved_ok=f->matches(true)&&saved_ok;
+        }
         undo();
         bool original_ok=true;for(auto &f:fields)original_ok=f->matches(false)&&original_ok;
         return !original_ok?Result::RollbackFailed:saved_ok?Result::Passed:Result::ApplyMismatch;
     }
+    Result probe()noexcept {return probe_with([]{return true;});}
 };
 }

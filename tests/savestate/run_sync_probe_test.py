@@ -3,13 +3,14 @@ from pathlib import Path
 import argparse,subprocess,tempfile
 p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);args=p.parse_args()
 s=Path(__file__).resolve().parents[2];t=(s/'vita3k/app/src/savestate.cpp').read_text()
-a=t.index('static std::string probe_saved_sync_values(');b=t.index('} // namespace',a)
+a=t.index('static std::string probe_saved_sync_values(');b=t.index('// Called only under the final kernel/thread/renderer exclusion.',a)
 records=''
 for name in ['SemaRecord','MutexRecord','EventFlagRecord','SimpleEventRecord']:
  start=t.index('struct '+name+' {');end=t.index('};',start)+2;records+=t[start:end]+'\n'
 code=r'''
 #include <app/savestate_value_probe.h>
 #include <cassert>
+#include <functional>
 #include <map>
 #include <string>
 #include <iostream>

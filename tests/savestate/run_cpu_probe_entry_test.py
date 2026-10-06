@@ -7,6 +7,7 @@ a=t.index('static std::string probe_saved_cpu_contexts(');b=t.index('// Plain-da
 code=r'''
 #include <app/savestate_cpu_probe.h>
 #include <map>
+#include <functional>
 #include <memory>
 #include <cassert>
 #include <stdexcept>

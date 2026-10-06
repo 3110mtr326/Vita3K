@@ -7,7 +7,7 @@ t=(s/'vita3k/app/src/savestate.cpp').read_text()
 begin=t.index('template<class Regions>\nstatic std::string probe_saved_ram(')
 end=t.index('\n} // namespace',begin)
 code=r'''
-#include <app/savestate_ram_probe.h>
+#include <app/savestate_ram_batch.h>
 #include <mutex>
 #include <map>
 #include <atomic>
@@ -36,20 +36,20 @@ struct EmuEnvState {
 };
 template<class R>std::string collect_snapshot_host_ram_ranges(EmuEnvState&,const R&,std::vector<SnapshotRamRange>&out,size_t&n){out={{5000,5200}};n=1;return {};}
 bool inject_rollback_failure=false;int writes=0;
-template<class Read,class Write,class Expired>
-auto observed_probe(std::istream &in,const std::vector<SnapshotRamSpan>&spans,Read read,Write write,Expired expired,SnapshotRamProbeStats&stats) {
- if(inject_rollback_failure)return SnapshotRamProbeResult::RollbackFailed;
- return app::probe_snapshot_ram(in,spans,read,[&](uint64_t address,const uint8_t*data,size_t size){
+template<class Read,class Write,class Expired,class During>
+auto observed_probe(std::istream &in,const std::vector<SnapshotRamSpan>&spans,Read read,Write write,Expired expired,During during,SnapshotRamProbeStats&stats) {
+ if(inject_rollback_failure)return SnapshotRamBatchResult::RollbackFailed;
+ return app::probe_snapshot_ram_batch(in,spans,read,[&](uint64_t address,const uint8_t*data,size_t size){
   ++writes;
   for(auto range:std::vector<SnapshotRamRange>{{5000,5200},{8192,12288},{16384,20480},{24576,28672}})
    assert(address+size<=range.first||address>=range.second);
   return write(address,data,size);
- },expired,stats);
+ },expired,during,stats);
 }
 PRODUCTION
 struct Region {uint32_t addr,saved_size;std::streamoff file_offset;};
 int main() {
- for(int mode=0;mode<12;++mode) {
+ for(int mode=0;mode<14;++mode) {
   EmuEnvState e;std::memset(e.mem.memory.get(),'B',65536);
   e.mem.protect_tree[8192]={8192,2};e.mem.external_mapping[1]={16384,4096};
   e.gxm.memory_mapped_regions[24576]={24576,4096};
@@ -67,11 +67,15 @@ int main() {
   inject_rollback_failure=mode==10;writes=0;
   const std::string before(reinterpret_cast<char*>(e.mem.memory.get()),65536);
   std::istringstream file(std::string(mode==11?1:61440,'A'));
-  const auto result=probe_saved_ram(e,file,std::vector<Region>{{4096,61440,0}});
+  const auto result=probe_saved_ram(e,file,std::vector<Region>{{4096,61440,0}},[&](const auto &verify){
+   if(mode==12){e.kernel.snapshot_restore_failed=true;return false;}
+   if(mode==13)throw std::runtime_error("joint callback");
+   return verify();
+  });
   assert(result.empty()==(mode==0));
-  if(mode==0)assert(writes>0);else assert(writes==0);
-  assert(e.kernel.snapshot_restore_failed==(mode==7||mode==10));
-  assert(e.renderer->render_abort.load()==(mode==3||mode==10));
+  if(mode==0||mode==12||mode==13)assert(writes>0);else assert(writes==0);
+  assert(e.kernel.snapshot_restore_failed==(mode==7||mode==10||mode==12));
+  assert(e.renderer->render_abort.load()==(mode==3||mode==10||mode==12));
   assert(std::memcmp(e.mem.memory.get(),before.data(),before.size())==0);
   // RAII releases both pins on success and every refusal/failure.
   assert(e.mem.generation_mutex.try_lock());e.mem.generation_mutex.unlock();
@@ -79,7 +83,7 @@ int main() {
  }
  std::cout<<"PASS: production RAM probe adapter, protected/external/GPU exclusions, page-table/allocation gates, rollback veto, lock release\n";
 }
-'''.replace('PRODUCTION',t[begin:end].replace('probe_snapshot_ram(in,spans,','observed_probe(in,spans,'))
+'''.replace('PRODUCTION',t[begin:end].replace('probe_snapshot_ram_batch(in,spans,','observed_probe(in,spans,'))
 with tempfile.TemporaryDirectory() as d:
  f=Path(d)/'entry.cpp';f.write_text(code);exe=Path(d)/'entry.exe'
  subprocess.run([a.compiler,'-std=c++20','-Wall','-Wextra','-Werror','-Wno-unused-variable','-I',str(s/'vita3k/app/include'),str(f),'-o',str(exe)],check=True)

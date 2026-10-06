@@ -30,7 +30,7 @@ int main(){
         if(mode==7)targets[1].cpu=nullptr;
         auto result=probe_snapshot_cpu_values<Cpu>(targets,[&](Cpu &c){
             ++reads;
-            if((mode==1&&reads==2)||(mode==5&&reads==5)||(mode==8&&reads==3))throw std::runtime_error("read");
+            if((mode==1&&reads==2)||(mode==5&&writes==4)||(mode==8&&reads==3))throw std::runtime_error("read");
             auto v=c.values;if(mode==3&&reads==3)v.context.cpu_registers[0]++;return v;
         },[&](Cpu &c,const SnapshotCpuValues &v){
             ++writes;

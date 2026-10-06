@@ -21,8 +21,8 @@ enum class SnapshotCpuProbe { Passed, InvalidTargets, ApplyMismatch, AccessFaile
 // Caller owns continuous kernel/thread exclusion. Does not execute instructions,
 // unwind waits, change thread status, or commit a restored context. Resolve and
 // validate all targets before entering; backup/allocation happens before writes.
-template<class Cpu,class Read,class Write>
-SnapshotCpuProbe probe_snapshot_cpu_values(std::span<const SnapshotCpuTarget<Cpu>> targets,Read read,Write write) {
+template<class Cpu,class Read,class Write,class During>
+SnapshotCpuProbe probe_snapshot_cpu_values(std::span<const SnapshotCpuTarget<Cpu>> targets,Read read,Write write,During during) {
     if(targets.empty())return SnapshotCpuProbe::InvalidTargets;
     for(size_t i=0;i<targets.size();++i) {
         if(!targets[i].cpu)return SnapshotCpuProbe::InvalidTargets;
@@ -41,6 +41,11 @@ SnapshotCpuProbe probe_snapshot_cpu_values(std::span<const SnapshotCpuTarget<Cpu
                 result=SnapshotCpuProbe::ApplyMismatch;break;
             }
         }
+        if(result==SnapshotCpuProbe::Passed) {
+            if(!during())result=SnapshotCpuProbe::ApplyMismatch;
+            for(const auto &t:targets)
+                if(!same_snapshot_cpu_values(read(*t.cpu),t.saved))result=SnapshotCpuProbe::ApplyMismatch;
+        }
     } catch(...) {result=SnapshotCpuProbe::AccessFailed;}
     bool rollback_ok=true;
     for(size_t i=0;i<touched;++i) {
@@ -52,5 +57,9 @@ SnapshotCpuProbe probe_snapshot_cpu_values(std::span<const SnapshotCpuTarget<Cpu
         catch(...) {rollback_ok=false;}
     }
     return rollback_ok?result:SnapshotCpuProbe::RollbackFailed;
+}
+template<class Cpu,class Read,class Write>
+SnapshotCpuProbe probe_snapshot_cpu_values(std::span<const SnapshotCpuTarget<Cpu>> targets,Read read,Write write) {
+    return probe_snapshot_cpu_values<Cpu>(targets,read,write,[]{return true;});
 }
 }

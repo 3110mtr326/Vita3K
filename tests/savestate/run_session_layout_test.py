@@ -12,6 +12,8 @@ check=t[a:b]
 code=r'''
 #include <app/savestate_stream_skip.h>
 #include <cassert>
+#include <functional>
+#define LOG_INFO(...) ((void)0)
 #include <sstream>
 #include <vector>
 #include <map>
@@ -37,10 +39,10 @@ std::string compare_object_sets(int a,int b){return a==b?"":"object IDs changed"
 bool records_match_object_set(int records,const char*,int){return records==0;}
 auto get_allocated_regions(Mem&m){return m.regions;}
 auto collect_gxm_counts(Counts c){return c;}
-std::string probe_saved_cpu_contexts(Kernel&,const std::vector<Thread>&){return {};}
-std::string probe_saved_sync_values(Kernel&,int,int,int,int,int){return {};}
+std::string probe_saved_cpu_contexts(Kernel&,const std::vector<Thread>&,const std::function<bool()>&f){return f()?"":"CPU failed";}
+std::string probe_saved_sync_values(Kernel&,int,int,int,int,int,const std::function<bool()>&f){return f()?"":"sync failed";}
 template<class E,class R>std::string audit_saved_ram(E&,std::istream&,const R&){return {};}
-template<class E,class R>std::string probe_saved_ram(E&,std::istream&,const R&){return {};}
+template<class E,class R,class F>std::string probe_saved_ram(E&,std::istream&,const R&,F f){return f([]{return true;})?"":"RAM failed";}
 std::string validate(int mode){
  std::istringstream in;
  Kernel kernel;Mem mem;struct {Counts gxm;} emuenv;

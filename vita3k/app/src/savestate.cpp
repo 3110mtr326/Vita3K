@@ -101,6 +101,7 @@
 #include <app/savestate_value_probe.h>
 #include <app/savestate_ram_audit.h>
 #include <app/savestate_ram_probe.h>
+#include <app/savestate_ram_batch.h>
 #include <dialog/state.h>
 #include <functional>
 #include <audio/state.h>
@@ -454,7 +455,8 @@ struct ThreadRecord {
 };
 
 // Called only with the snapshot guard's kernel/primitive/thread locks held.
-static std::string probe_saved_cpu_contexts(KernelState &kernel,const std::vector<ThreadRecord> &records) {
+static std::string probe_saved_cpu_contexts(KernelState &kernel,const std::vector<ThreadRecord> &records,
+    const std::function<bool()> &during = {}) {
     if(kernel.snapshot_restore_failed)return "CPU rollback previously failed; restart the app";
     std::vector<SnapshotCpuTarget<CPUState>> targets;targets.reserve(records.size());
     for(const auto &record:records) {
@@ -465,7 +467,8 @@ static std::string probe_saved_cpu_contexts(KernelState &kernel,const std::vecto
     }
     const auto result=probe_snapshot_cpu_values<CPUState>(targets,
         [](CPUState &cpu){return SnapshotCpuValues{save_context(cpu),read_tpidruro(cpu)};},
-        [](CPUState &cpu,const SnapshotCpuValues &v){load_context(cpu,v.context);write_tpidruro(cpu,v.tpidruro);});
+        [](CPUState &cpu,const SnapshotCpuValues &v){load_context(cpu,v.context);write_tpidruro(cpu,v.tpidruro);},
+        [&] { return !during || during(); });
     if(result==SnapshotCpuProbe::RollbackFailed) {
         kernel.snapshot_restore_failed=true;
         LOG_ERROR("Savestate CPU probe: rollback FAILED; guest resume blocked, restart app required.");
@@ -797,7 +800,7 @@ struct SimpleEventRecord {
 static std::string probe_saved_sync_values(KernelState &kernel,
     const std::vector<SemaRecord> &semas,const std::vector<MutexRecord> &mutexes,
     const std::vector<MutexRecord> &lwmutexes,const std::vector<EventFlagRecord> &flags,
-    const std::vector<SimpleEventRecord> &events) {
+    const std::vector<SimpleEventRecord> &events, const std::function<bool()> &during = {}) {
     if(kernel.snapshot_restore_failed)return "Previous rollback failed; restart the app";
     SnapshotValueProbe values;
     for(const auto &r:semas) {
@@ -835,7 +838,7 @@ static std::string probe_saved_sync_values(KernelState &kernel,
         auto &v=*it->second;values.stage(v.pattern,r.pattern);values.stage(v.last_user_data,r.last_user_data);
         values.stage(v.auto_reset,bool(r.auto_reset));values.stage(v.cb_wakeup_only,bool(r.cb_wakeup_only));
     }
-    const auto result=values.probe();
+    const auto result=values.probe_with([&] { return !during || during(); });
     if(result==SnapshotValueProbe::Result::RollbackFailed) {
         kernel.snapshot_restore_failed=true;
         return "Kernel value rollback failed; restart the app without Resume";
@@ -909,7 +912,8 @@ static std::string audit_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
 // remain held by the diagnostic caller throughout. No guest instructions execute
 // between apply and undo, so the original translated-code cache remains valid.
 template<class Regions>
-static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const Regions &regions) {
+static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const Regions &regions,
+    const SnapshotRamJointCheck &joint = {}) {
     auto &mem = emuenv.mem;
     auto &kernel = emuenv.kernel;
     if (kernel.snapshot_restore_failed) return "Previous rollback failed; restart the app";
@@ -970,26 +974,33 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
     LOG_INFO("Savestate RAM probe: starting {} eligible bytes; protected, external, GPU-mapped and host-object ranges excluded.",planned_bytes);
     SnapshotRamProbeStats stats;
     const auto start = std::chrono::steady_clock::now();
-    const auto result = probe_snapshot_ram(in,spans,
+    const auto result = probe_snapshot_ram_batch(in,spans,
         [&](uint64_t address,uint8_t *data,size_t size) noexcept {
             std::memcpy(data,mem.memory.get()+address,size); return true;
         }, [&](uint64_t address,const uint8_t *data,size_t size) noexcept {
             std::memcpy(mem.memory.get()+address,data,size); return true;
-        }, [&] { return std::chrono::steady_clock::now()-start >= std::chrono::seconds(10); },stats);
-    if (result == SnapshotRamProbeResult::RollbackFailed) {
+        }, [&] { return std::chrono::steady_clock::now()-start >= std::chrono::seconds(10); },
+        [&](const std::function<bool()> &verify_ram) { return joint ? joint(verify_ram) : verify_ram(); },stats);
+    if (result == SnapshotRamBatchResult::RollbackFailed) {
         kernel.snapshot_restore_failed = true;
         emuenv.renderer->render_abort.store(true);
         LOG_ERROR("Savestate RAM probe: rollback FAILED; Resume blocked; restart app required.");
         return "RAM rollback failed; restart the app without Resume";
     }
-    if (result != SnapshotRamProbeResult::Passed) {
-        LOG_WARN("Savestate RAM probe: incomplete (reason {}), {} compared bytes, {} changed chunks restored; no saved RAM retained.",
+    if (kernel.snapshot_restore_failed) {
+        emuenv.renderer->render_abort.store(true);
+        return "CPU/sync rollback failed during joint probe; restart the app without Resume";
+    }
+    if (result != SnapshotRamBatchResult::Passed) {
+        LOG_WARN("Savestate RAM batch probe: incomplete (reason {}), {} compared bytes; completed chunks {}; original RAM retained unless a domain rollback failed.",
             static_cast<int>(result),stats.compared_bytes,stats.changed_chunks);
-        return result == SnapshotRamProbeResult::NoChanges
+        if (result == SnapshotRamBatchResult::BudgetExceeded)
+            return "Joint RAM staging exceeds 64 MiB payload or 4096 chunks; no saved RAM applied";
+        return result == SnapshotRamBatchResult::NoChanges
             ? "RAM probe inconclusive: no changed eligible bytes; no saved RAM retained"
             : "RAM probe incomplete; original RAM retained; see log";
     }
-    LOG_INFO("Savestate RAM probe: saved bytes MATCH; rollback MATCH; {} compared bytes, {} temporarily changed bytes in {} chunks; {} ms; exclusions retained; no game rewind committed.",
+    LOG_INFO("Savestate RAM batch probe: saved bytes MATCH; rollback MATCH; {} compared bytes, {} simultaneously staged bytes in {} chunks; {} ms; exclusions retained; no game rewind committed.",
         stats.compared_bytes,stats.changed_bytes,stats.changed_chunks,
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count());
     return {};
@@ -1369,7 +1380,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "RAM, CPU and sync roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint RAM/CPU/sync roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
@@ -1552,11 +1563,25 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 return "Graphics object counts changed since saving";
             const auto ram_result = audit_saved_ram(emuenv,in,pending_regions);
             if (!ram_result.empty()) return ram_result;
-            const auto ram_probe = probe_saved_ram(emuenv,in,pending_regions);
-            if (!ram_probe.empty()) return ram_probe;
-            const auto cpu_result=probe_saved_cpu_contexts(kernel, thread_records);
-            if(!cpu_result.empty())return cpu_result;
-            return probe_saved_sync_values(kernel,sema_records,mutex_records,lwmutex_records,eventflag_records,simple_event_records);
+            std::string joint_error;
+            bool simultaneous_check = false;
+            const auto ram_probe = probe_saved_ram(emuenv,in,pending_regions,
+                [&](const std::function<bool()> &verify_ram) {
+                    const auto cpu_result = probe_saved_cpu_contexts(kernel,thread_records,[&] {
+                        joint_error = probe_saved_sync_values(kernel,sema_records,mutex_records,lwmutex_records,
+                            eventflag_records,simple_event_records,[&] {
+                                simultaneous_check = verify_ram();
+                                return simultaneous_check;
+                            });
+                        return joint_error.empty();
+                    });
+                    if (!cpu_result.empty()) joint_error = cpu_result;
+                    return joint_error.empty();
+                });
+            if (!ram_probe.empty()) return joint_error.empty() ? ram_probe : ram_probe + "; " + joint_error;
+            if (!simultaneous_check) return "Joint RAM/CPU/sync checkpoint was not reached";
+            LOG_INFO("Savestate joint probe: RAM/CPU/sync saved values coexisted; all rollbacks MATCH; no guest instructions, wait replay or game rewind.");
+            return {};
         }); // Unconditional return: no retained RAM changes, wait aborts or replay.
     }
 
