@@ -4,7 +4,35 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Read-only file position checkpoint (latest change)
+## Joint file-position checkpoint (latest change)
+
+Phone evidence at 2026-10-06 19:04: three read-only files passed the separate
+saved-offset/rollback probe; RAM/CPU/sync/context and live GPU probes passed,
+and the user reported normal Resume operation.
+
+The file-position transaction now encloses the RAM/CPU/sync/context transaction.
+All file validation and backup preparation complete before seeking. Files remain
+at saved offsets during the nested probes. The innermost context callback verifies
+both saved RAM and saved offsets while all five domains hold saved values. After
+context, sync, CPU and RAM rollback, saved file offsets are checked again, then
+all touched files are returned to current-session offsets and verified. GPU image
+probing still runs separately after every domain has rolled back.
+
+A false/throwing nested callback triggers file rollback; file rollback failure
+still permanently vetoes Resume and aborts rendering. Existing writable, EOF/error,
+identity and layout guards remain. No guest instructions run, no wait queues are
+restored, and no rewind is committed. File contents/open-instance lifetime, audio,
+excluded RAM and complete backend/wait restoration remain unresolved. Format v9.
+
+Success UI: Joint files/RAM/CPU/sync/context roundtrip checked.
+Log: Savestate file joint probe: saved offsets MATCH; nested checkpoint MATCH;
+rollback MATCH, plus the files/RAM/CPU/sync/context simultaneous marker.
+
+Host verification: actual savestate.cpp syntax; 13 extracted production file-probe
+cases including nested false, exception and offset mutation; existing session
+layout and Load diagnostic tests. Android build and phone testing remain required.
+
+## Read-only file position checkpoint (previous checkpoint)
 
 Previous phone test passed the joint RAM/CPU/sync/context probe and Resume was
 normal (2026-10-06 16:23). Full game rewind remains unavailable.

@@ -6,6 +6,8 @@ t=(s/'vita3k/app/src/savestate.cpp').read_text()
 a=t.index('static std::string probe_saved_file_positions(');b=t.index('std::string reconcile_host_state(',a)
 code=r"""
 #include <cstdio>
+#include <functional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <set>
@@ -33,7 +35,7 @@ struct Renderer{bool render_abort=false;};
 struct EmuEnvState{struct{std::map<int,FileStats>std_files;}io;struct{bool snapshot_restore_failed=false;}kernel;Renderer*renderer;};
 FUNCTION
 int main(){
- for(int mode=0;mode<10;++mode){
+ for(int mode=0;mode<13;++mode){
   FILE*f=tmpfile();assert(f);fputs("abcdef",f);fflush(f);fseek(f,4,SEEK_SET);
   Renderer renderer;EmuEnvState e;e.renderer=&renderer;e.io.std_files.emplace(1,FileStats{f});
   std::vector<IoFileRecord> saved{{1,0,1,"app0:x","x","x"}};
@@ -46,15 +48,23 @@ int main(){
   if(mode==7)saved.clear();
   if(mode==8)saved[0].fd=2;
   if(mode==9)saved[0].open_mode=2;
-  const auto before=ftell(f);auto result=probe_saved_file_positions(e,saved);
+  const auto before=ftell(f);int calls=0;
+  auto result=probe_saved_file_positions(e,saved,[&](const std::function<bool()>&verify){
+   ++calls;assert(ftell(f)==1);assert(verify());
+   if(mode==10)return false;
+   if(mode==11)throw std::runtime_error("nested failure");
+   if(mode==12){fseek(f,2,SEEK_SET);return true;}
+   return true;
+  });
+  assert(calls==((mode==0||mode==6||mode>=10)?1:0));
   assert(result.empty()==(mode==0));
   assert(e.kernel.snapshot_restore_failed==(mode==6));assert(renderer.render_abort==(mode==6));
   if(mode!=6)assert(ftell(f)==before);
-  if(mode!=0&&mode!=5&&mode!=6)assert(e.io.std_files.at(1).seeks==0);
+  if(mode!=0&&mode!=5&&mode!=6&&mode<10)assert(e.io.std_files.at(1).seeks==0);
   if(mode==4)assert(feof(f));
   fclose(f);
  }
- std::cout<<"file position production probe: 10 cases passed\n";
+ std::cout<<"file position production probe: 13 cases passed\n";
 }
 """.replace('FUNCTION',t[a:b])
 with tempfile.TemporaryDirectory() as d:

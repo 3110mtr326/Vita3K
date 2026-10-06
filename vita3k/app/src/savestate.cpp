@@ -699,7 +699,8 @@ bool read_host_state(fs::ifstream &in, std::vector<IoFileRecord> &io_files,
 // destroyed since the save, and GXM object counts. A game that uses an
 // object destroyed after the save will see errors; see docs/savestate.md.
 // Runs only under the final kernel/thread/renderer exclusion. Never opens or writes files.
-static std::string probe_saved_file_positions(EmuEnvState &emuenv, const std::vector<IoFileRecord> &saved) {
+static std::string probe_saved_file_positions(EmuEnvState &emuenv, const std::vector<IoFileRecord> &saved,
+    const std::function<bool(const std::function<bool()> &)> &during) {
     struct Target { const FileStats *file; int64_t before, after; };
     std::vector<Target> targets;
     std::set<SceUID> ids;
@@ -725,6 +726,12 @@ static std::string probe_saved_file_positions(EmuEnvState &emuenv, const std::ve
         if (can_write(rec.open_mode)) return "Writable open file requires unsupported restoration";
         targets.push_back({&file, before, rec.offset});
     }
+    // Allocate the callback before changing any stream position.
+    const std::function<bool()> verify_saved = [&] {
+        for (const auto &target : targets)
+            if (target.file->tell() != target.after) return false;
+        return true;
+    };
     size_t touched = 0;
     bool applied = true;
     for (const auto &target : targets) {
@@ -734,8 +741,13 @@ static std::string probe_saved_file_positions(EmuEnvState &emuenv, const std::ve
             break;
         }
     }
-    for (size_t i = 0; i < touched; ++i)
-        if (targets[i].file->tell() != targets[i].after) applied = false;
+    if (applied) {
+        try {
+            applied = verify_saved() && during(verify_saved) && verify_saved();
+        } catch (...) {
+            applied = false; // Nested transactions undo before unwinding here.
+        }
+    }
     bool restored = true;
     while (touched) {
         const auto &target = targets[--touched];
@@ -751,7 +763,7 @@ static std::string probe_saved_file_positions(EmuEnvState &emuenv, const std::ve
         return "File position rollback failed; restart the application";
     }
     if (!applied) return "Saved file position probe failed; original positions restored";
-    LOG_INFO("Savestate file position probe: saved offsets MATCH; rollback MATCH; {} read-only files. Separate from RAM/context probe; no file contents restored.", targets.size());
+    LOG_INFO("Savestate file joint probe: saved offsets MATCH; nested checkpoint MATCH; rollback MATCH; {} read-only files; no file contents restored.", targets.size());
     return {};
 }
 
@@ -1451,7 +1463,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "File positions checked; joint RAM/CPU/sync/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU/sync/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
@@ -1632,18 +1644,19 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 || counts.deferred_contexts != saved_gxm_counts.deferred_contexts
                 || counts.immediate_context != saved_gxm_counts.immediate_context)
                 return "Graphics object counts changed since saving";
-            const auto file_result = probe_saved_file_positions(emuenv, saved_io_files);
-            if (!file_result.empty()) return file_result;
             const auto ram_result = audit_saved_ram(emuenv,in,pending_regions);
             if (!ram_result.empty()) return ram_result;
             std::string joint_error;
             bool simultaneous_check = false;
-            const auto ram_probe = probe_saved_ram(emuenv,in,pending_regions,
+            std::string ram_probe;
+            const auto file_result = probe_saved_file_positions(emuenv, saved_io_files,
+                [&](const std::function<bool()> &verify_files) {
+                ram_probe = probe_saved_ram(emuenv,in,pending_regions,
                 [&](const std::function<bool()> &verify_ram) {
                     const auto cpu_result = probe_saved_cpu_contexts(kernel,thread_records,[&] {
                         joint_error = probe_saved_sync_values(kernel,sema_records,mutex_records,lwmutex_records,
                             eventflag_records,simple_event_records,[&] {
-                                simultaneous_check = graphics_checkpoint(verify_ram);
+                                simultaneous_check = graphics_checkpoint([&] { return verify_ram() && verify_files(); });
                                 return simultaneous_check;
                             });
                         return joint_error.empty();
@@ -1651,9 +1664,13 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                     if (!cpu_result.empty()) joint_error = cpu_result;
                     return joint_error.empty();
                 });
+                return ram_probe.empty() && simultaneous_check;
+            });
+            if (!file_result.empty()) return file_result + (ram_probe.empty() ? "" : "; " + ram_probe)
+                + (joint_error.empty() ? "" : "; " + joint_error);
             if (!ram_probe.empty()) return joint_error.empty() ? ram_probe : ram_probe + "; " + joint_error;
-            if (!simultaneous_check) return "Joint RAM/CPU/sync/context checkpoint was not reached";
-            LOG_INFO("Savestate joint probe: RAM/CPU/sync/context saved values coexisted; all rollbacks MATCH; no guest instructions, wait replay or game rewind.");
+            if (!simultaneous_check) return "Joint files/RAM/CPU/sync/context checkpoint was not reached";
+            LOG_INFO("Savestate joint probe: files/RAM/CPU/sync/context saved values coexisted; all rollbacks MATCH; no guest instructions, wait replay or game rewind.");
             return {};
         }); // Unconditional return: no retained RAM changes, wait aborts or replay.
     }
