@@ -4,7 +4,39 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## NGS pending compressed input checkpoint (latest change, format v15)
+## NGS runtime decoder history checkpoint (latest change, format v15 unchanged)
+
+Phone evidence 2026-10-08 01:52: all prior joint/GPU rollbacks passed, Resume normal.
+Pending compressed input and resampler history were empty at capture and probe.
+Those non-empty paths remain covered by host tests, not this device run.
+
+The NGS transaction now includes histories in EXISTING runtime decoder instances:
+PCMDecoderState::adpcm_history and ATRAC9's MDCT history via export_state/load_state.
+It try-locks each present codec mutex while retaining scheduler/voice/memory locks.
+ATRAC9 handles/info, config equality and 1-2 channels are required before staging.
+Absent runtime decoders are counted and skipped, not created or claimed tested.
+No decoder send/receive, resampler rebuild or audio generation executes.
+
+SnapshotValueProbe's new bounded accessor field backs up history before mutation,
+loads saved history, reads it back before/after the nested checkpoint, restores
+original history and verifies bytes. Read/write false/exception is contained; a
+failed restore or unverifiable original sets RollbackFailed, triggering the existing
+persistent kernel resume veto and renderer abort. Every staged field still gets its
+undo attempt. Accessor allocation/backups finish before the first NGS write.
+
+The log reports PCM, ATRAC9 and absent decoder counts. This verifies history transfer
+through existing runtime APIs, not sample output correctness, decoder construction,
+resampler reconstruction or full game rewind. Module parameters/other modules,
+scheduler queues/output audio and complete guest-wait restoration remain unresolved.
+UI marker contains NGS-runtime-history. File format remains v15; fresh Save requested.
+
+Host validation: real savestate.cpp syntax; 48 production NGS cases with modeled
+runtime decoders, both histories applied during callback and restored, absent decoder
+and invalid handle/config rejection; accessor backup/read/write/restore failures and
+exceptions, plus existing codec/sync/session/Load tests. Real Android libatrac9 runtime
+history transfer and Resume behavior are the next device checkpoint.
+
+## NGS pending compressed input checkpoint (previous checkpoint, format v15)
 
 Phone evidence 2026-10-08 00:26 confirmed joint/GPU rollback and normal Resume.
 33 queues held 1024 current samples and zero current resampler history samples;

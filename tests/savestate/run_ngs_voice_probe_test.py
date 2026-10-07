@@ -33,7 +33,16 @@ struct Mem {std::unique_ptr<unsigned char[]> memory{new unsigned char[65536]{}};
 };
 struct ADPCMHistory{int32_t hist1=0,hist2=0,hist3=0,hist4=0;};
 struct Atrac9DecoderSavedState{double prev_values[2][256]{};};
+enum class DecoderQuery{CHANNELS};
+struct PCMDecoderState{std::mutex codec_mutex;ADPCMHistory adpcm_history[2]{};};
+struct Atrac9DecoderState{std::mutex codec_mutex;uint32_t config_data=0;void*decoder_handle=this;void*atrac9_info=this;Atrac9DecoderSavedState state{};
+ uint32_t get(DecoderQuery){return 2;}
+ void export_state(Atrac9DecoderSavedState*v){*v=state;}
+ void load_state(const Atrac9DecoderSavedState*v){state=*v;}};
 namespace ngs {
+struct ModuleRuntimeState{virtual ~ModuleRuntimeState()=default;};
+struct PlayerRuntimeState:ModuleRuntimeState{std::unique_ptr<PCMDecoderState>decoder{new PCMDecoderState};};
+struct Atrac9RuntimeState:ModuleRuntimeState{std::unique_ptr<Atrac9DecoderState>decoder{new Atrac9DecoderState};};
 struct ModuleLogicalState{virtual ~ModuleLogicalState()=default;};
 struct PCMFrameQueue{std::vector<float>samples{1,2,3,4};uint32_t read_offset_frames=1;};
 struct StereoRateResamplerLogicalState{PCMFrameQueue input_history;bool needs_reset=false;};
@@ -42,7 +51,7 @@ struct Atrac9LogicalState:ModuleLogicalState{std::vector<uint8_t>superframe_stag
 enum VoiceState{VOICE_STATE_AVAILABLE,VOICE_STATE_ACTIVE,VOICE_STATE_FINALIZING,VOICE_STATE_UNLOADING};
 struct Rack;
 struct Voice;
-struct ModuleData{std::unique_ptr<ModuleLogicalState>logical_state{new PlayerLogicalState};Voice*parent=nullptr;uint32_t index=0;std::vector<uint8_t>guest_state_data=std::vector<uint8_t>(24);};
+struct ModuleData{std::unique_ptr<ModuleRuntimeState>runtime_state{new PlayerRuntimeState};std::unique_ptr<ModuleLogicalState>logical_state{new PlayerLogicalState};Voice*parent=nullptr;uint32_t index=0;std::vector<uint8_t>guest_state_data=std::vector<uint8_t>(24);};
 struct Module{uint32_t id=0x5CE6;uint32_t module_id()const{return id;}uint32_t get_guest_state_size()const{return 24;}};
 struct Voice {Rack*rack=nullptr;std::unique_ptr<std::mutex>voice_mutex{new std::mutex};std::vector<ModuleData>datas=std::vector<ModuleData>(1);
  VoiceState state=VOICE_STATE_ACTIVE;bool is_pending=false,is_paused=false,is_keyed_off=false;uint32_t frame_count=100;};
@@ -72,13 +81,13 @@ int main(){
  std::istringstream in(bytes);assert((parse(in)==SaveStateResult::Success)==(mode==0));
  }
 
- for(int mode=0;mode<45;++mode){
+ for(int mode=0;mode<48;++mode){
  EmuEnvState e;Renderer r;e.renderer=&r;
  auto*sys=new(e.mem.memory.get()+4096)ngs::System;
  auto*rack=new(e.mem.memory.get()+8192)ngs::Rack;
  auto*voice=new(e.mem.memory.get()+12288)ngs::Voice;
  e.ngs.systems={sys};sys->racks={rack};rack->system=sys;rack->voices={{voice}};voice->rack=rack;voice->datas[0].parent=voice;rack->modules.push_back(std::make_unique<ngs::Module>());
- if(mode==28 || mode==32){rack->modules[0]->id=0x5CAA;voice->datas[0].logical_state=std::make_unique<ngs::Atrac9LogicalState>();}
+ if(mode==28 || mode==32 || mode==46 || mode==47){voice->datas[0].runtime_state=std::make_unique<ngs::Atrac9RuntimeState>();rack->modules[0]->id=0x5CAA;voice->datas[0].logical_state=std::make_unique<ngs::Atrac9LogicalState>();}
  if(mode==17)sys->racks={nullptr,rack,nullptr};
  if(mode==18)sys->racks={nullptr,nullptr};
  std::vector<NgsVoiceRecord> saved,current;
@@ -130,8 +139,13 @@ int main(){
  if(mode==42)pcm_saved[0].history.resize(NGS_PCM_MAX_SAMPLES+2);
  if(mode==43)pcm_saved[0].pending_input.resize(NGS_PENDING_MAX_BYTES+1);
  if(mode==44)pcm_saved[0].pending_input.clear();
+ if(mode==45)voice->datas[0].runtime_state.reset();
+ if(mode==46)static_cast<ngs::Atrac9RuntimeState*>(voice->datas[0].runtime_state.get())->decoder->config_data=123;
+ if(mode==47)static_cast<ngs::Atrac9RuntimeState*>(voice->datas[0].runtime_state.get())->decoder->decoder_handle=nullptr;
  auto result=snapshot_ngs_voices(e,current,&saved,[&]{
   ++called;
+  if(mode==28){auto*d=static_cast<ngs::Atrac9RuntimeState*>(voice->datas[0].runtime_state.get())->decoder.get();assert(reinterpret_cast<uint8_t*>(&d->state)[0]==13);}
+  else if(mode!=45){auto*d=static_cast<ngs::PlayerRuntimeState*>(voice->datas[0].runtime_state.get())->decoder.get();assert(reinterpret_cast<uint8_t*>(&d->adpcm_history)[0]==13);}
   auto &q=mode==28?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm;
   auto &rate=mode==28?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->rate_resampler:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->rate_resampler;
   assert(rate.input_history.samples==pcm_saved[0].history && rate.input_history.read_offset_frames==2 && rate.needs_reset);
@@ -148,24 +162,27 @@ int main(){
   return true;
  },mode>=19,&pcm_current,&pcm_saved);
  if(mode>=19 && mode<23)assert(called==1);
- if((mode>=23&&mode<28)||(mode>=29&&mode<=36)||(mode>=39&&mode<44))assert(called==0);
- if(mode==28||mode==37||mode==38||mode==44)assert(called==1);
+ if((mode>=23&&mode<28)||(mode>=29&&mode<=36)||(mode>=39&&mode<44)||mode>=46)assert(called==0);
+ if(mode==28||mode==37||mode==38||mode==44||mode==45)assert(called==1);
  assert(voice->datas[0].guest_state_data[0]==0);
- assert(result.empty()==(mode==0||mode==17||mode==19||mode==28||mode==37||mode==44));
+ assert(result.empty()==(mode==0||mode==17||mode==19||mode==28||mode==37||mode==44||mode==45));
  assert(voice->frame_count==100 && !voice->is_paused && voice->state==ngs::VOICE_STATE_ACTIVE);
  if(mode!=31){
- auto &q=(mode==28||mode==32)?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm;
- auto &rate=(mode==28||mode==32)?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->rate_resampler:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->rate_resampler;
+ auto &q=(mode==28||mode==32||mode==46||mode==47)?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm;
+ auto &rate=(mode==28||mode==32||mode==46||mode==47)?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->rate_resampler:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->rate_resampler;
  assert((rate.input_history.samples==std::vector<float>{1,2,3,4}) && rate.input_history.read_offset_frames==1 && !rate.needs_reset);
- auto &pending=(mode==28||mode==32)?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->superframe_staging:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->adpcm_buffer;
+ auto &pending=(mode==28||mode==32||mode==46||mode==47)?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->superframe_staging:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->adpcm_buffer;
  assert((pending==std::vector<uint8_t>{1,2,3}));
  assert((q.samples==std::vector<float>{1,2,3,4}) && q.read_offset_frames==1);
- if(mode==28||mode==32){auto*l=static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get());assert(reinterpret_cast<uint8_t*>(&l->saved_state)[0]==0 && l->current_loop_count==0);}
+ if(mode==28||mode==32||mode==46||mode==47){auto*l=static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get());assert(reinterpret_cast<uint8_t*>(&l->saved_state)[0]==0 && l->current_loop_count==0);}
  else {auto*l=static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get());assert(reinterpret_cast<uint8_t*>(&l->adpcm_history)[0]==0 && l->current_loop_count==0);}}
+ if(mode!=45){
+ if(mode==28||mode==32||mode==46||mode==47){auto*d=static_cast<ngs::Atrac9RuntimeState*>(voice->datas[0].runtime_state.get())->decoder.get();assert(reinterpret_cast<uint8_t*>(&d->state)[0]==0);}
+ else{auto*d=static_cast<ngs::PlayerRuntimeState*>(voice->datas[0].runtime_state.get())->decoder.get();assert(reinterpret_cast<uint8_t*>(&d->adpcm_history)[0]==0);}}
  assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
  voice->~Voice();rack->~Rack();sys->~System();
  }
- std::cout<<"NGS production probe: 45 capture/pending/joint/rollback/refusal and 5 record parsing cases passed\n";
+ std::cout<<"NGS production probe: 48 capture/runtime-history/joint/rollback/refusal and 5 record parsing cases passed\n";
 }
 """.replace('FUNCTION',t[a:b]).replace('PARSER',parser)
 with tempfile.TemporaryDirectory() as d:

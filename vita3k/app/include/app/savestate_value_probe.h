@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <memory>
+#include <functional>
 #include <array>
 #include <cstring>
 #include <set>
@@ -54,6 +55,22 @@ class SnapshotValueProbe {
                 && (target.empty() || std::memcmp(target.data(),expected.data(),target.size()*sizeof(T))==0);
         }
     };
+    template<class T>struct AccessBytes final:Field {
+        std::function<bool(T&)> read;
+        std::function<bool(const T&)> write;
+        T before{},after{};
+        bool applied_ok=false,restored_ok=false;
+        AccessBytes(const void*saved,std::function<bool(T&)>r,std::function<bool(const T&)>w):read(std::move(r)),write(std::move(w)){
+            std::memcpy(&after,saved,sizeof(T));
+            if(!read(before))throw std::runtime_error("Snapshot runtime history backup failed");
+        }
+        void apply()noexcept override{try{applied_ok=write(after);}catch(...){applied_ok=false;}}
+        void undo()noexcept override{try{restored_ok=write(before);}catch(...){restored_ok=false;}}
+        bool matches(bool saved)const noexcept override{
+            if(!(saved?applied_ok:restored_ok))return false;
+            try{T current{};return read(current)&&std::memcmp(&current,saved?&after:&before,sizeof(T))==0;}catch(...){return false;}
+        }
+    };
     std::vector<std::unique_ptr<Field>> fields;
     std::set<const void*> addresses;
     bool applied=false,finished=false;
@@ -84,6 +101,13 @@ public:
         if(applied||finished||!addresses.insert(&target).second)
             throw std::invalid_argument("Duplicate or closed snapshot vector");
         fields.push_back(std::make_unique<VectorBytes<T>>(target,saved));
+    }
+    template<class T>void stage_access_bytes(const void*identity,const void*saved,
+        std::function<bool(T&)>read,std::function<bool(const T&)>write){
+        static_assert(std::is_trivially_copyable_v<T>);
+        if(!identity||!saved||applied||finished||!addresses.insert(identity).second)
+            throw std::invalid_argument("Duplicate or closed snapshot runtime");
+        fields.push_back(std::make_unique<AccessBytes<T>>(saved,std::move(read),std::move(write)));
     }
     size_t size()const noexcept{return fields.size();}
     template<class During>Result probe_with(During during)noexcept {

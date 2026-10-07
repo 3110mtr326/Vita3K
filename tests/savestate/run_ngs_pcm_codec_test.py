@@ -42,7 +42,16 @@ int main(){
  const auto result=probe.probe_with([&]{assert(target==saved);if(mode==1)return false;if(mode==2){target.resize(100);throw 1;}if(mode==3)target[0]=0;return true;});
  assert((result==SnapshotValueProbe::Result::Passed)==(mode==0));assert(target.data()==original&&target.capacity()==cap&&target.size()==r.samples.size());assert(std::memcmp(target.data(),r.samples.data(),16)==0);
  }
- std::cout<<"PASS: PCM/resampler/pending codec bit patterns, framing/truncation, identity/size limits; vector pointer/capacity/data rollback on success, false, exception and mutation\n";
+ for(int mode=0;mode<8;++mode){uint32_t value=7,saved=9;int writes=0;SnapshotValueProbe probe;
+ probe.stage_access_bytes<uint32_t>(&value,&saved,[&](uint32_t&out){if(mode==3&&value==9)return false;if(mode==5&&writes==2)throw 1;out=value;return true;},
+ [&](const uint32_t&in){++writes;if(mode==4&&writes==2)return false;value=in;if(mode==1&&writes==1)return false;if(mode==2&&writes==1)throw 1;return true;});
+ auto result=probe.probe_with([&]{assert(value==9);if(mode==6)return false;if(mode==7)throw 1;return true;});
+ assert(writes==2);if(mode!=4)assert(value==7);
+ assert(result==(mode==0?SnapshotValueProbe::Result::Passed:(mode==4||mode==5)?SnapshotValueProbe::Result::RollbackFailed:SnapshotValueProbe::Result::ApplyMismatch));
+ }
+ {uint32_t value=7,saved=9;SnapshotValueProbe probe;bool caught=false;
+ try{probe.stage_access_bytes<uint32_t>(&value,&saved,[](uint32_t&){return false;},[&](const uint32_t&){assert(false);return false;});}catch(...){caught=true;}assert(caught&&value==7);}
+ std::cout<<"PASS: PCM/resampler/pending codec bit patterns, framing/truncation, identity/size limits; vector rollback and runtime accessor apply/read/write/rollback failure handling\n";
 }
 """
 with tempfile.TemporaryDirectory() as d:

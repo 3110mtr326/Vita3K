@@ -878,7 +878,8 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     }
     if (saved->size() != captured.size()) return "NGS voice count changed since saving";
     if (saved_pcm && saved_pcm->size()!=captured_pcm->size()) return "NGS PCM queue count changed";
-    size_t pcm_index=0;
+    size_t pcm_index=0,pcm_decoders=0,atrac_decoders=0,absent_decoders=0;
+    std::vector<std::unique_lock<std::mutex>> codec_locks;
     SnapshotValueProbe transaction;
     for (size_t i=0;i<captured.size();++i) {
         const auto &before=captured[i]; const auto &after=(*saved)[i];
@@ -898,6 +899,31 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
             for (size_t k=0;k<source.bytes.size();++k) transaction.stage(bytes[k],source.bytes[k]);
             // Preserve native runtime decoder instances; probe only pointer-free logical history.
             auto &data=voice.datas[source.index];
+            if (source.module_id==0x5CE6) {
+                auto *runtime=static_cast<ngs::PlayerRuntimeState*>(data.runtime_state.get());
+                if (runtime && runtime->decoder) {
+                    auto *decoder=runtime->decoder.get();
+                    codec_locks.emplace_back(decoder->codec_mutex,std::try_to_lock);
+                    if (!codec_locks.back().owns_lock()) return "PCM runtime decoder is busy";
+                    transaction.stage_object_bytes(decoder->adpcm_history,source.history.data());
+                    ++pcm_decoders;
+                } else ++absent_decoders;
+            } else {
+                auto *runtime=static_cast<ngs::Atrac9RuntimeState*>(data.runtime_state.get());
+                if (runtime && runtime->decoder) {
+                    auto *decoder=runtime->decoder.get();
+                    codec_locks.emplace_back(decoder->codec_mutex,std::try_to_lock);
+                    if (!codec_locks.back().owns_lock()) return "ATRAC9 runtime decoder is busy";
+                    if (!decoder->decoder_handle || !decoder->atrac9_info || decoder->config_data!=source.decoder_config)
+                        return "ATRAC9 runtime decoder configuration mismatch";
+                    const auto channels=decoder->get(DecoderQuery::CHANNELS);
+                    if (channels<1 || channels>2) return "Unsupported ATRAC9 channel count";
+                    transaction.stage_access_bytes<Atrac9DecoderSavedState>(decoder,source.history.data(),
+                        [decoder](Atrac9DecoderSavedState &value){decoder->export_state(&value);return true;},
+                        [decoder](const Atrac9DecoderSavedState &value){decoder->load_state(&value);return true;});
+                    ++atrac_decoders;
+                } else ++absent_decoders;
+            }
             if (saved_pcm) {
                 const auto &pcm=(*saved_pcm)[pcm_index++];
                 if (pcm.voice!=after.voice || pcm.index!=source.index || pcm.module_id!=source.module_id)
@@ -938,6 +964,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     }
     if (result!=SnapshotValueProbe::Result::Passed) return "NGS saved voice values did not match";
     LOG_INFO("Savestate NGS voice probe: saved scalars/playback/history bytes MATCH; nested checkpoint MATCH; rollback MATCH; {} voices, {} fields, {} playback modules; no audio rewind.",captured.size(),transaction.size(),playback_modules);
+    LOG_INFO("Savestate NGS runtime history probe: {} PCM decoders, {} ATRAC9 decoders, {} absent; saved histories MATCH; original runtime histories restored; no decoding executed.",pcm_decoders,atrac_decoders,absent_decoders);
     size_t saved_pending_bytes=0;
     if (saved_pcm) for (const auto &record:*saved_pcm) saved_pending_bytes+=record.pending_input.size();
     LOG_INFO("Savestate NGS pending input probe: {} saved bytes, {} current bytes; saved contents MATCH; original buffers restored. Empty buffers do not exercise partial-frame restoration.",saved_pending_bytes,pending_bytes);
@@ -1720,7 +1747,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU/sync/NGS-pending/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU/sync/NGS-runtime-history/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
