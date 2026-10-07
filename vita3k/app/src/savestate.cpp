@@ -139,7 +139,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 10; // v10: adds bounded NGS voice scalar records after host state
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 11; // v11: bounded NGS guest playback records alongside voice scalars
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -700,18 +700,37 @@ bool read_host_state(fs::ifstream &in, std::vector<IoFileRecord> &io_files,
 // object destroyed after the save will see errors; see docs/savestate.md.
 
 // NGS logical scalars only. No decoder, queue or audio backend restoration.
+struct NgsPlaybackRecord {
+    uint32_t index = 0, module_id = 0;
+    // SceNgsPlayerStates and SceNgsAT9States each contain six SceInt32 fields.
+    std::array<uint8_t,24> bytes{};
+};
 struct NgsVoiceRecord {
     uint32_t system, rack, voice, state, pending, paused, keyed_off, frames, modules;
+    uint32_t playback_count = 0;
+    std::array<NgsPlaybackRecord,16> playback{};
 };
-static_assert(sizeof(NgsVoiceRecord) == 9 * sizeof(uint32_t));
+static_assert(sizeof(NgsPlaybackRecord) == 32);
+static_assert(sizeof(NgsVoiceRecord) == 552);
 
 static bool valid_ngs_records(const std::vector<NgsVoiceRecord> &records) {
     if (records.size() > 4096) return false;
     std::set<uint32_t> ids;
-    for (const auto &r : records)
+    for (const auto &r : records) {
         if (!r.system || !r.rack || !r.voice || !ids.insert(r.voice).second
             || r.state > uint32_t(ngs::VOICE_STATE_UNLOADING)
-            || r.pending > 1 || r.paused > 1 || r.keyed_off > 1 || r.modules > 256) return false;
+            || r.pending > 1 || r.paused > 1 || r.keyed_off > 1 || r.modules > 256
+            || r.playback_count > r.playback.size()) return false;
+        std::set<uint32_t> indices;
+        for (size_t i=0;i<r.playback_count;++i) {
+            const auto &p=r.playback[i];
+            if (p.index>=r.modules || !indices.insert(p.index).second
+                || (p.module_id!=0x5CE6 && p.module_id!=0x5CAA)) return false;
+            int32_t buffer = 0;
+            std::memcpy(&buffer,p.bytes.data()+sizeof(int32_t),sizeof(buffer));
+            if (buffer < -1 || buffer > 3) return false;
+        }
+    }
     return true;
 }
 
@@ -778,13 +797,30 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
                 if (captured.size() >= 4096 || voice->datas.size() > 256) return "NGS voice limit exceeded";
                 captured.push_back({system_id,rack_id,voice_id,uint32_t(voice->state),uint32_t(voice->is_pending),
                     uint32_t(voice->is_paused),uint32_t(voice->is_keyed_off),voice->frame_count,uint32_t(voice->datas.size())});
+                auto &record=captured.back();
+                if (rack->modules.size()!=voice->datas.size()) return "NGS module layout mismatch";
+                for (size_t index=0;index<voice->datas.size();++index) {
+                    const auto &module=rack->modules[index];
+                    if (!module) return "Missing NGS module";
+                    const auto id=module->module_id();
+                    if (id!=0x5CE6 && id!=0x5CAA) continue;
+                    const auto &data=voice->datas[index];
+                    if (data.parent!=voice || data.index!=index || module->get_guest_state_size()!=24
+                        || data.guest_state_data.size()!=24) return "NGS playback state layout mismatch";
+                    if (record.playback_count>=record.playback.size()) return "Too many NGS playback modules";
+                    auto &playback=record.playback[record.playback_count++];
+                    playback.index=static_cast<uint32_t>(index);playback.module_id=id;
+                    std::copy(data.guest_state_data.begin(),data.guest_state_data.end(),playback.bytes.begin());
+                }
                 targets.push_back(voice);
             }
         }
     }
     if (!valid_ngs_records(captured)) return "Invalid current NGS voice values";
+    size_t playback_modules=0;
+    for (const auto &record : captured) playback_modules+=record.playback_count;
     if (!saved) {
-        LOG_INFO("Savestate NGS capture: {} voices; logical scalars only, no decoder state.",captured.size());
+        LOG_INFO("Savestate NGS capture: {} voices, {} playback modules; guest positions only, no decoder history.",captured.size(),playback_modules);
         return {};
     }
     if (saved->size() != captured.size()) return "NGS voice count changed since saving";
@@ -799,6 +835,13 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
         transaction.stage(voice.is_paused,bool(after.paused));
         transaction.stage(voice.is_keyed_off,bool(after.keyed_off));
         transaction.stage(voice.frame_count,after.frames);
+        if (before.playback_count!=after.playback_count) return "NGS playback module count changed";
+        for (size_t j=0;j<after.playback_count;++j) {
+            const auto &source=after.playback[j];const auto &live=before.playback[j];
+            if (source.index!=live.index || source.module_id!=live.module_id) return "NGS playback module identity changed";
+            auto &bytes=voice.datas[source.index].guest_state_data;
+            for (size_t k=0;k<source.bytes.size();++k) transaction.stage(bytes[k],source.bytes[k]);
+        }
     }
     const auto result=transaction.probe_with([&] { return !during || during(); });
     if (result==SnapshotValueProbe::Result::RollbackFailed) {
@@ -807,7 +850,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
         return "NGS voice rollback failed; restart the application";
     }
     if (result!=SnapshotValueProbe::Result::Passed) return "NGS saved voice values did not match";
-    LOG_INFO("Savestate NGS voice probe: saved scalars MATCH; nested checkpoint MATCH; rollback MATCH; {} voices, {} fields; no audio rewind.",captured.size(),transaction.size());
+    LOG_INFO("Savestate NGS voice probe: saved scalars/playback bytes MATCH; nested checkpoint MATCH; rollback MATCH; {} voices, {} fields, {} playback modules; no audio rewind.",captured.size(),transaction.size(),playback_modules);
     return {};
 }
 
@@ -1350,7 +1393,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             *out_detail = "GPU image capture unsupported, busy or incomplete; the previous save was not replaced";
         return SaveStateResult::ErrorGraphicsNotReady;
     }
-    LOG_INFO("Savestate: {} logical contexts and {} image-section bytes encoded for v10; restoration remains unsupported.",
+    LOG_INFO("Savestate: {} logical contexts and {} image-section bytes encoded for v11; restoration remains unsupported.",
         graphics.records.size(), image_bytes->size());
 
     // Keep snapshot locks until disk serialization ends, including on errors.
@@ -1584,7 +1627,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU/sync/NGS/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU/sync/NGS-playback/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;

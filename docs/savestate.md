@@ -4,7 +4,39 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Joint NGS scalar checkpoint (latest change)
+## NGS guest playback checkpoint (latest change, format v11)
+
+Phone evidence 2026-10-07 12:30 confirmed joint files/RAM/CPU/sync/NGS/context
+rollback, 34 voices/170 scalar fields, and separate live GPU rollback. Resume normal.
+
+Format v11 extends each NGS voice record with up to 16 playback module records.
+Each contains module index/ID and the 24 bytes of guest_state_data for Player
+(0x5CE6, PCM/ADPCM) or ATRAC9 (0x5CAA). These are six guest-visible int32 counters:
+byte position, buffer index, generated/consumed counts since key-on and totals.
+They reside in host-owned vectors and were absent from the previous RAM snapshot.
+Save verifies the runtime module's advertised state size and actual buffer size,
+parent/index, and module count. Only those two IDs are included; other module data
+remains excluded. Records reject duplicate/out-of-range indices, unknown IDs and
+buffer indices outside -1..3. Format v10 files are refused; a fresh Save is required.
+Records are fixed-size, bounded to 4096 voices, and contain no native pointers.
+
+The existing joint NGS transaction stages the playback bytes alongside scalar
+fields under scheduler/voice/memory locks, checks saved values before and after
+the inner graphics callback, then restores originals. It never resizes live buffers,
+executes audio processing, changes module parameters or replaces a runtime decoder.
+Capture/probe logs include playback module count so empty coverage is observable.
+
+This is NOT decoder history restoration: decoded PCM queues, predictor/MDCT history,
+resampler state, parameters, scheduler queues, other modules and output backend
+still need restoration. Full game rewind remains unsupported. GPU probing remains
+separate. UI: Joint files/RAM/CPU/sync/NGS-playback/context roundtrip checked.
+
+Host checks: actual savestate.cpp syntax; 29 extracted production NGS cases including
+Player and ATRAC9, saved playback bytes visible during nested callbacks and restored
+after success/false/throw/mutation, module mismatch/size/index guards; five record
+parsing cases; existing session-layout and Load-flow tests. Android/device unverified.
+
+## Joint NGS scalar checkpoint (previous checkpoint)
 
 Phone result 2026-10-07 02:04: separate NGS probe passed for 34 voices / 170
 scalar fields. Joint files/RAM/CPU/sync/context and live GPU rollback also passed;
