@@ -4,7 +4,32 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## NGS decoded PCM queue checkpoint (latest change, format v13)
+## NGS logical resampler checkpoint (latest change, format v14)
+
+Phone evidence 2026-10-07 23:06 confirmed 33 decoded queues, 1024 current samples,
+1094 NGS fields, joint/GPU rollback, and normal Resume.
+
+NPC2 extends each PCM record with the stereo resampler's input-history samples,
+frame offset and reset flag. Format v14 rejects earlier files. Both PCM and history
+vectors share the existing 8 MiB total sample budget, each retains the 131072 sample
+limit, even stereo count and frame-offset validation. Reset flags must be 0 or 1.
+Records remain explicitly little endian and preserve float bit patterns. Save checks
+history limits under NGS locks before copying. Parsing validates before applying.
+
+The joint NGS transaction swaps saved history vectors and stages offset/reset flag
+alongside the decoded queues, playback positions and decoder histories. It verifies
+saved values around the inner graphics checkpoint and restores original vector
+storage/capacity/content and scalar values. Logs distinguish combined sample count
+from resampler history samples. Runtime SwrContext, rates and scratch buffers are
+not changed or invoked. This does not yet validate replay_history's reconstruction
+accuracy, phase or delay; no audio generation or playable rewind is implemented.
+
+Host checks: actual savestate.cpp syntax; 43 production NGS cases plus five reader
+cases; PCM/resampler codec tests with bit patterns, truncation and malformed history
+sizes/offsets/reset flag; existing session and Load-flow tests. Device/Android build
+remain unverified. UI marker contains NGS-resampler. Fresh Save required.
+
+## NGS decoded PCM queue checkpoint (previous checkpoint, format v13)
 
 Phone evidence 2026-10-07 21:31 confirmed prior histories, 34 voices / 33 playback
 modules / 1028 staged fields, and all joint/GPU rollbacks; Resume was normal.

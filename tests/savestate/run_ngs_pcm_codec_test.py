@@ -11,16 +11,22 @@ code=r"""
 using namespace app;
 int main(){
  NgsPcmRecord r{4096,0,0x5CE6,1,{std::bit_cast<float>(0x80000000u),std::bit_cast<float>(0x7fc01234u),3,4}};
+ r.history={std::bit_cast<float>(0x7fc05678u),std::bit_cast<float>(0x80000000u)};r.history_offset=1;r.needs_reset=1;
  std::ostringstream out;assert(write_ngs_pcm(out,{r}));const auto bytes=out.str();
  std::vector<NgsPcmRecord>decoded;
  std::istringstream in(bytes+"TAIL");assert(read_ngs_pcm(in,decoded));assert(in.get()=='T');
+ assert(decoded[0].history_offset==1 && decoded[0].needs_reset==1 && std::memcmp(decoded[0].history.data(),r.history.data(),8)==0);
  assert(decoded.size()==1 && decoded[0].offset==1 && std::memcmp(decoded[0].samples.data(),r.samples.data(),16)==0);
  for(size_t n=0;n<bytes.size();++n){std::istringstream bad(bytes.substr(0,n));decoded={r};assert(!read_ngs_pcm(bad,decoded));assert(decoded.size()==1);}
- for(int mode=0;mode<8;++mode){auto invalid=r;
+ for(int mode=0;mode<12;++mode){auto invalid=r;
  if(mode==0)invalid.voice=0;if(mode==1)invalid.index=256;if(mode==2)invalid.module_id=0;
  if(mode==3)invalid.offset=3;if(mode==4)invalid.samples.push_back(0);
  if(mode==5)invalid.samples.resize(NGS_PCM_MAX_SAMPLES+2);
  std::vector<NgsPcmRecord>records{invalid};
+ if(mode==8)records[0].history_offset=2;
+ if(mode==9)records[0].needs_reset=2;
+ if(mode==10)records[0].history.push_back(0);
+ if(mode==11)records[0].history.resize(NGS_PCM_MAX_SAMPLES+2);
  if(mode==6)records.push_back(invalid);
  if(mode==7){records.clear();for(uint32_t j=0;j<17;++j){auto big=r;big.voice+=j;big.samples.resize(NGS_PCM_MAX_SAMPLES);records.push_back(std::move(big));}}
  std::ostringstream refused;assert(!write_ngs_pcm(refused,records));assert(refused.str().empty());
@@ -32,7 +38,7 @@ int main(){
  const auto result=probe.probe_with([&]{assert(target==saved);if(mode==1)return false;if(mode==2){target.resize(100);throw 1;}if(mode==3)target[0]=0;return true;});
  assert((result==SnapshotValueProbe::Result::Passed)==(mode==0));assert(target.data()==original&&target.capacity()==cap&&target.size()==r.samples.size());assert(std::memcmp(target.data(),r.samples.data(),16)==0);
  }
- std::cout<<"PASS: PCM codec bit patterns, framing/truncation, identity/size limits; vector pointer/capacity/data rollback on success, false, exception and mutation\n";
+ std::cout<<"PASS: PCM/resampler codec bit patterns, framing/truncation, identity/size limits; vector pointer/capacity/data rollback on success, false, exception and mutation\n";
 }
 """
 with tempfile.TemporaryDirectory() as d:
