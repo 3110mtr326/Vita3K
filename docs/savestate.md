@@ -4,7 +4,33 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## NGS logical resampler checkpoint (latest change, format v14)
+## NGS pending compressed input checkpoint (latest change, format v15)
+
+Phone evidence 2026-10-08 00:26 confirmed joint/GPU rollback and normal Resume.
+33 queues held 1024 current samples and zero current resampler history samples;
+non-empty resampler-history recovery is not established by that phone run.
+
+NPC3 adds pending_input bytes for each supported module: Player adpcm_buffer or
+ATRAC9 superframe_staging. Format v15 rejects older snapshots. Capture checks
+64 KiB per buffer and 1 MiB total before copying; serialization and parsing enforce
+the same bounds. Truncated data is refused before any probe. The complete current
+buffer is replaced temporarily through the existing allocation-before-apply vector
+transaction, verified while histories/scalars/PCM/resampler states coexist, then
+undone with original storage/capacity/content verification. No decoder is invoked.
+
+Logs show saved and current pending byte counts. Both zero means this phone run
+did not exercise partial-frame data restoration. Existing PCM/history sample budget
+is unchanged. This completes capture of the currently defined Player/ATRAC9 logical
+state fields, but does not restore runtime decoder/resampler instances, module
+parameters, other modules, scheduler/patch graphs, output audio or full guest waits.
+Full playable rewind remains unsupported. UI contains NGS-pending.
+
+Host checks: actual savestate.cpp syntax; 45 production NGS cases plus five record
+reader cases; codec bitwise roundtrip/truncation and per-buffer/aggregate bounds;
+non-empty/empty saved buffers, nested failures and mutation rollback; existing
+session and Load-flow tests. Android build and device execution remain unverified.
+
+## NGS logical resampler checkpoint (previous checkpoint, format v14)
 
 Phone evidence 2026-10-07 23:06 confirmed 33 decoded queues, 1024 current samples,
 1094 NGS fields, joint/GPU rollback, and normal Resume.

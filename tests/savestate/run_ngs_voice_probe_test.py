@@ -37,8 +37,8 @@ namespace ngs {
 struct ModuleLogicalState{virtual ~ModuleLogicalState()=default;};
 struct PCMFrameQueue{std::vector<float>samples{1,2,3,4};uint32_t read_offset_frames=1;};
 struct StereoRateResamplerLogicalState{PCMFrameQueue input_history;bool needs_reset=false;};
-struct PlayerLogicalState:ModuleLogicalState{PCMFrameQueue decoded_pcm;StereoRateResamplerLogicalState rate_resampler;ADPCMHistory adpcm_history[2]{};int8_t current_loop_count=0;};
-struct Atrac9LogicalState:ModuleLogicalState{PCMFrameQueue decoded_pcm;StereoRateResamplerLogicalState rate_resampler;Atrac9DecoderSavedState saved_state{};int8_t current_loop_count=0;uint32_t decoder_config=0;};
+struct PlayerLogicalState:ModuleLogicalState{std::vector<uint8_t>adpcm_buffer{1,2,3};PCMFrameQueue decoded_pcm;StereoRateResamplerLogicalState rate_resampler;ADPCMHistory adpcm_history[2]{};int8_t current_loop_count=0;};
+struct Atrac9LogicalState:ModuleLogicalState{std::vector<uint8_t>superframe_staging{1,2,3};PCMFrameQueue decoded_pcm;StereoRateResamplerLogicalState rate_resampler;Atrac9DecoderSavedState saved_state{};int8_t current_loop_count=0;uint32_t decoder_config=0;};
 enum VoiceState{VOICE_STATE_AVAILABLE,VOICE_STATE_ACTIVE,VOICE_STATE_FINALIZING,VOICE_STATE_UNLOADING};
 struct Rack;
 struct Voice;
@@ -72,7 +72,7 @@ int main(){
  std::istringstream in(bytes);assert((parse(in)==SaveStateResult::Success)==(mode==0));
  }
 
- for(int mode=0;mode<43;++mode){
+ for(int mode=0;mode<45;++mode){
  EmuEnvState e;Renderer r;e.renderer=&r;
  auto*sys=new(e.mem.memory.get()+4096)ngs::System;
  auto*rack=new(e.mem.memory.get()+8192)ngs::Rack;
@@ -85,6 +85,7 @@ int main(){
  std::vector<NgsPcmRecord> pcm_saved,pcm_current;
  assert(snapshot_ngs_voices(e,saved,nullptr,{},false,&pcm_saved).empty());assert(saved.size()==(mode==18?0:1));
  if(mode==18){assert(snapshot_ngs_voices(e,current,&saved).empty());voice->~Voice();rack->~Rack();sys->~System();continue;}
+ pcm_saved[0].pending_input={0,255,9,8,7};
  pcm_saved[0].samples={9,8};pcm_saved[0].offset=0;
  pcm_saved[0].history={7,6,5,4,3,2};pcm_saved[0].history_offset=2;pcm_saved[0].needs_reset=1;
  saved[0].playback[0].bytes[0]=77;
@@ -127,13 +128,17 @@ int main(){
  if(mode==40)pcm_saved[0].history_offset=4;
  if(mode==41)pcm_saved[0].history.push_back(0);
  if(mode==42)pcm_saved[0].history.resize(NGS_PCM_MAX_SAMPLES+2);
+ if(mode==43)pcm_saved[0].pending_input.resize(NGS_PENDING_MAX_BYTES+1);
+ if(mode==44)pcm_saved[0].pending_input.clear();
  auto result=snapshot_ngs_voices(e,current,&saved,[&]{
   ++called;
   auto &q=mode==28?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm;
   auto &rate=mode==28?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->rate_resampler:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->rate_resampler;
   assert(rate.input_history.samples==pcm_saved[0].history && rate.input_history.read_offset_frames==2 && rate.needs_reset);
+  auto &pending=mode==28?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->superframe_staging:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->adpcm_buffer;
+  assert(pending==pcm_saved[0].pending_input);
   assert(q.samples==pcm_saved[0].samples && q.read_offset_frames==pcm_saved[0].offset);
-  if(mode==38){q.samples.push_back(42);throw std::runtime_error("queue mutation");}
+  if(mode==38){pending.resize(100);q.samples.push_back(42);throw std::runtime_error("queue mutation");}
   if(mode==28){auto*l=static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get());assert(reinterpret_cast<uint8_t*>(&l->saved_state)[0]==13 && l->current_loop_count==2);}
   else{auto*l=static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get());assert(reinterpret_cast<uint8_t*>(&l->adpcm_history)[0]==13 && l->current_loop_count==2);}
   assert(voice->datas[0].guest_state_data[0]==77);assert(voice->frame_count==42 && voice->is_paused && voice->state==ngs::VOICE_STATE_AVAILABLE);
@@ -143,22 +148,24 @@ int main(){
   return true;
  },mode>=19,&pcm_current,&pcm_saved);
  if(mode>=19 && mode<23)assert(called==1);
- if((mode>=23&&mode<28)||(mode>=29&&mode<=36)||mode>=39)assert(called==0);
- if(mode==28||mode==37||mode==38)assert(called==1);
+ if((mode>=23&&mode<28)||(mode>=29&&mode<=36)||(mode>=39&&mode<44))assert(called==0);
+ if(mode==28||mode==37||mode==38||mode==44)assert(called==1);
  assert(voice->datas[0].guest_state_data[0]==0);
- assert(result.empty()==(mode==0||mode==17||mode==19||mode==28||mode==37));
+ assert(result.empty()==(mode==0||mode==17||mode==19||mode==28||mode==37||mode==44));
  assert(voice->frame_count==100 && !voice->is_paused && voice->state==ngs::VOICE_STATE_ACTIVE);
  if(mode!=31){
  auto &q=(mode==28||mode==32)?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm;
  auto &rate=(mode==28||mode==32)?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->rate_resampler:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->rate_resampler;
  assert((rate.input_history.samples==std::vector<float>{1,2,3,4}) && rate.input_history.read_offset_frames==1 && !rate.needs_reset);
+ auto &pending=(mode==28||mode==32)?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->superframe_staging:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->adpcm_buffer;
+ assert((pending==std::vector<uint8_t>{1,2,3}));
  assert((q.samples==std::vector<float>{1,2,3,4}) && q.read_offset_frames==1);
  if(mode==28||mode==32){auto*l=static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get());assert(reinterpret_cast<uint8_t*>(&l->saved_state)[0]==0 && l->current_loop_count==0);}
  else {auto*l=static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get());assert(reinterpret_cast<uint8_t*>(&l->adpcm_history)[0]==0 && l->current_loop_count==0);}}
  assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
  voice->~Voice();rack->~Rack();sys->~System();
  }
- std::cout<<"NGS production probe: 43 capture/resampler/joint/rollback/refusal and 5 record parsing cases passed\n";
+ std::cout<<"NGS production probe: 45 capture/pending/joint/rollback/refusal and 5 record parsing cases passed\n";
 }
 """.replace('FUNCTION',t[a:b]).replace('PARSER',parser)
 with tempfile.TemporaryDirectory() as d:
