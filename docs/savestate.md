@@ -4,7 +4,40 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## NGS logical decoder history checkpoint (latest change, format v12)
+## NGS decoded PCM queue checkpoint (latest change, format v13)
+
+Phone evidence 2026-10-07 21:31 confirmed prior histories, 34 voices / 33 playback
+modules / 1028 staged fields, and all joint/GPU rollbacks; Resume was normal.
+
+Format v13 appends NPC1 after NGS voice records. For each supported Player/ATRAC9
+module it stores voice ID, module index/ID, read offset in stereo frames, sample
+count and all decoded PCM samples (including the consumed prefix). Fields and float
+bit patterns are encoded as explicit little-endian uint32 values. Limits: 2048
+queues, 131072 float samples per queue, 2097152 samples / 8 MiB total. Odd stereo
+counts, out-of-range offsets, duplicate keys, unsupported IDs, excess sizes and
+truncation are refused. Read failure does not replace the destination records.
+Queue identities/count must exactly match current supported modules before application.
+
+Save captures queues under the existing NGS locks. The joint NGS transaction stages
+both sample vectors and read offsets beside histories/scalars. Vector staging makes
+all allocations before application. Application/undo use noexcept swap; original
+buffer address/capacity, size and bitwise content are verified after undo. Saved bytes
+are verified before and after the inner graphics checkpoint. Nested false, exception
+or queue mutation still unwinds every domain. GPU remains a separate later probe.
+Extra queue copies during capture/staging are bounded by the per-snapshot budget.
+
+This restores logical queues temporarily, not output-backend audio, resampler state,
+module parameters, pending compressed input or runtime decoder operation. No audio
+is emitted and no game rewind is committed. v12 files are incompatible; fresh Save
+required. UI includes NGS-PCM. Log includes queue count and current stored samples.
+
+Host checks: actual savestate.cpp syntax; 39 extracted NGS capture/joint cases plus
+five full NGS record reader cases; dedicated PCM codec truncation/framing/budget
+and bit-pattern tests; vector pointer/capacity/data rollback on success, callback
+false, exception and mutation; session/Load-flow tests. Android build and device
+execution are still required for this checkpoint.
+
+## NGS logical decoder history checkpoint (previous checkpoint, format v12)
 
 Phone evidence 2026-10-07 19:56 confirmed 34 voices, 33 playback modules and 962
 scalar/byte fields in the prior joint probe; all rollbacks and GPU checks passed.

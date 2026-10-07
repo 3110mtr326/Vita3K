@@ -106,6 +106,7 @@
 #include <functional>
 #include <audio/state.h>
 #include <ngs/state.h>
+#include <app/savestate_ngs_pcm.h>
 #include <ngs/system.h>
 #include <ngs/modules/player.h>
 #include <ngs/modules/atrac9.h>
@@ -141,7 +142,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 12; // v12: bounded logical decoder histories; maximum 128 voices
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 13; // v13: adds bounded NPC1 decoded PCM queues
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -749,8 +750,13 @@ static bool valid_ngs_records(const std::vector<NgsVoiceRecord> &records) {
 // That internal caller MUST continuously own both memory metadata mutexes.
 static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     std::vector<NgsVoiceRecord> &captured, const std::vector<NgsVoiceRecord> *saved = nullptr,
-    const std::function<bool()> &during = {}, bool metadata_locked = false) {
+    const std::function<bool()> &during = {}, bool metadata_locked = false,
+    std::vector<NgsPcmRecord> *captured_pcm = nullptr, const std::vector<NgsPcmRecord> *saved_pcm = nullptr) {
     if (saved && !valid_ngs_records(*saved)) return "Invalid saved NGS voice records";
+    if (saved_pcm && (!captured_pcm || !saved || !valid_ngs_pcm(*saved_pcm))) return "Invalid NGS PCM records";
+    if (saved && captured_pcm && !saved_pcm) return "Missing saved NGS PCM records";
+    if (captured_pcm) captured_pcm->clear();
+    size_t pcm_samples=0;
     auto &mem = emuenv.mem;
     std::unique_lock<std::mutex> allocation(mem.generation_mutex, std::defer_lock);
     std::unique_lock<std::mutex> protection(mem.protect_mutex, std::defer_lock);
@@ -822,17 +828,27 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
                     playback.index=static_cast<uint32_t>(index);playback.module_id=id;
                     std::copy(data.guest_state_data.begin(),data.guest_state_data.end(),playback.bytes.begin());
                     if (!data.logical_state) return "Missing NGS decoder logical state";
+                    const ngs::PCMFrameQueue *pcm_queue=nullptr;
                     if (id==0x5CE6) {
                         const auto *logical=static_cast<const ngs::PlayerLogicalState *>(data.logical_state.get());
+                        pcm_queue=&logical->decoded_pcm;
                         playback.history_size=sizeof(logical->adpcm_history);
                         playback.loop_count=logical->current_loop_count;
                         std::memcpy(playback.history.data(),&logical->adpcm_history,playback.history_size);
                     } else {
                         const auto *logical=static_cast<const ngs::Atrac9LogicalState *>(data.logical_state.get());
+                        pcm_queue=&logical->decoded_pcm;
                         playback.history_size=sizeof(logical->saved_state);
                         playback.loop_count=logical->current_loop_count;
                         playback.decoder_config=logical->decoder_config;
                         std::memcpy(playback.history.data(),&logical->saved_state,playback.history_size);
+                    }
+                    if (captured_pcm) {
+                        const auto count=pcm_queue->samples.size();
+                        if (count>NGS_PCM_MAX_SAMPLES || count%2 || pcm_queue->read_offset_frames>count/2
+                            || count>NGS_PCM_TOTAL_SAMPLES-pcm_samples) return "NGS PCM queue exceeds snapshot limits";
+                        pcm_samples+=count;
+                        captured_pcm->push_back({voice_id,static_cast<uint32_t>(index),id,pcm_queue->read_offset_frames,pcm_queue->samples});
                     }
                 }
                 targets.push_back(voice);
@@ -847,6 +863,8 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
         return {};
     }
     if (saved->size() != captured.size()) return "NGS voice count changed since saving";
+    if (saved_pcm && saved_pcm->size()!=captured_pcm->size()) return "NGS PCM queue count changed";
+    size_t pcm_index=0;
     SnapshotValueProbe transaction;
     for (size_t i=0;i<captured.size();++i) {
         const auto &before=captured[i]; const auto &after=(*saved)[i];
@@ -866,6 +884,16 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
             for (size_t k=0;k<source.bytes.size();++k) transaction.stage(bytes[k],source.bytes[k]);
             // Preserve native runtime decoder instances; probe only pointer-free logical history.
             auto &data=voice.datas[source.index];
+            if (saved_pcm) {
+                const auto &pcm=(*saved_pcm)[pcm_index++];
+                if (pcm.voice!=after.voice || pcm.index!=source.index || pcm.module_id!=source.module_id)
+                    return "NGS PCM queue identity changed";
+                auto &queue=source.module_id==0x5CE6
+                    ? static_cast<ngs::PlayerLogicalState*>(data.logical_state.get())->decoded_pcm
+                    : static_cast<ngs::Atrac9LogicalState*>(data.logical_state.get())->decoded_pcm;
+                transaction.stage_vector_bytes(queue.samples,pcm.samples);
+                transaction.stage(queue.read_offset_frames,pcm.offset);
+            }
             if (source.module_id==0x5CE6) {
                 auto *logical=static_cast<ngs::PlayerLogicalState *>(data.logical_state.get());
                 transaction.stage_object_bytes(logical->adpcm_history,source.history.data());
@@ -886,6 +914,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     }
     if (result!=SnapshotValueProbe::Result::Passed) return "NGS saved voice values did not match";
     LOG_INFO("Savestate NGS voice probe: saved scalars/playback/history bytes MATCH; nested checkpoint MATCH; rollback MATCH; {} voices, {} fields, {} playback modules; no audio rewind.",captured.size(),transaction.size(),playback_modules);
+    LOG_INFO("Savestate NGS PCM probe: {} queues, {} current samples; saved queue bytes and read offsets MATCH; original storage restored.",pcm_index,pcm_samples);
     return {};
 }
 
@@ -1401,7 +1430,8 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     }
 
     std::vector<NgsVoiceRecord> ngs_records;
-    if (const auto reason = snapshot_ngs_voices(emuenv, ngs_records); !reason.empty()) {
+    std::vector<NgsPcmRecord> ngs_pcm;
+    if (const auto reason = snapshot_ngs_voices(emuenv, ngs_records,nullptr,{},false,&ngs_pcm); !reason.empty()) {
         if (out_detail) *out_detail = reason;
         return SaveStateResult::ErrorThreadNotSafe;
     }
@@ -1428,7 +1458,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             *out_detail = "GPU image capture unsupported, busy or incomplete; the previous save was not replaced";
         return SaveStateResult::ErrorGraphicsNotReady;
     }
-    LOG_INFO("Savestate: {} logical contexts and {} image-section bytes encoded for v12; restoration remains unsupported.",
+    LOG_INFO("Savestate: {} logical contexts and {} image-section bytes encoded for v13; restoration remains unsupported.",
         graphics.records.size(), image_bytes->size());
 
     // Keep snapshot locks until disk serialization ends, including on errors.
@@ -1576,6 +1606,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     write_host_state(out, io_files, object_sets, gxm_counts);
     write_pod(out, static_cast<uint32_t>(ngs_records.size()));
     for (const auto &record : ngs_records) write_pod(out, record);
+    if (!write_ngs_pcm(out,ngs_pcm)) return SaveStateResult::ErrorIO;
 
     if (!file.commit()) {
         if (out_detail)
@@ -1662,7 +1693,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU/sync/NGS-history/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU/sync/NGS-PCM/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
@@ -1790,6 +1821,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     std::vector<ObjectSetRecord> saved_object_sets;
     GxmCountsRecord saved_gxm_counts{};
     std::vector<NgsVoiceRecord> saved_ngs_records;
+    std::vector<NgsPcmRecord> saved_ngs_pcm;
     if (!read_records(sema_records) || !read_records(mutex_records) || !read_records(eventflag_records) || !read_records(simple_event_records)
         || !read_records(lwmutex_records) || !read_host_state(in, saved_io_files, saved_object_sets, saved_gxm_counts))
         return SaveStateResult::ErrorIO;
@@ -1803,6 +1835,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
     for (auto &record : saved_ngs_records)
         if (!read_pod(in, record)) return SaveStateResult::ErrorIO;
     if (!valid_ngs_records(saved_ngs_records)) return SaveStateResult::ErrorMismatch;
+    if (!read_ngs_pcm(in,saved_ngs_pcm)) return SaveStateResult::ErrorIO;
 
     // Reject malformed thread records before starting even the bounded drain.
     std::set<SceUID> saved_thread_ids;
@@ -1865,10 +1898,11 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                         joint_error = probe_saved_sync_values(kernel,sema_records,mutex_records,lwmutex_records,
                             eventflag_records,simple_event_records,[&] {
                                 std::vector<NgsVoiceRecord> current_ngs;
+                                std::vector<NgsPcmRecord> current_pcm;
                                 ngs_error = snapshot_ngs_voices(emuenv,current_ngs,&saved_ngs_records,[&] {
                                     simultaneous_check = graphics_checkpoint([&] { return verify_ram() && verify_files(); });
                                     return simultaneous_check;
-                                },true); // probe_saved_ram continuously owns metadata locks here.
+                                },true,&current_pcm,&saved_ngs_pcm); // RAM continuously owns metadata locks.
                                 if (!ngs_error.empty()) {
                                     LOG_WARN("Savestate NGS joint probe refused: {}",ngs_error);
                                     simultaneous_check = false;

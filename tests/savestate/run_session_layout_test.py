@@ -46,11 +46,11 @@ template<class E,class R>std::string audit_saved_ram(E&,std::istream&,const R&){
 template<class E,class R,class F>std::string probe_saved_ram(E&,std::istream&,const R&,F f){return f([]{return true;})?"":"RAM failed";}
 template<class E,class F>std::string probe_saved_file_positions(E&,int,F f){return f([]{return true;})?"":"files failed";}
 int ngs_mode=0;
-struct NgsVoiceRecord{};
-template<class E,class F>std::string snapshot_ngs_voices(E&,std::vector<NgsVoiceRecord>&,const std::vector<NgsVoiceRecord>*,F f,bool held){assert(held);if(ngs_mode==16)return "NGS refused";bool ok=f();return ok&&ngs_mode!=17?"":"NGS failed";}
+struct NgsVoiceRecord{};struct NgsPcmRecord{};
+template<class E,class F>std::string snapshot_ngs_voices(E&,std::vector<NgsVoiceRecord>&,const std::vector<NgsVoiceRecord>*,F f,bool held,std::vector<NgsPcmRecord>*,const std::vector<NgsPcmRecord>*){assert(held);if(ngs_mode==16)return "NGS refused";bool ok=f();return ok&&ngs_mode!=17?"":"NGS failed";}
 std::string validate(int mode){
  ngs_mode=mode;
- std::vector<NgsVoiceRecord> saved_ngs_records;
+ std::vector<NgsVoiceRecord> saved_ngs_records;std::vector<NgsPcmRecord>saved_ngs_pcm;
  int saved_io_files=0;
  const auto graphics_checkpoint=[](const std::function<bool()> &verify){return verify();};
  std::istringstream in;

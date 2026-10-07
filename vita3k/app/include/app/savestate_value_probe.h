@@ -40,6 +40,20 @@ class SnapshotValueProbe {
             return std::memcmp(&target,saved?after.data():before.data(),sizeof(T))==0;
         }
     };
+    template<class T>struct VectorBytes final:Field {
+        std::vector<T>&target;
+        std::vector<T> before,after,exchange;
+        const T*original_data;size_t original_capacity;
+        VectorBytes(std::vector<T>&t,const std::vector<T>&saved):target(t),before(t),after(saved),exchange(saved),original_data(t.data()),original_capacity(t.capacity()){}
+        void apply()noexcept override{target.swap(exchange);}
+        void undo()noexcept override{target.swap(exchange);}
+        bool matches(bool saved)const noexcept override{
+            const auto&expected=saved?after:before;
+            return target.size()==expected.size()
+                && (saved || (target.data()==original_data && target.capacity()==original_capacity))
+                && (target.empty() || std::memcmp(target.data(),expected.data(),target.size()*sizeof(T))==0);
+        }
+    };
     std::vector<std::unique_ptr<Field>> fields;
     std::set<const void*> addresses;
     bool applied=false,finished=false;
@@ -64,6 +78,12 @@ public:
         if(!saved || applied || finished || !addresses.insert(&target).second)
             throw std::invalid_argument("Duplicate or closed snapshot object");
         fields.push_back(std::make_unique<ObjectBytes<T>>(target,saved));
+    }
+    template<class T>void stage_vector_bytes(std::vector<T>&target,const std::vector<T>&saved){
+        static_assert(std::is_trivially_copyable_v<T> && !std::is_same_v<T,bool>);
+        if(applied||finished||!addresses.insert(&target).second)
+            throw std::invalid_argument("Duplicate or closed snapshot vector");
+        fields.push_back(std::make_unique<VectorBytes<T>>(target,saved));
     }
     size_t size()const noexcept{return fields.size();}
     template<class During>Result probe_with(During during)noexcept {
