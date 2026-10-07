@@ -107,6 +107,8 @@
 #include <audio/state.h>
 #include <ngs/state.h>
 #include <ngs/system.h>
+#include <ngs/modules/player.h>
+#include <ngs/modules/atrac9.h>
 
 #include <emuenv/state.h>
 #include <gdbstub/state.h>
@@ -139,7 +141,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 11; // v11: bounded NGS guest playback records alongside voice scalars
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 12; // v12: bounded logical decoder histories; maximum 128 voices
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -704,17 +706,22 @@ struct NgsPlaybackRecord {
     uint32_t index = 0, module_id = 0;
     // SceNgsPlayerStates and SceNgsAT9States each contain six SceInt32 fields.
     std::array<uint8_t,24> bytes{};
+    uint32_t history_size = 0, decoder_config = 0;
+    int32_t loop_count = 0;
+    std::array<uint8_t,4096> history{};
 };
 struct NgsVoiceRecord {
     uint32_t system, rack, voice, state, pending, paused, keyed_off, frames, modules;
     uint32_t playback_count = 0;
     std::array<NgsPlaybackRecord,16> playback{};
 };
-static_assert(sizeof(NgsPlaybackRecord) == 32);
-static_assert(sizeof(NgsVoiceRecord) == 552);
+static_assert(sizeof(ADPCMHistory)*2 == 32);
+static_assert(sizeof(Atrac9DecoderSavedState) == 4096);
+static_assert(sizeof(NgsPlaybackRecord) == 4140);
+static_assert(sizeof(NgsVoiceRecord) == 66280);
 
 static bool valid_ngs_records(const std::vector<NgsVoiceRecord> &records) {
-    if (records.size() > 4096) return false;
+    if (records.size() > 128) return false;
     std::set<uint32_t> ids;
     for (const auto &r : records) {
         if (!r.system || !r.rack || !r.voice || !ids.insert(r.voice).second
@@ -729,6 +736,9 @@ static bool valid_ngs_records(const std::vector<NgsVoiceRecord> &records) {
             int32_t buffer = 0;
             std::memcpy(&buffer,p.bytes.data()+sizeof(int32_t),sizeof(buffer));
             if (buffer < -1 || buffer > 3) return false;
+            if (p.history_size != (p.module_id==0x5CE6 ? 32u : 4096u)
+                || p.loop_count < -128 || p.loop_count > 127) return false;
+            if (p.module_id==0x5CE6 && p.decoder_config!=0) return false;
         }
     }
     return true;
@@ -794,7 +804,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
                     return "Invalid or protected NGS voice";
                 voices.emplace_back(*voice->voice_mutex,std::try_to_lock);
                 if (!voices.back().owns_lock()) return "NGS voice is busy";
-                if (captured.size() >= 4096 || voice->datas.size() > 256) return "NGS voice limit exceeded";
+                if (captured.size() >= 128 || voice->datas.size() > 256) return "NGS voice limit exceeded";
                 captured.push_back({system_id,rack_id,voice_id,uint32_t(voice->state),uint32_t(voice->is_pending),
                     uint32_t(voice->is_paused),uint32_t(voice->is_keyed_off),voice->frame_count,uint32_t(voice->datas.size())});
                 auto &record=captured.back();
@@ -811,6 +821,19 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
                     auto &playback=record.playback[record.playback_count++];
                     playback.index=static_cast<uint32_t>(index);playback.module_id=id;
                     std::copy(data.guest_state_data.begin(),data.guest_state_data.end(),playback.bytes.begin());
+                    if (!data.logical_state) return "Missing NGS decoder logical state";
+                    if (id==0x5CE6) {
+                        const auto *logical=static_cast<const ngs::PlayerLogicalState *>(data.logical_state.get());
+                        playback.history_size=sizeof(logical->adpcm_history);
+                        playback.loop_count=logical->current_loop_count;
+                        std::memcpy(playback.history.data(),&logical->adpcm_history,playback.history_size);
+                    } else {
+                        const auto *logical=static_cast<const ngs::Atrac9LogicalState *>(data.logical_state.get());
+                        playback.history_size=sizeof(logical->saved_state);
+                        playback.loop_count=logical->current_loop_count;
+                        playback.decoder_config=logical->decoder_config;
+                        std::memcpy(playback.history.data(),&logical->saved_state,playback.history_size);
+                    }
                 }
                 targets.push_back(voice);
             }
@@ -820,7 +843,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     size_t playback_modules=0;
     for (const auto &record : captured) playback_modules+=record.playback_count;
     if (!saved) {
-        LOG_INFO("Savestate NGS capture: {} voices, {} playback modules; guest positions only, no decoder history.",captured.size(),playback_modules);
+        LOG_INFO("Savestate NGS capture: {} voices, {} playback modules; guest positions and logical decoder histories; runtime decoders unchanged.",captured.size(),playback_modules);
         return {};
     }
     if (saved->size() != captured.size()) return "NGS voice count changed since saving";
@@ -841,6 +864,18 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
             if (source.index!=live.index || source.module_id!=live.module_id) return "NGS playback module identity changed";
             auto &bytes=voice.datas[source.index].guest_state_data;
             for (size_t k=0;k<source.bytes.size();++k) transaction.stage(bytes[k],source.bytes[k]);
+            // Preserve native runtime decoder instances; probe only pointer-free logical history.
+            auto &data=voice.datas[source.index];
+            if (source.module_id==0x5CE6) {
+                auto *logical=static_cast<ngs::PlayerLogicalState *>(data.logical_state.get());
+                transaction.stage_object_bytes(logical->adpcm_history,source.history.data());
+                transaction.stage(logical->current_loop_count,static_cast<int8_t>(source.loop_count));
+            } else {
+                if (source.decoder_config!=live.decoder_config) return "ATRAC9 decoder configuration changed since saving";
+                auto *logical=static_cast<ngs::Atrac9LogicalState *>(data.logical_state.get());
+                transaction.stage_object_bytes(logical->saved_state,source.history.data());
+                transaction.stage(logical->current_loop_count,static_cast<int8_t>(source.loop_count));
+            }
         }
     }
     const auto result=transaction.probe_with([&] { return !during || during(); });
@@ -850,7 +885,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
         return "NGS voice rollback failed; restart the application";
     }
     if (result!=SnapshotValueProbe::Result::Passed) return "NGS saved voice values did not match";
-    LOG_INFO("Savestate NGS voice probe: saved scalars/playback bytes MATCH; nested checkpoint MATCH; rollback MATCH; {} voices, {} fields, {} playback modules; no audio rewind.",captured.size(),transaction.size(),playback_modules);
+    LOG_INFO("Savestate NGS voice probe: saved scalars/playback/history bytes MATCH; nested checkpoint MATCH; rollback MATCH; {} voices, {} fields, {} playback modules; no audio rewind.",captured.size(),transaction.size(),playback_modules);
     return {};
 }
 
@@ -1393,7 +1428,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             *out_detail = "GPU image capture unsupported, busy or incomplete; the previous save was not replaced";
         return SaveStateResult::ErrorGraphicsNotReady;
     }
-    LOG_INFO("Savestate: {} logical contexts and {} image-section bytes encoded for v11; restoration remains unsupported.",
+    LOG_INFO("Savestate: {} logical contexts and {} image-section bytes encoded for v12; restoration remains unsupported.",
         graphics.records.size(), image_bytes->size());
 
     // Keep snapshot locks until disk serialization ends, including on errors.
@@ -1627,7 +1662,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU/sync/NGS-playback/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU/sync/NGS-history/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
@@ -1763,7 +1798,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         return SaveStateResult::ErrorNotPaused;
 
     uint32_t ngs_count = 0;
-    if (!read_pod(in, ngs_count) || ngs_count > 4096) return SaveStateResult::ErrorIO;
+    if (!read_pod(in, ngs_count) || ngs_count > 128) return SaveStateResult::ErrorIO;
     saved_ngs_records.resize(ngs_count);
     for (auto &record : saved_ngs_records)
         if (!read_pod(in, record)) return SaveStateResult::ErrorIO;

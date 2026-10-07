@@ -4,7 +4,40 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## NGS guest playback checkpoint (latest change, format v11)
+## NGS logical decoder history checkpoint (latest change, format v12)
+
+Phone evidence 2026-10-07 19:56 confirmed 34 voices, 33 playback modules and 962
+scalar/byte fields in the prior joint probe; all rollbacks and GPU checks passed.
+
+Format v12 adds pointer-free logical histories to each playback record: two-channel
+ADPCM predictor history (32 bytes) for Player or ATRAC9 MDCT history (4096 bytes),
+int8 loop count encoded as int32, and the ATRAC9 decoder configuration. Current
+module logical state must exist. ATRAC9 configuration changes are refused before
+application; the runtime decoder is neither replaced nor called. Histories and
+loop counts join the existing stopped six-domain transaction. Original bytes are
+restored exactly, including floating-point object representations.
+
+SnapshotValueProbe now supports full trivially-copyable object representations
+with memcpy/memcmp and preallocated original/saved arrays. The caller must supply
+non-overlapping pointer-free objects. This avoids one allocation per history byte.
+Existing scalar comparison/staging remains unchanged. All staging finishes before
+NGS mutation; nested false/exception/mismatch still rolls back every staged object.
+
+Wire limits: 128 voices, 16 playback modules per voice, 66280 bytes per fixed voice
+record (maximum 8,483,840 voice payload bytes). This conservative cap bounds history
+storage; titles with more voices are refused. v11 saves are incompatible; new Save
+required. History sizes and loop range are validated before probes. These are
+logical copies; runtime decoder reconstruction, decoded PCM/resampler queues,
+parameters, other modules and audio output remain unimplemented. Full rewind stays
+disabled. UI marker: Joint files/RAM/CPU/sync/NGS-history/context roundtrip checked.
+
+Host validation: real savestate.cpp syntax; 33 extracted production NGS cases and
+five reader cases, including both history types visible during nested callbacks,
+rollback on false/exception/mutation, missing logical state, bad sizes/loop values
+and ATRAC9 config mismatch; existing sync, session and Load-flow tests. Android
+build and device behavior remain unverified for this checkpoint.
+
+## NGS guest playback checkpoint (previous checkpoint, format v11)
 
 Phone evidence 2026-10-07 12:30 confirmed joint files/RAM/CPU/sync/NGS/context
 rollback, 34 voices/170 scalar fields, and separate live GPU rollback. Resume normal.

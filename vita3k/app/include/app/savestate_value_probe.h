@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <memory>
+#include <array>
+#include <cstring>
 #include <set>
 #include <stdexcept>
 #include <type_traits>
@@ -25,6 +27,19 @@ class SnapshotValueProbe {
         void undo() noexcept override {target=before;}
         bool matches(bool saved)const noexcept override {return target==(saved?after:before);}
     };
+    template<class T>struct ObjectBytes final:Field {
+        T &target;
+        std::array<unsigned char,sizeof(T)> before{},after{};
+        ObjectBytes(T &t,const void *saved):target(t){
+            std::memcpy(before.data(),&target,sizeof(T));
+            std::memcpy(after.data(),saved,sizeof(T));
+        }
+        void apply()noexcept override{std::memcpy(&target,after.data(),sizeof(T));}
+        void undo()noexcept override{std::memcpy(&target,before.data(),sizeof(T));}
+        bool matches(bool saved)const noexcept override{
+            return std::memcmp(&target,saved?after.data():before.data(),sizeof(T))==0;
+        }
+    };
     std::vector<std::unique_ptr<Field>> fields;
     std::set<const void*> addresses;
     bool applied=false,finished=false;
@@ -41,6 +56,14 @@ public:
         if(applied||finished||!addresses.insert(&target).second)
             throw std::invalid_argument("Duplicate or closed snapshot field");
         fields.push_back(std::make_unique<Value<T>>(target,saved));
+    }
+    // Caller supplies a full object representation and non-overlapping targets.
+    // Intended only for pointer-free, trivially-copyable codec history records.
+    template<class T>void stage_object_bytes(T &target,const void *saved) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        if(!saved || applied || finished || !addresses.insert(&target).second)
+            throw std::invalid_argument("Duplicate or closed snapshot object");
+        fields.push_back(std::make_unique<ObjectBytes<T>>(target,saved));
     }
     size_t size()const noexcept{return fields.size();}
     template<class During>Result probe_with(During during)noexcept {
