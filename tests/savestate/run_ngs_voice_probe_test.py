@@ -16,6 +16,7 @@ code=r"""
 #include <cstdint>
 #include <iostream>
 #include <sstream>
+#include <functional>
 #define LOG_INFO(...) ((void)0)
 using app::SnapshotValueProbe;
 struct Segment{uint64_t address=0,size=0;};
@@ -55,7 +56,7 @@ int main(){
  std::istringstream in(bytes);assert((parse(in)==SaveStateResult::Success)==(mode==0));
  }
 
- for(int mode=0;mode<19;++mode){
+ for(int mode=0;mode<23;++mode){
  EmuEnvState e;Renderer r;e.renderer=&r;
  auto*sys=new(e.mem.memory.get()+4096)ngs::System;
  auto*rack=new(e.mem.memory.get()+8192)ngs::Rack;
@@ -83,13 +84,23 @@ int main(){
  if(mode==14)saved[0].modules++;
  if(mode==15)saved[0].state=4;
  if(mode==16)e.mem.host_page_size=3;
- auto result=snapshot_ngs_voices(e,current,&saved);
- assert(result.empty()==(mode==0||mode==17));
+ int called=0;
+ std::unique_lock<std::mutex> a(e.mem.generation_mutex,std::defer_lock),b(e.mem.protect_mutex,std::defer_lock);
+ if(mode>=19){a.lock();b.lock();}
+ auto result=snapshot_ngs_voices(e,current,&saved,[&]{
+  ++called;assert(voice->frame_count==42 && voice->is_paused && voice->state==ngs::VOICE_STATE_AVAILABLE);
+  if(mode==20)return false;
+  if(mode==21)throw std::runtime_error("nested failure");
+  if(mode==22)voice->frame_count=99;
+  return true;
+ },mode>=19);
+ if(mode>=19)assert(called==1);
+ assert(result.empty()==(mode==0||mode==17||mode==19));
  assert(voice->frame_count==100 && !voice->is_paused && voice->state==ngs::VOICE_STATE_ACTIVE);
  assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
  voice->~Voice();rack->~Rack();sys->~System();
  }
- std::cout<<"NGS production probe: 19 capture/rollback/refusal and 5 record parsing cases passed\n";
+ std::cout<<"NGS production probe: 23 capture/joint/rollback/refusal and 5 record parsing cases passed\n";
 }
 """.replace('FUNCTION',t[a:b]).replace('PARSER',parser)
 with tempfile.TemporaryDirectory() as d:

@@ -4,7 +4,38 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## NGS empty rack fix (latest change)
+## Joint NGS scalar checkpoint (latest change)
+
+Phone result 2026-10-07 02:04: separate NGS probe passed for 34 voices / 170
+scalar fields. Joint files/RAM/CPU/sync/context and live GPU rollback also passed;
+user reported normal Resume. The null-rack capture refusal was resolved.
+
+Load now nests NGS scalar application inside the existing file -> RAM -> CPU ->
+sync transaction, enclosing the logical graphics context checkpoint. Innermost
+RAM/file verification occurs while all six domains hold saved values. Undo order
+is context -> NGS -> sync -> CPU -> RAM -> files. GPU remains a separate later probe.
+
+The NGS adapter's internal metadata_locked parameter is used only by the RAM probe
+callback, which already owns generation_mutex and protect_mutex continuously.
+It avoids recursive locking of these nonrecursive mutexes; scheduler and voice
+mutexes are still acquired with try_lock. Address/protection/lifetime/layout checks
+and the empty-rack handling remain enabled. The standalone Save capture still
+acquires its own metadata locks. The shared scalar transaction checks NGS values
+before and after the nested callback, undoes on false/exception, and checks originals.
+A failed NGS rollback retains the persistent resume veto / renderer abort. NGS errors
+propagate through outer rollbacks and are included in the refusal detail.
+
+Format stays v10. No decoder/module buffers, scheduler queues, audio output or
+excluded RAM restoration is added. No game rewind is committed. Success marker:
+Joint files/RAM/CPU/sync/NGS/context roundtrip checked.
+
+Host verification: savestate.cpp syntax; 23 production NGS probe cases and five
+record-reader cases including saved values visible in nested callback, false,
+exception, mutation and externally held metadata locks; session tests including
+NGS refusal before and failure after the graphics callback; Load diagnostic tests.
+Android build and phone behavior remain unverified for this change.
+
+## NGS empty rack fix (previous checkpoint)
 
 2026-10-07 device save was refused with Invalid or protected NGS rack.
 Source inspection found init_system uses racks.resize(max_racks), creating null

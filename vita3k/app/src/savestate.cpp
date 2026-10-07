@@ -716,14 +716,16 @@ static bool valid_ngs_records(const std::vector<NgsVoiceRecord> &records) {
 }
 
 // Caller holds final kernel/thread and renderer exclusion. This probe is separate
-// from RAM probing: its metadata locks are released before RAM acquires them.
+// from RAM probing unless metadata_locked is set by the RAM probe callback.
+// That internal caller MUST continuously own both memory metadata mutexes.
 static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
-    std::vector<NgsVoiceRecord> &captured, const std::vector<NgsVoiceRecord> *saved = nullptr) {
+    std::vector<NgsVoiceRecord> &captured, const std::vector<NgsVoiceRecord> *saved = nullptr,
+    const std::function<bool()> &during = {}, bool metadata_locked = false) {
     if (saved && !valid_ngs_records(*saved)) return "Invalid saved NGS voice records";
     auto &mem = emuenv.mem;
-    std::unique_lock<std::mutex> allocation(mem.generation_mutex, std::try_to_lock);
-    std::unique_lock<std::mutex> protection(mem.protect_mutex, std::try_to_lock);
-    if (!allocation.owns_lock() || !protection.owns_lock()) return "NGS memory metadata is busy";
+    std::unique_lock<std::mutex> allocation(mem.generation_mutex, std::defer_lock);
+    std::unique_lock<std::mutex> protection(mem.protect_mutex, std::defer_lock);
+    if (!metadata_locked && (!allocation.try_lock() || !protection.try_lock())) return "NGS memory metadata is busy";
     const uint64_t page = mem.host_page_size;
     if (!mem.memory || !page || (page & (page-1))) return "NGS memory unavailable";
     const auto checked_address = [&](const auto *object) -> uint32_t {
@@ -798,14 +800,14 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
         transaction.stage(voice.is_keyed_off,bool(after.keyed_off));
         transaction.stage(voice.frame_count,after.frames);
     }
-    const auto result=transaction.probe();
+    const auto result=transaction.probe_with([&] { return !during || during(); });
     if (result==SnapshotValueProbe::Result::RollbackFailed) {
         emuenv.kernel.snapshot_restore_failed=true;
         if (emuenv.renderer) emuenv.renderer->render_abort=true;
         return "NGS voice rollback failed; restart the application";
     }
     if (result!=SnapshotValueProbe::Result::Passed) return "NGS saved voice values did not match";
-    LOG_INFO("Savestate NGS voice probe: saved scalars MATCH; rollback MATCH; {} voices, {} fields; separate from RAM/GPU; no audio rewind.",captured.size(),transaction.size());
+    LOG_INFO("Savestate NGS voice probe: saved scalars MATCH; nested checkpoint MATCH; rollback MATCH; {} voices, {} fields; no audio rewind.",captured.size(),transaction.size());
     return {};
 }
 
@@ -1582,7 +1584,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "NGS voice scalars checked; joint files/RAM/CPU/sync/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU/sync/NGS/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
@@ -1771,12 +1773,10 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 || counts.deferred_contexts != saved_gxm_counts.deferred_contexts
                 || counts.immediate_context != saved_gxm_counts.immediate_context)
                 return "Graphics object counts changed since saving";
-            std::vector<NgsVoiceRecord> current_ngs;
-            const auto ngs_result = snapshot_ngs_voices(emuenv,current_ngs,&saved_ngs_records);
-            if (!ngs_result.empty()) return ngs_result;
             const auto ram_result = audit_saved_ram(emuenv,in,pending_regions);
             if (!ram_result.empty()) return ram_result;
             std::string joint_error;
+            std::string ngs_error;
             bool simultaneous_check = false;
             std::string ram_probe;
             const auto file_result = probe_saved_file_positions(emuenv, saved_io_files,
@@ -1786,8 +1786,16 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                     const auto cpu_result = probe_saved_cpu_contexts(kernel,thread_records,[&] {
                         joint_error = probe_saved_sync_values(kernel,sema_records,mutex_records,lwmutex_records,
                             eventflag_records,simple_event_records,[&] {
-                                simultaneous_check = graphics_checkpoint([&] { return verify_ram() && verify_files(); });
-                                return simultaneous_check;
+                                std::vector<NgsVoiceRecord> current_ngs;
+                                ngs_error = snapshot_ngs_voices(emuenv,current_ngs,&saved_ngs_records,[&] {
+                                    simultaneous_check = graphics_checkpoint([&] { return verify_ram() && verify_files(); });
+                                    return simultaneous_check;
+                                },true); // probe_saved_ram continuously owns metadata locks here.
+                                if (!ngs_error.empty()) {
+                                    LOG_WARN("Savestate NGS joint probe refused: {}",ngs_error);
+                                    simultaneous_check = false;
+                                }
+                                return ngs_error.empty() && simultaneous_check;
                             });
                         return joint_error.empty();
                     });
@@ -1797,10 +1805,11 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 return ram_probe.empty() && simultaneous_check;
             });
             if (!file_result.empty()) return file_result + (ram_probe.empty() ? "" : "; " + ram_probe)
-                + (joint_error.empty() ? "" : "; " + joint_error);
+                + (joint_error.empty() ? "" : "; " + joint_error)
+                + (ngs_error.empty() ? "" : "; " + ngs_error);
             if (!ram_probe.empty()) return joint_error.empty() ? ram_probe : ram_probe + "; " + joint_error;
             if (!simultaneous_check) return "Joint files/RAM/CPU/sync/context checkpoint was not reached";
-            LOG_INFO("Savestate joint probe: files/RAM/CPU/sync/context saved values coexisted; all rollbacks MATCH; no guest instructions, wait replay or game rewind.");
+            LOG_INFO("Savestate joint probe: files/RAM/CPU/sync/NGS/context saved values coexisted; all rollbacks MATCH; no guest instructions, wait replay or game rewind.");
             return {};
         }); // Unconditional return: no retained RAM changes, wait aborts or replay.
     }

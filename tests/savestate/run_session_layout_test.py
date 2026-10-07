@@ -14,6 +14,7 @@ code=r'''
 #include <cassert>
 #include <functional>
 #define LOG_INFO(...) ((void)0)
+#define LOG_WARN(...) ((void)0)
 #include <sstream>
 #include <vector>
 #include <map>
@@ -44,9 +45,11 @@ std::string probe_saved_sync_values(Kernel&,int,int,int,int,int,const std::funct
 template<class E,class R>std::string audit_saved_ram(E&,std::istream&,const R&){return {};}
 template<class E,class R,class F>std::string probe_saved_ram(E&,std::istream&,const R&,F f){return f([]{return true;})?"":"RAM failed";}
 template<class E,class F>std::string probe_saved_file_positions(E&,int,F f){return f([]{return true;})?"":"files failed";}
+int ngs_mode=0;
 struct NgsVoiceRecord{};
-template<class E>std::string snapshot_ngs_voices(E&,std::vector<NgsVoiceRecord>&,const std::vector<NgsVoiceRecord>*){return {};}
+template<class E,class F>std::string snapshot_ngs_voices(E&,std::vector<NgsVoiceRecord>&,const std::vector<NgsVoiceRecord>*,F f,bool held){assert(held);if(ngs_mode==16)return "NGS refused";bool ok=f();return ok&&ngs_mode!=17?"":"NGS failed";}
 std::string validate(int mode){
+ ngs_mode=mode;
  std::vector<NgsVoiceRecord> saved_ngs_records;
  int saved_io_files=0;
  const auto graphics_checkpoint=[](const std::function<bool()> &verify){return verify();};
@@ -76,8 +79,8 @@ int main(){
    std::istringstream in(bad);assert(parse(in,true)==SaveStateResult::ErrorMismatch);
  }
  std::istringstream huge("x");assert(!skip_savestate_bytes(huge,0xffffffffu));
- for(int mode=0;mode<16;++mode)assert(validate(mode).empty()==(mode==0));
- std::cout<<"PASS: RAM indexing without payload allocation; truncation, bounds, tail position; 15 session mismatch cases\n";
+ for(int mode=0;mode<18;++mode)assert(validate(mode).empty()==(mode==0));
+ std::cout<<"PASS: RAM indexing without payload allocation; truncation, bounds, tail position; 15 session mismatch and 2 NGS failure cases\n";
 }
 '''.replace('RAM\n',ram).replace(' CHECK\n',check)
 with tempfile.TemporaryDirectory() as d:
