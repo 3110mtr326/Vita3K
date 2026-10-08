@@ -4,7 +4,39 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## NGS zero-ID output module fix (latest change, format v17 unchanged)
+## All-module parameter checkpoint (latest change, format v18)
+
+Phone evidence 2026-10-08 23:17 confirms metadata capture/load diagnostic succeeded
+with 200 modules and normal Resume after the zero-ID output fix. No registration
+or playback parameter differences were present in those device probes.
+
+Capture now includes non-playback module guest parameter storage: up to 256 bytes
+per module, with exact sizes from the module implementation and ModuleData::info.
+Zero-size modules (output and input mixer) have canonical zero address/size and
+are not read. Player/ATRAC9 retain their separate bounded parameter records.
+Each voice record is now 140144 bytes, at most 128 records; v18 rejects older saves.
+
+Before any parameter read, all nonempty blocks (maximum 4096) are checked against
+all discovered NGS host objects and other parameter ranges, including playback
+blocks. Ordinary allocated memory and protection/mapping checks remain required.
+Load requires exact current/saved size and address for each module. All bytes are
+staged before applying NGS changes; they coexist with the other saved domains in
+the nested checkpoint and are restored/verified on success, rejection or exception.
+The existing persistent resume veto handles unsuccessful rollback.
+
+Logs count non-playback blocks/bytes/changed blocks; UI marker NGS-all-parameters.
+No module parameter callbacks, effects processing, decoder execution or guest
+execution run while saved values are installed. Byte-level diagnostics are not
+semantic validation for executing untrusted save files. DSP internal histories,
+routing, resampler/backend reconstruction and complete rewind remain outstanding.
+
+Host checks pass: actual savestate.cpp syntax; 75 production-adapter scenarios and
+9 parser scenarios, including changed non-playback parameters with joint metadata,
+zero-size output, range overlap, protection, out-of-range and size/address mismatch,
+and parameter mutation followed by exception/rollback. Existing PCM/accessor,
+session-layout and Load diagnostic tests pass. Device capture and Resume are next.
+
+## NGS zero-ID output module fix (previous checkpoint, format v17 unchanged)
 
 The 2026-10-08 21:52 phone log rejected capture with Invalid current NGS voice
 values. The preceding change incorrectly required every module ID to be nonzero.
