@@ -4,7 +4,40 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## NGS playback parameter checkpoint (latest change, format v16)
+## NGS module registration checkpoint (latest change, format v17)
+
+Prior phone evidence 2026-10-08 19:52: 33 parameter blocks/2772 bytes passed;
+zero blocks differed between saved and current settings. Resume was normal.
+This did not exercise changed parameter values on hardware.
+
+Capture now records module ID, bypass flag, guest callback and guest user-data
+addresses for ALL modules (up to 256 per voice), plus the voice finished callback
+and its guest user-data address. The new voice record is 72560 bytes, bounded to
+128 voices. Version 17 rejects old formats; use a fresh Save on this APK.
+
+Module ownership/index and unlocked parameter status are checked for every module.
+Saved bypass fields must be Boolean; module IDs must be nonzero and match live IDs,
+including non-playback modules. Guest callback addresses are converted into typed
+Ptr values for the stopped-session transaction; host pointers are never serialized.
+The pointers are not dereferenced and callbacks are never invoked during the probe.
+No claim is made that callback addresses in untrusted files are executable/valid.
+All fields are staged before mutation, coexist with the existing saved state at
+the nested checkpoint, and are compared/restored before guest execution resumes.
+Any rollback failure retains the existing persistent resume veto.
+
+Logs report total modules and changed module registrations; the UI marker is
+NGS-metadata. Changed voice callback values are covered by host tests too.
+Remaining work includes non-playback module parameters/internal state, audio routing,
+resampler/backend state and wait continuation. Full rewind is still unsupported.
+
+Validation: actual savestate.cpp syntax; 66 extracted production NGS scenarios and
+9 record parsing cases, including changed callback/bypass values, a second
+non-playback module, module identity mismatch, locked non-playback parameters,
+invalid Boolean values and callback mutation/nested-failure rollback; existing
+PCM/accessor, session-layout and Load diagnostic tests pass. Android build and
+hardware register/apply/rollback/Resume behavior remain untested for this version.
+
+## NGS playback parameter checkpoint (previous checkpoint, format v16)
 
 Phone evidence 2026-10-08 17:33: runtime-history transfer passed for one PCM
 runtime decoder, zero ATRAC9 decoders, and 32 absent decoders. User reports normal

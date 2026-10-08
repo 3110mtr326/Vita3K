@@ -41,6 +41,7 @@ struct Atrac9DecoderState{std::mutex codec_mutex;uint32_t config_data=0;void*dec
  uint32_t get(DecoderQuery){return 2;}
  void export_state(Atrac9DecoderSavedState*v){*v=state;}
  void load_state(const Atrac9DecoderSavedState*v){state=*v;}};
+struct GuestAddress{uint32_t value=0;GuestAddress()=default;explicit GuestAddress(uint32_t v):value(v){}uint32_t address()const{return value;}};
 namespace ngs {
 struct ModuleRuntimeState{virtual ~ModuleRuntimeState()=default;};
 struct PlayerRuntimeState:ModuleRuntimeState{std::unique_ptr<PCMDecoderState>decoder{new PCMDecoderState};};
@@ -54,9 +55,9 @@ enum VoiceState{VOICE_STATE_AVAILABLE,VOICE_STATE_ACTIVE,VOICE_STATE_FINALIZING,
 struct Rack;
 struct Voice;
 struct ParamPtr{uint32_t address=16384;void*get(Mem&m)const{return address?m.memory.get()+address:nullptr;}};
-struct ModuleData{uint8_t flags=0;struct{ParamPtr data;uint32_t size=84;}info;std::unique_ptr<ModuleRuntimeState>runtime_state{new PlayerRuntimeState};std::unique_ptr<ModuleLogicalState>logical_state{new PlayerLogicalState};Voice*parent=nullptr;uint32_t index=0;std::vector<uint8_t>guest_state_data=std::vector<uint8_t>(24);};
+struct ModuleData{GuestAddress callback,user_data;bool is_bypassed=false;uint8_t flags=0;struct{ParamPtr data;uint32_t size=84;}info;std::unique_ptr<ModuleRuntimeState>runtime_state{new PlayerRuntimeState};std::unique_ptr<ModuleLogicalState>logical_state{new PlayerLogicalState};Voice*parent=nullptr;uint32_t index=0;std::vector<uint8_t>guest_state_data=std::vector<uint8_t>(24);};
 struct Module{uint32_t id=0x5CE6;uint32_t module_id()const{return id;}uint32_t get_guest_state_size()const{return 24;}uint32_t get_buffer_parameter_size()const{return id==0x5CE6?84:96;}};
-struct Voice {Rack*rack=nullptr;std::unique_ptr<std::mutex>voice_mutex{new std::mutex};std::vector<ModuleData>datas=std::vector<ModuleData>(1);
+struct Voice {GuestAddress finished_callback,finished_callback_user_data;Rack*rack=nullptr;std::unique_ptr<std::mutex>voice_mutex{new std::mutex};std::vector<ModuleData>datas=std::vector<ModuleData>(1);
  VoiceState state=VOICE_STATE_ACTIVE;bool is_pending=false,is_paused=false,is_keyed_off=false;uint32_t frame_count=100;};
 struct VoicePtr{Voice*v;Voice*get(Mem&)const{return v;}};
 struct System;
@@ -76,6 +77,7 @@ FUNCTION
 int main(){
  for(int mode=0;mode<9;++mode){
  uint32_t count=mode==1?4097:1;NgsVoiceRecord rec{4096,8192,12288,1,0,0,0,42,1};
+ rec.module_metadata[0].module_id=0x5CE6;
  if(mode==2)rec.pending=2;
  if(mode>=5){
    rec.playback_count=1;auto&p=rec.playback[0];p.module_id=0x5CE6;p.history_size=32;
@@ -91,13 +93,17 @@ int main(){
  std::istringstream in(bytes);assert((parse(in)==SaveStateResult::Success)==(mode==0||mode==5));
  }
 
- for(int mode=0;mode<60;++mode){
+ for(int mode=0;mode<66;++mode){
  EmuEnvState e;Renderer r;e.renderer=&r;
  auto*sys=new(e.mem.memory.get()+4096)ngs::System;
  auto*rack=new(e.mem.memory.get()+8192)ngs::Rack;
  auto*voice=new(e.mem.memory.get()+12288)ngs::Voice;
  e.ngs.systems={sys};sys->racks={rack};rack->system=sys;rack->voices={{voice}};voice->rack=rack;voice->datas[0].parent=voice;rack->modules.push_back(std::make_unique<ngs::Module>());
  if(mode==28 || mode==32 || mode==46 || mode==47){voice->datas[0].runtime_state=std::make_unique<ngs::Atrac9RuntimeState>();rack->modules[0]->id=0x5CAA;voice->datas[0].info.size=96;voice->datas[0].logical_state=std::make_unique<ngs::Atrac9LogicalState>();}
+ if(mode>=60){
+   voice->datas.emplace_back();voice->datas[1].parent=voice;voice->datas[1].index=1;
+   auto extra=std::make_unique<ngs::Module>();extra->id=0x5CEC;rack->modules.push_back(std::move(extra));
+ }
  if(mode==17)sys->racks={nullptr,rack,nullptr};
  if(mode==18)sys->racks={nullptr,nullptr};
  std::vector<NgsVoiceRecord> saved,current;
@@ -110,6 +116,8 @@ int main(){
  saved[0].playback[0].parameters[16]=91;
  saved[0].playback[0].bytes[0]=77;
  saved[0].playback[0].history[0]=13;saved[0].playback[0].loop_count=2;
+ saved[0].finished_callback=0x20001;saved[0].finished_user_data=0x30004;
+ for(size_t j=0;j<saved[0].modules;++j){auto&m=saved[0].module_metadata[j];m.callback=0x20005;m.user_data=0x30008;m.bypassed=1;}
  saved[0].frames=42;saved[0].paused=1;saved[0].state=0;
  if(mode==1)saved[0].paused=2;
  if(mode==2)saved[0].voice++;
@@ -167,8 +175,15 @@ int main(){
    voice->datas.emplace_back();voice->datas[1].parent=voice;voice->datas[1].index=1;
    rack->modules.push_back(std::make_unique<ngs::Module>());
  }
+ if(mode==61)saved[0].module_metadata[1].module_id++;
+ if(mode==62)voice->datas[1].flags=1;
+ if(mode==63)saved[0].module_metadata[0].bypassed=2;
+ if(mode==65)saved[0].module_metadata[1].module_id=0;
  auto result=snapshot_ngs_voices(e,current,&saved,[&]{
   ++called;
+  assert(voice->finished_callback.address()==0x20001 && voice->finished_callback_user_data.address()==0x30004);
+  for(auto&d:voice->datas)assert(d.callback.address()==0x20005 && d.user_data.address()==0x30008 && d.is_bypassed);
+  if(mode==64){voice->datas[1].callback=GuestAddress(42);voice->finished_callback=GuestAddress(99);return false;}
   assert(e.mem.memory[16384+16]==91);
   if(mode==58){e.mem.memory[16384+16]=10;throw std::runtime_error("parameter mutation");}
   if(mode==28){auto*d=static_cast<ngs::Atrac9RuntimeState*>(voice->datas[0].runtime_state.get())->decoder.get();assert(reinterpret_cast<uint8_t*>(&d->state)[0]==13);}
@@ -189,12 +204,14 @@ int main(){
   return true;
  },mode>=19,&pcm_current,&pcm_saved);
  if(mode>=19 && mode<23)assert(called==1);
- if((mode>=23&&mode<28)||(mode>=29&&mode<=36)||(mode>=39&&mode<44)||(mode>=46&&mode!=58))assert(called==0);
+ if((mode>=23&&mode<28)||(mode>=29&&mode<=36)||(mode>=39&&mode<44)||(mode>=46&&mode!=58&&mode!=60&&mode!=64))assert(called==0);
  if(mode==28||mode==37||mode==38||mode==44||mode==45)assert(called==1);
  assert(e.mem.memory[16384+16]==0);
- if(mode==58)assert(called==1);
+ if(mode==58||mode==60||mode==64)assert(called==1);
+ assert(voice->finished_callback.address()==0 && voice->finished_callback_user_data.address()==0);
+ for(auto&d:voice->datas)assert(d.callback.address()==0 && d.user_data.address()==0 && !d.is_bypassed);
  assert(voice->datas[0].guest_state_data[0]==0);
- assert(result.empty()==(mode==0||mode==17||mode==19||mode==28||mode==37||mode==44||mode==45));
+ assert(result.empty()==(mode==0||mode==17||mode==19||mode==28||mode==37||mode==44||mode==45||mode==60));
  assert(voice->frame_count==100 && !voice->is_paused && voice->state==ngs::VOICE_STATE_ACTIVE);
  if(mode!=31){
  auto &q=(mode==28||mode==32||mode==46||mode==47)?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm;
@@ -211,7 +228,7 @@ int main(){
  assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
  voice->~Voice();rack->~Rack();sys->~System();
  }
- std::cout<<"NGS production probe: 60 capture/parameters/runtime-history/joint/rollback/refusal and 9 record parsing cases passed\n";
+ std::cout<<"NGS production probe: 66 capture/metadata/parameters/runtime-history/joint/rollback/refusal and 9 record parsing cases passed\n";
 }
 """.replace('FUNCTION',t[a:b]).replace('PARSER',parser)
 with tempfile.TemporaryDirectory() as d:
