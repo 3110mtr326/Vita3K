@@ -739,7 +739,8 @@ static bool valid_ngs_records(const std::vector<NgsVoiceRecord> &records) {
             || r.pending > 1 || r.paused > 1 || r.keyed_off > 1 || r.modules > 256
             || r.playback_count > r.playback.size()) return false;
         for (size_t i=0;i<r.modules;++i)
-            if (!r.module_metadata[i].module_id || r.module_metadata[i].bypassed>1) return false;
+            // OutputModule inherits Module::module_id(), whose valid ID is zero.
+            if (r.module_metadata[i].bypassed>1) return false;
         std::set<uint32_t> indices;
         for (size_t i=0;i<r.playback_count;++i) {
             const auto &p=r.playback[i];

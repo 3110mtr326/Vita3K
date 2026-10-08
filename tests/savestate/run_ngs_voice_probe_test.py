@@ -93,7 +93,7 @@ int main(){
  std::istringstream in(bytes);assert((parse(in)==SaveStateResult::Success)==(mode==0||mode==5));
  }
 
- for(int mode=0;mode<66;++mode){
+ for(int mode=0;mode<67;++mode){
  EmuEnvState e;Renderer r;e.renderer=&r;
  auto*sys=new(e.mem.memory.get()+4096)ngs::System;
  auto*rack=new(e.mem.memory.get()+8192)ngs::Rack;
@@ -102,7 +102,7 @@ int main(){
  if(mode==28 || mode==32 || mode==46 || mode==47){voice->datas[0].runtime_state=std::make_unique<ngs::Atrac9RuntimeState>();rack->modules[0]->id=0x5CAA;voice->datas[0].info.size=96;voice->datas[0].logical_state=std::make_unique<ngs::Atrac9LogicalState>();}
  if(mode>=60){
    voice->datas.emplace_back();voice->datas[1].parent=voice;voice->datas[1].index=1;
-   auto extra=std::make_unique<ngs::Module>();extra->id=0x5CEC;rack->modules.push_back(std::move(extra));
+   auto extra=std::make_unique<ngs::Module>();extra->id=mode==66?0:0x5CEC;rack->modules.push_back(std::move(extra));
  }
  if(mode==17)sys->racks={nullptr,rack,nullptr};
  if(mode==18)sys->racks={nullptr,nullptr};
@@ -204,14 +204,14 @@ int main(){
   return true;
  },mode>=19,&pcm_current,&pcm_saved);
  if(mode>=19 && mode<23)assert(called==1);
- if((mode>=23&&mode<28)||(mode>=29&&mode<=36)||(mode>=39&&mode<44)||(mode>=46&&mode!=58&&mode!=60&&mode!=64))assert(called==0);
+ if((mode>=23&&mode<28)||(mode>=29&&mode<=36)||(mode>=39&&mode<44)||(mode>=46&&mode!=58&&mode!=60&&mode!=64&&mode!=66))assert(called==0);
  if(mode==28||mode==37||mode==38||mode==44||mode==45)assert(called==1);
  assert(e.mem.memory[16384+16]==0);
- if(mode==58||mode==60||mode==64)assert(called==1);
+ if(mode==58||mode==60||mode==64||mode==66)assert(called==1);
  assert(voice->finished_callback.address()==0 && voice->finished_callback_user_data.address()==0);
  for(auto&d:voice->datas)assert(d.callback.address()==0 && d.user_data.address()==0 && !d.is_bypassed);
  assert(voice->datas[0].guest_state_data[0]==0);
- assert(result.empty()==(mode==0||mode==17||mode==19||mode==28||mode==37||mode==44||mode==45||mode==60));
+ assert(result.empty()==(mode==0||mode==17||mode==19||mode==28||mode==37||mode==44||mode==45||mode==60||mode==66));
  assert(voice->frame_count==100 && !voice->is_paused && voice->state==ngs::VOICE_STATE_ACTIVE);
  if(mode!=31){
  auto &q=(mode==28||mode==32||mode==46||mode==47)?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm;
@@ -228,7 +228,7 @@ int main(){
  assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
  voice->~Voice();rack->~Rack();sys->~System();
  }
- std::cout<<"NGS production probe: 66 capture/metadata/parameters/runtime-history/joint/rollback/refusal and 9 record parsing cases passed\n";
+ std::cout<<"NGS production probe: 67 capture/metadata/parameters/runtime-history/joint/rollback/refusal and 9 record parsing cases passed\n";
 }
 """.replace('FUNCTION',t[a:b]).replace('PARSER',parser)
 with tempfile.TemporaryDirectory() as d:

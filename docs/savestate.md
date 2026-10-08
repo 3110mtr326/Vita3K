@@ -4,7 +4,23 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## NGS module registration checkpoint (latest change, format v17)
+## NGS zero-ID output module fix (latest change, format v17 unchanged)
+
+The 2026-10-08 21:52 phone log rejected capture with Invalid current NGS voice
+values. The preceding change incorrectly required every module ID to be nonzero.
+OutputModule inherits the base Module::module_id() returning zero; definitions.cpp
+includes it in real voice definitions. Accept zero IDs in metadata validation.
+Keep exact saved/live per-index ID comparison and Boolean/range/locking checks.
+This fixes a demonstrated source-level rejection; the device log alone does not
+identify the failing field. Device confirmation of successful capture is pending.
+
+Host regression now includes a zero-ID non-playback module, changed saved callback
+and bypass metadata during the nested checkpoint, and exact restoration afterward.
+A nonzero live module paired with saved ID zero still fails identity validation.
+67 production scenarios and 9 parser scenarios pass; actual savestate.cpp syntax
+passes. No format change, callbacks, guest execution or retained rewind added.
+
+## NGS module registration checkpoint (previous checkpoint, format v17)
 
 Prior phone evidence 2026-10-08 19:52: 33 parameter blocks/2772 bytes passed;
 zero blocks differed between saved and current settings. Resume was normal.
