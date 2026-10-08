@@ -4,7 +4,42 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## NGS runtime decoder history checkpoint (latest change, format v15 unchanged)
+## NGS playback parameter checkpoint (latest change, format v16)
+
+Phone evidence 2026-10-08 17:33: runtime-history transfer passed for one PCM
+runtime decoder, zero ATRAC9 decoders, and 32 absent decoders. User reports normal
+Resume. This is not ATRAC9 device coverage or successful game rewind.
+
+Capture now includes the guest parameter blocks for Player (84 bytes) and ATRAC9
+(96 bytes), which contain guest buffer addresses, playback rates and configuration.
+Records carry guest addresses and bounded 128-byte storage, never host pointers.
+The voice record is 68456 bytes and limited to 128 voices/16 playback modules each.
+Version 16 rejects previous snapshots; create a fresh Save with this APK.
+
+Before reading blocks, capture requires exact module/parameter sizes, flags zero
+(including no PARAMS_LOCK), allocated ordinary pages, no protected/external/GXM
+mapped pages, and no overlap with any discovered NGS System/Rack/Voice C++ object
+or another playback parameter block. All scheduler/voice/memory exclusions remain
+held. Load requires the same validated live addresses, sizes and module identities.
+Every original parameter byte is staged before any NGS mutation, then saved bytes
+join the existing files/RAM/CPU/sync/NGS/context transaction. Nested comparison and
+rollback verify all bytes. Restore failure keeps the persistent Resume veto.
+The log reports block/byte counts and how many blocks differ from current settings.
+
+No parameter-change callback, guest execution or decoding runs with these settings.
+Other module parameters, module callback/bypass metadata, resampler reconstruction,
+output queues and complete game rewind remain unfinished. Values are byte-checked
+for this reversible diagnostic, not certified suitable for executing malformed
+input snapshots. The UI marker is NGS-parameters; unsupported restore is intentional.
+
+Host validation: real savestate.cpp C++20 syntax (including real parameter sizes);
+60 extracted production NGS scenarios and 9 record parsing scenarios, including
+locked/invalid/protected/overlapping parameter storage, changed address/size,
+32-bit overflow, both module types, nested failure/exception/mutation rollback;
+existing PCM codec/accessor, session-layout and Load diagnostic checks passed.
+Android build and device parameter roundtrip/Resume are the remaining checkpoint.
+
+## NGS runtime decoder history checkpoint (previous checkpoint, format v15 unchanged)
 
 Phone evidence 2026-10-08 01:52: all prior joint/GPU rollbacks passed, Resume normal.
 Pending compressed input and resampler history were empty at capture and probe.
