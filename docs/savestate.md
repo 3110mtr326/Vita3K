@@ -4,7 +4,38 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## All-module parameter checkpoint (latest change, format v18)
+## Output-module PCM checkpoint (latest change, format v19)
+
+Previous phone run 2026-10-09 01:55/01:56: 165 non-playback parameter blocks,
+7656 bytes, zero differing blocks, all joint/GPU rollback checks passed and Resume
+normal. Changed settings are still host-test coverage, not that phone run.
+
+OutputModule's guest_state_data contains interleaved stereo S16 at granularity
+frames. Capture now stores this output buffer, up to 4096 bytes (1024 frames),
+with the module index. The existing master-bus definition has one OutputModule;
+multiple outputs per voice or unsupported sizes are refused before mutation.
+Nonpositive/over-limit granularity or a mismatched live vector size is rejected.
+The record has 144248 bytes, at most 128 voices; v19 requires a fresh save.
+
+The reader checks aligned bounded size, output index and zero-ID module membership,
+and requires exactly one output iff a buffer is present. Load checks saved/current
+index and size before staging each byte. Writes are in place: vector allocation,
+capacity and pointers are not replaced. Bytes join the other saved domains for
+nested verification, then original bytes are restored even after nested failure.
+No output is submitted and guest/module processing remains excluded throughout.
+Log counts output buffers/bytes/changed buffers; UI marker NGS-output-buffer.
+
+This is the NGS output conversion buffer, not the SDL/Android audio device queue.
+Audio routing/input queues, resampler state, host backend and complete rewind remain
+unfinished. The unsupported-host-state diagnostic return stays in place.
+
+Validation: real savestate.cpp syntax; 84 production-adapter cases and 9 parser
+cases, including changed output bytes, maximum 4096-byte buffer, invalid granularity,
+size/index/membership mismatch, duplicate output, exception rollback and unchanged
+storage addresses. Existing PCM/accessor, session-layout and Load checks pass.
+Android build and device output-buffer/Resume checks are next.
+
+## All-module parameter checkpoint (previous checkpoint, format v18)
 
 Phone evidence 2026-10-08 23:17 confirms metadata capture/load diagnostic succeeded
 with 200 modules and normal Resume after the zero-ID output fix. No registration

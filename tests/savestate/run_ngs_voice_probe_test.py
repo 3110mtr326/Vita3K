@@ -62,7 +62,7 @@ struct Voice {GuestAddress finished_callback,finished_callback_user_data;Rack*ra
 struct VoicePtr{Voice*v;Voice*get(Mem&)const{return v;}};
 struct System;
 struct Rack{System*system=nullptr;std::vector<VoicePtr>voices;std::vector<std::unique_ptr<Module>>modules;};
-struct System{struct{std::recursive_mutex mutex;bool is_updating=false;std::queue<int>operations_pending;}voice_scheduler;std::vector<Rack*>racks;};
+struct System{int granularity=6;struct{std::recursive_mutex mutex;bool is_updating=false;std::queue<int>operations_pending;}voice_scheduler;std::vector<Rack*>racks;};
 }
 struct Renderer{bool render_abort=false;};
 struct EmuEnvState{Mem mem;struct{std::map<uint64_t,Segment>memory_mapped_regions;}gxm;
@@ -93,7 +93,8 @@ int main(){
  std::istringstream in(bytes);assert((parse(in)==SaveStateResult::Success)==(mode==0||mode==5));
  }
 
- for(int mode=0;mode<75;++mode){
+ for(int mode=0;mode<84;++mode){
+ const bool output_mode=mode==66||mode>=75;
  EmuEnvState e;Renderer r;e.renderer=&r;
  auto*sys=new(e.mem.memory.get()+4096)ngs::System;
  auto*rack=new(e.mem.memory.get()+8192)ngs::Rack;
@@ -102,8 +103,9 @@ int main(){
  if(mode==28 || mode==32 || mode==46 || mode==47){voice->datas[0].runtime_state=std::make_unique<ngs::Atrac9RuntimeState>();rack->modules[0]->id=0x5CAA;voice->datas[0].info.size=96;voice->datas[0].logical_state=std::make_unique<ngs::Atrac9LogicalState>();}
  if(mode>=60){
    voice->datas.emplace_back();voice->datas[1].parent=voice;voice->datas[1].index=1;
-   auto extra=std::make_unique<ngs::Module>();extra->id=mode==66?0:0x5CEC;voice->datas[1].info.size=mode==66?0:96;voice->datas[1].info.data.address=20480;rack->modules.push_back(std::move(extra));
+   auto extra=std::make_unique<ngs::Module>();extra->id=output_mode?0:0x5CEC;voice->datas[1].info.size=output_mode?0:96;voice->datas[1].info.data.address=20480;rack->modules.push_back(std::move(extra));
  }
+ if(mode==75){sys->granularity=1024;voice->datas[1].guest_state_data.resize(4096);}
  if(mode==17)sys->racks={nullptr,rack,nullptr};
  if(mode==18)sys->racks={nullptr,nullptr};
  std::vector<NgsVoiceRecord> saved,current;
@@ -116,7 +118,8 @@ int main(){
  saved[0].playback[0].parameters[16]=91;
  saved[0].playback[0].bytes[0]=77;
  saved[0].playback[0].history[0]=13;saved[0].playback[0].loop_count=2;
- if(mode>=60 && mode!=66)saved[0].module_metadata[1].parameters[5]=93;
+ if(mode>=60 && !output_mode)saved[0].module_metadata[1].parameters[5]=93;
+ if(output_mode){saved[0].output_bytes[0]=27;saved[0].output_bytes[saved[0].output_size-1]=43;}
  saved[0].finished_callback=0x20001;saved[0].finished_user_data=0x30004;
  for(size_t j=0;j<saved[0].modules;++j){auto&m=saved[0].module_metadata[j];m.callback=0x20005;m.user_data=0x30008;m.bypassed=1;}
  saved[0].frames=42;saved[0].paused=1;saved[0].state=0;
@@ -187,9 +190,22 @@ int main(){
  if(mode==71)saved[0].module_metadata[1].parameter_size=257;
  if(mode==72)voice->datas[1].info.data.address=12288;
  if(mode==73)voice->datas[1].info.data.address=65520;
+ if(mode==76)sys->granularity=1025;
+ if(mode==77)saved[0].output_size=4097;
+ if(mode==78)saved[0].output_size=20;
+ if(mode==79){
+   voice->datas.emplace_back();voice->datas[2].parent=voice;voice->datas[2].index=2;voice->datas[2].info.size=0;
+   auto extra=std::make_unique<ngs::Module>();extra->id=0;rack->modules.push_back(std::move(extra));
+ }
+ if(mode==81)voice->datas[1].guest_state_data.resize(20);
+ if(mode==82)saved[0].output_index=0;
+ if(mode==83){saved[0].output_size=0;saved[0].output_index=0;}
+ const auto*original_output=output_mode?voice->datas[1].guest_state_data.data():nullptr;
  auto result=snapshot_ngs_voices(e,current,&saved,[&]{
   ++called;
-  if(mode>=60 && mode!=66)assert(e.mem.memory[20480+5]==93);
+  if(output_mode){auto&v=voice->datas[1].guest_state_data;assert(v.data()==original_output && v[0]==27 && v.back()==43);}
+  if(mode==80){voice->datas[1].guest_state_data[0]=31;throw std::runtime_error("output mutation");}
+  if(mode>=60 && !output_mode)assert(e.mem.memory[20480+5]==93);
   if(mode==74){e.mem.memory[20480+5]=17;throw std::runtime_error("effect parameter mutation");}
   assert(voice->finished_callback.address()==0x20001 && voice->finished_callback_user_data.address()==0x30004);
   for(auto&d:voice->datas)assert(d.callback.address()==0x20005 && d.user_data.address()==0x30008 && d.is_bypassed);
@@ -214,15 +230,16 @@ int main(){
   return true;
  },mode>=19,&pcm_current,&pcm_saved);
  if(mode>=19 && mode<23)assert(called==1);
- if((mode>=23&&mode<28)||(mode>=29&&mode<=36)||(mode>=39&&mode<44)||(mode>=46&&mode!=58&&mode!=60&&mode!=64&&mode!=66&&mode!=74))assert(called==0);
+ if((mode>=23&&mode<28)||(mode>=29&&mode<=36)||(mode>=39&&mode<44)||(mode>=46&&mode!=58&&mode!=60&&mode!=64&&mode!=66&&mode!=74&&mode!=75&&mode!=80))assert(called==0);
  if(mode==28||mode==37||mode==38||mode==44||mode==45)assert(called==1);
+ if(output_mode){auto&v=voice->datas[1].guest_state_data;assert(v.data()==original_output && v[0]==0 && v.back()==0);}
  assert(e.mem.memory[20480+5]==0);
  assert(e.mem.memory[16384+16]==0);
- if(mode==58||mode==60||mode==64||mode==66||mode==74)assert(called==1);
+ if(mode==58||mode==60||mode==64||mode==66||mode==74||mode==75||mode==80)assert(called==1);
  assert(voice->finished_callback.address()==0 && voice->finished_callback_user_data.address()==0);
  for(auto&d:voice->datas)assert(d.callback.address()==0 && d.user_data.address()==0 && !d.is_bypassed);
  assert(voice->datas[0].guest_state_data[0]==0);
- assert(result.empty()==(mode==0||mode==17||mode==19||mode==28||mode==37||mode==44||mode==45||mode==60||mode==66));
+ assert(result.empty()==(mode==0||mode==17||mode==19||mode==28||mode==37||mode==44||mode==45||mode==60||mode==66||mode==75));
  assert(voice->frame_count==100 && !voice->is_paused && voice->state==ngs::VOICE_STATE_ACTIVE);
  if(mode!=31){
  auto &q=(mode==28||mode==32||mode==46||mode==47)?static_cast<ngs::Atrac9LogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm:static_cast<ngs::PlayerLogicalState*>(voice->datas[0].logical_state.get())->decoded_pcm;
@@ -239,7 +256,7 @@ int main(){
  assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
  voice->~Voice();rack->~Rack();sys->~System();
  }
- std::cout<<"NGS production probe: 75 capture/all-parameters/metadata/parameters/runtime-history/joint/rollback/refusal and 9 record parsing cases passed\n";
+ std::cout<<"NGS production probe: 84 capture/output-buffer/all-parameters/metadata/parameters/runtime-history/joint/rollback/refusal and 9 record parsing cases passed\n";
 }
 """.replace('FUNCTION',t[a:b]).replace('PARSER',parser)
 with tempfile.TemporaryDirectory() as d:
