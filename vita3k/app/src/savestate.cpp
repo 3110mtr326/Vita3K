@@ -142,7 +142,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 19; // v19: bounded output-module PCM bytes
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 20; // v20: bounded scheduler membership and order
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -726,22 +726,27 @@ struct NgsVoiceRecord {
     std::array<NgsModuleRecord,256> module_metadata{};
     uint32_t output_index=0, output_size=0;
     std::array<uint8_t,4096> output_bytes{};
+    uint32_t scheduler_position = UINT32_MAX; // Unqueued, otherwise zero-based within system.
 };
 static_assert(sizeof(SceNgsPlayerParams) == 84);
 static_assert(sizeof(SceNgsAT9Params) == 96);
 static_assert(sizeof(ADPCMHistory)*2 == 32);
 static_assert(sizeof(Atrac9DecoderSavedState) == 4096);
 static_assert(sizeof(NgsPlaybackRecord) == 4276);
-static_assert(sizeof(NgsVoiceRecord) == 144248);
+static_assert(sizeof(NgsVoiceRecord) == 144252);
 
 static bool valid_ngs_records(const std::vector<NgsVoiceRecord> &records) {
     if (records.size() > 128) return false;
     std::set<uint32_t> ids;
+    std::map<uint32_t,std::set<uint32_t>> positions;
     for (const auto &r : records) {
         if (!r.system || !r.rack || !r.voice || !ids.insert(r.voice).second
             || r.state > uint32_t(ngs::VOICE_STATE_UNLOADING)
             || r.pending > 1 || r.paused > 1 || r.keyed_off > 1 || r.modules > 256
             || r.playback_count > r.playback.size()) return false;
+        if (r.scheduler_position!=UINT32_MAX
+            && (r.scheduler_position>=records.size()
+                || !positions[r.system].insert(r.scheduler_position).second)) return false;
         for (size_t i=0;i<r.modules;++i) {
             const auto &m=r.module_metadata[i];
             // Zero is the normal output module ID. Playback blocks are stored separately.
@@ -774,6 +779,8 @@ static bool valid_ngs_records(const std::vector<NgsVoiceRecord> &records) {
             if (p.module_id==0x5CE6 && p.decoder_config!=0) return false;
         }
     }
+    for (const auto &[system,order]:positions)
+        if (!order.empty() && *order.rbegin()!=order.size()-1) return false;
     return true;
 }
 
@@ -943,6 +950,22 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
             }
         }
     }
+    // All system and voice locks remain held. Compare queue pointers only against
+    // validated objects before dereferencing; never persist host pointers.
+    size_t queued_voices=0;
+    for (auto *system:emuenv.ngs.systems) {
+        const auto &queue=system->voice_scheduler.queue;
+        if (queue.size()>targets.size()) return "NGS scheduler queue exceeds voice count";
+        for (size_t position=0;position<queue.size();++position) {
+            const auto found=std::find(targets.begin(),targets.end(),queue[position]);
+            if (found==targets.end()) return "Unknown NGS scheduler voice";
+            const auto index=static_cast<size_t>(found-targets.begin());
+            if (targets[index]->rack->system!=system
+                || captured[index].scheduler_position!=UINT32_MAX) return "Invalid NGS scheduler membership";
+            captured[index].scheduler_position=static_cast<uint32_t>(position);
+            ++queued_voices;
+        }
+    }
     // Validate every range against every host object and parameter block before
     // reading parameters. Never serialize or later overwrite placement-new C++ data.
     std::vector<std::pair<uint32_t,size_t>> parameter_ranges;
@@ -975,6 +998,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     size_t playback_modules=0;
     for (const auto &record : captured) playback_modules+=record.playback_count;
     if (!saved) {
+        LOG_INFO("Savestate NGS scheduler capture: {} systems, {} queued voices.",emuenv.ngs.systems.size(),queued_voices);
         LOG_INFO("Savestate NGS buffers capture: {} PCM/history samples, {} resampler samples, {} pending compressed bytes.",pcm_samples,resampler_samples,pending_bytes);
         LOG_INFO("Savestate NGS capture: {} voices, {} playback modules; guest positions and logical decoder histories; runtime decoders unchanged.",captured.size(),playback_modules);
         return {};
@@ -1104,6 +1128,25 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
             }
         }
     }
+    // Voice identities have all matched above. Reconstruct only from these live
+    // objects. Stage every queue before applying anything; swapping restores the
+    // original allocation as well as membership/order on failure or success.
+    size_t changed_schedulers=0,saved_queued=0;
+    for (auto *system:emuenv.ngs.systems) {
+        std::vector<ngs::Voice *> queue;
+        for (size_t i=0;i<targets.size();++i)
+            if (targets[i]->rack->system==system && (*saved)[i].scheduler_position!=UINT32_MAX)
+                queue.push_back(targets[i]);
+        for (size_t i=0;i<targets.size();++i) {
+            const auto position=(*saved)[i].scheduler_position;
+            if (targets[i]->rack->system!=system || position==UINT32_MAX) continue;
+            if (position>=queue.size()) return "Invalid saved NGS scheduler order";
+            queue[position]=targets[i];
+        }
+        saved_queued+=queue.size();
+        if (queue!=system->voice_scheduler.queue) ++changed_schedulers;
+        transaction.stage_vector_bytes(system->voice_scheduler.queue,queue);
+    }
     const auto result=transaction.probe_with([&] { return !during || during(); });
     if (result==SnapshotValueProbe::Result::RollbackFailed) {
         emuenv.kernel.snapshot_restore_failed=true;
@@ -1116,6 +1159,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     LOG_INFO("Savestate NGS parameter probe: {} Player/ATRAC9 blocks, {} bytes, {} changed blocks; saved bytes MATCH; original bytes restored; no parameter callbacks or decoding executed.",playback_modules,parameter_bytes,changed_parameter_blocks);
     LOG_INFO("Savestate NGS metadata probe: {} modules, {} changed modules; saved bypass and guest callback registrations MATCH; original registrations restored; no callbacks invoked.",metadata_modules,changed_metadata_modules);
     LOG_INFO("Savestate NGS non-playback parameter probe: {} blocks, {} bytes, {} changed blocks; saved bytes MATCH; original bytes restored; no effects processing executed.",effect_blocks,effect_bytes,changed_effect_blocks);
+    LOG_INFO("Savestate NGS scheduler probe: {} systems, {} saved queued voices, {} current queued voices, {} changed queues; saved membership/order MATCH; original queues and storage restored; no scheduling executed.",emuenv.ngs.systems.size(),saved_queued,queued_voices,changed_schedulers);
     LOG_INFO("Savestate NGS output buffer probe: {} buffers, {} bytes, {} changed buffers; saved PCM bytes MATCH; original bytes restored in place; no output submitted.",output_buffers,output_bytes,changed_output_buffers);
     size_t saved_pending_bytes=0;
     if (saved_pcm) for (const auto &record:*saved_pcm) saved_pending_bytes+=record.pending_input.size();
@@ -1899,7 +1943,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU/sync/NGS-output-buffer/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU/sync/NGS-scheduler/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;

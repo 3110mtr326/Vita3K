@@ -4,7 +4,41 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Output-module PCM checkpoint (latest change, format v19)
+## Scheduler membership/order checkpoint (latest change, format v20)
+
+Previous v19 phone screenshot 2026-10-09 17:22 shows NGS-output-buffer and
+live-gpu-roundtrip-passed; user reports normal operation. Its detailed log was
+not read: Downloads/vita3k_log.txt was absent when development resumed.
+
+Each voice now stores a zero-based scheduler_position, or UINT32_MAX when
+unqueued. Ranks must be unique and contiguous within each system. Record size is
+144252 bytes; the existing 128-voice limit remains. A fresh v20 save is required.
+No host pointers are serialized. Under all scheduler/voice locks, capture checks
+each queue pointer against already validated voices before dereferencing it;
+unknown, null, duplicate, cross-system and oversized queues are refused.
+Busy schedulers and pending operations remain unsupported.
+
+Load first validates the complete saved/live voice identity and module layout,
+then reconstructs each system queue from those verified live targets. Queues join
+files/RAM/CPU/sync/NGS/context in the existing reversible transaction. All staging
+and allocation finish before any mutation. The transaction checks saved order
+and membership, including empty queues and multiple systems, then restores the
+original vector allocation/capacity/content even on nested exceptions. No scheduler
+update, decoding, callback, guest execution or audio submission occurs in the probe.
+
+Logs report system count, saved/current queued voices and changed queues. The UI
+marker is NGS-scheduler. The unsupported-host-state return remains intentional:
+this is a diagnostic roundtrip, not retained rewind. Audio routing and other
+uncovered state still require work; the graphics-image probe is still separate.
+
+Host validation passed: actual savestate.cpp syntax; 101 extracted production
+adapter scenarios and 26 record parser cases; existing PCM/accessor rollback,
+RAM/session-layout and Load diagnostic tests. New cases exercise changed order
+and membership, empty queues, two systems, malformed ranks, unknown/cross-system
+pointers, duplicates, queue limits, callback failure/mutation and storage rollback.
+Android build and the phone scheduler/Resume test have not been performed here.
+
+## Output-module PCM checkpoint (previous checkpoint, format v19)
 
 Previous phone run 2026-10-09 01:55/01:56: 165 non-playback parameter blocks,
 7656 bytes, zero differing blocks, all joint/GPU rollback checks passed and Resume

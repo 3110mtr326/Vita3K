@@ -62,7 +62,7 @@ struct Voice {GuestAddress finished_callback,finished_callback_user_data;Rack*ra
 struct VoicePtr{Voice*v;Voice*get(Mem&)const{return v;}};
 struct System;
 struct Rack{System*system=nullptr;std::vector<VoicePtr>voices;std::vector<std::unique_ptr<Module>>modules;};
-struct System{int granularity=6;struct{std::recursive_mutex mutex;bool is_updating=false;std::queue<int>operations_pending;}voice_scheduler;std::vector<Rack*>racks;};
+struct System{int granularity=6;struct{std::recursive_mutex mutex;bool is_updating=false;std::queue<int>operations_pending;std::vector<Voice*>queue;}voice_scheduler;std::vector<Rack*>racks;};
 }
 struct Renderer{bool render_abort=false;};
 struct EmuEnvState{Mem mem;struct{std::map<uint64_t,Segment>memory_mapped_regions;}gxm;
@@ -256,7 +256,66 @@ int main(){
  assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
  voice->~Voice();rack->~Rack();sys->~System();
  }
- std::cout<<"NGS production probe: 84 capture/output-buffer/all-parameters/metadata/parameters/runtime-history/joint/rollback/refusal and 9 record parsing cases passed\n";
+
+ // Real adapter: multiple voices/systems, order and membership changes, and
+ // callback failure must restore the original allocation and all scalar state.
+ for(int mode=0;mode<17;++mode){
+ EmuEnvState e;Renderer r;e.renderer=&r;
+ auto*sys=new(e.mem.memory.get()+4096)ngs::System;
+ auto*rack=new(e.mem.memory.get()+8192)ngs::Rack;
+ auto*v1=new(e.mem.memory.get()+12288)ngs::Voice;
+ auto*v2=new(e.mem.memory.get()+24576)ngs::Voice;
+ auto*sys2=new(e.mem.memory.get()+28672)ngs::System;
+ auto*rack2=new(e.mem.memory.get()+32768)ngs::Rack;
+ v1->datas.clear();v2->datas.clear();v1->rack=rack;v2->rack=rack;
+ rack->voices={{v1},{v2}};rack->system=sys;sys->racks={rack};
+ rack2->system=sys2;sys2->racks={rack2};e.ngs.systems={sys,sys2};
+ auto&q=sys->voice_scheduler.queue;q={v2,v1};
+ if(mode==11||mode==16){rack->voices={{v1}};rack2->voices={{v2}};v2->rack=rack2;q={v1};sys2->voice_scheduler.queue={v2};}
+ std::vector<NgsVoiceRecord> saved,current;
+ assert(snapshot_ngs_voices(e,saved).empty());
+ assert(saved.size()==2 && saved[0].scheduler_position==(mode==11||mode==16?0:1) && saved[1].scheduler_position==0);
+ // Parse the actual serialized records too, including invalid order values.
+ if(mode==4)saved[0].scheduler_position=2; // gap
+ if(mode==5)saved[0].scheduler_position=0; // duplicate
+ if(mode==6)saved[0].scheduler_position=128; // bound
+ if(mode==7)saved[0].scheduler_position=UINT32_MAX-1;
+ uint32_t count=2;std::string bytes(reinterpret_cast<char*>(&count),sizeof(count));
+ bytes.append(reinterpret_cast<char*>(saved.data()),saved.size()*sizeof(NgsVoiceRecord));
+ std::ostringstream pcmout;assert(write_ngs_pcm(pcmout,{}));bytes+=pcmout.str();
+ std::istringstream in(bytes);assert((parse(in)==SaveStateResult::Success)==!(mode>=4 && mode<=7));
+ // Change the live queue after capture; Load must use the saved membership.
+ if(mode!=11&&mode!=16)q={v1,v2};
+ if(mode==1)q={v1};
+ if(mode==2)q.clear();
+ if(mode==3){saved[0].scheduler_position=UINT32_MAX;saved[1].scheduler_position=UINT32_MAX;}
+ if(mode==8)q={v1,v1};
+ if(mode==9)q={nullptr};
+ if(mode==10)q={reinterpret_cast<ngs::Voice*>(uintptr_t(1))};
+ if(mode==11)q={v2}; // real voice, wrong system
+ if(mode==12)q={v1,v2,v1};
+ if(mode==16){q.clear();sys2->voice_scheduler.queue.clear();}
+ saved[0].frames=42;saved[1].frames=43;
+ const auto original=q;auto*storage=q.data();const auto capacity=q.capacity();
+ const auto other_original=sys2->voice_scheduler.queue;auto*other_storage=sys2->voice_scheduler.queue.data();
+ int called=0;
+ auto result=snapshot_ngs_voices(e,current,&saved,[&]{
+   ++called;assert(v1->frame_count==42 && v2->frame_count==43);
+   if(mode==16){assert((q==std::vector<ngs::Voice*>{v1}));assert((sys2->voice_scheduler.queue==std::vector<ngs::Voice*>{v2}));}
+   else if(mode==3)assert(q.empty());else assert((q==std::vector<ngs::Voice*>{v2,v1}));
+   if(mode==13){q.resize(128,v1);throw std::runtime_error("scheduler callback");}
+   if(mode==14)return false;
+   if(mode==15)q.clear(); // detect mutation even if callback reports success
+   return true;
+ });
+ assert(result.empty()==(mode<=3||mode==16));assert(called==(mode<=3||mode>=13?1:0));
+ assert(q==original && q.data()==storage && q.capacity()==capacity);
+ assert(sys2->voice_scheduler.queue==other_original && sys2->voice_scheduler.queue.data()==other_storage);
+ assert(v1->frame_count==100 && v2->frame_count==100);
+ assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
+ v1->~Voice();v2->~Voice();rack->~Rack();rack2->~Rack();sys->~System();sys2->~System();
+ }
+ std::cout<<"NGS production probe: 101 capture/scheduler/output-buffer/all-parameters/metadata/parameters/runtime-history/joint/rollback/refusal and 26 record parsing cases passed\n";
 }
 """.replace('FUNCTION',t[a:b]).replace('PARSER',parser)
 with tempfile.TemporaryDirectory() as d:
