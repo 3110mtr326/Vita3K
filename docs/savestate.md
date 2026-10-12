@@ -4,7 +4,46 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Fixed-route patch volume checkpoint (latest change, format v22)
+## Same-storage patch routing checkpoint (latest change, format v23)
+
+Extends v22 volume probing to saved routing and active/inactive membership when
+the same allocated patch remains in the same port/slot. Slot counts, guest patch
+addresses and ownership must match; null-to-allocated changes remain refused.
+Saved active destinations must still be known voices in the same system with
+input zero. No patch allocation, release or voice/rack reconstruction is done.
+
+Active saved patches stage output port/subindex, destination input, typed guest
+source/destination addresses and volume bits. Inactive saved patches stage only
+the -1 output_sub_index sentinel, leaving dormant fields untouched. All route
+changes join voice state, scheduler order, buffers and the existing joint probe.
+All staging finishes before mutation, and original fields are restored after
+verification or nested failure. No scheduling, callbacks, mixing or guest
+instructions execute while temporary routes are installed. Changed routes are
+counted in Savestate NGS patch routing probe. UI marker NGS-patch-routing.
+
+Wire record layout is unchanged (162696 bytes), but version advances to v23 to
+identify the new semantics; make a fresh save. Complete retained rewind remains
+unsupported. GPU probing is still separate and patch storage recreation is not
+implemented.
+
+Host validation: actual savestate.cpp syntax, 135 production adapter cases and
+26 parser cases, PCM/accessor rollback, session-layout and Load diagnostic tests.
+New cases cover changed destinations jointly with scheduler order, activation,
+deactivation, unknown destination, changed/missing allocation, nested exceptions
+and mutation detection with full restoration of original fields and queue.
+Android build and device test are pending. Prior v22 hardware evidence is below.
+
+## Fixed-route patch volume checkpoint (previous checkpoint, format v22)
+
+Device result 2026-10-12 23:54 (PCSG00219): Save completed. Load checked
+33 active patches, zero changed volume matrices; saved volume bits and original
+matrix rollback MATCH with fixed routes. Changed-volume hardware coverage is
+not established by this run. Input buffers: 34 / 139264 bytes, one changed;
+output: one / 2048 bytes, changed; both saved bytes and rollback MATCH.
+Joint files/RAM/CPU/sync/NGS/context and separate live GPU upload/rollback all
+MATCH. Scheduler has two saved/current queued voices and zero changed queues.
+User reports normal operation. Full retained rewind remains unsupported.
+Detailed evidence: Downloads/vita3k_log.txt, read 2026-10-12.
 
 Capture records all routing slots (including null/inactive), at most four ports
 with 64 slots each per voice. Records hold guest patch identity, port/slot,

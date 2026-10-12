@@ -379,7 +379,43 @@ int main(){
  assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
  patch->~Patch();v->~Voice();rack->~Rack();sys->~System();
  }
- std::cout<<"NGS production probe: 125 capture/patch-volume/input-buffer/scheduler/output-buffer/all-parameters/metadata/parameters/runtime-history/joint/rollback/refusal and 26 record parsing cases passed\n";
+
+ // Route retargeting and activation are tested jointly with scheduler order.
+ for(int mode=0;mode<10;++mode){
+ EmuEnvState e;Renderer r;e.renderer=&r;
+ auto*sys=new(e.mem.memory.get()+4096)ngs::System;auto*rack=new(e.mem.memory.get()+8192)ngs::Rack;
+ auto*v=new(e.mem.memory.get()+12288)ngs::Voice;auto*d=new(e.mem.memory.get()+24576)ngs::Voice;
+ auto*patch=new(e.mem.memory.get()+16384)ngs::Patch;
+ v->datas.clear();d->datas.clear();v->rack=rack;d->rack=rack;rack->system=sys;rack->voices={{v},{d}};sys->racks={rack};e.ngs.systems={sys};
+ v->inputs.inputs={std::vector<uint8_t>(48)};d->inputs.inputs={std::vector<uint8_t>(48)};
+ v->patches[0]={{patch}};patch->source=GuestAddress(12288);patch->dest=GuestAddress(24576);patch->volume_matrix[0][0]=0.5f;
+ if(mode==2)patch->output_sub_index=-1;
+ sys->voice_scheduler.queue={v,d};
+ std::vector<NgsVoiceRecord> saved,current;assert(snapshot_ngs_voices(e,saved).empty());
+ patch->dest=GuestAddress(12288);patch->volume_matrix[0][0]=0.25f;
+ if(mode==1||mode==8)patch->output_sub_index=-1;else patch->output_sub_index=0;
+ sys->voice_scheduler.queue={d,v};
+ if(mode==3)saved[0].patches[0].dest=65535;
+ if(mode==4)saved[0].patches[0].address=20480;
+ if(mode==5)v->patches[0][0]={nullptr};
+ if(mode==9){saved[0].patches[0].active=0;saved[0].patches[0].dest=0;}
+ const auto original=*patch;const auto original_queue=sys->voice_scheduler.queue;
+ int called=0;auto result=snapshot_ngs_voices(e,current,&saved,[&]{
+ ++called;assert((sys->voice_scheduler.queue==std::vector<ngs::Voice*>{v,d}));
+ if(mode==2||mode==9){assert(patch->output_sub_index==-1);assert(patch->dest.address()==original.dest.address());}
+ else{assert(patch->output_sub_index==0 && patch->output_index==0 && patch->dest_index==0);assert(patch->dest.address()==24576 && patch->source.address()==12288);assert(patch->volume_matrix[0][0]==0.5f);}
+ if(mode==6||mode==8){patch->dest=GuestAddress(42);patch->output_sub_index=55;throw std::runtime_error("routing failure");}
+ if(mode==7)patch->dest=GuestAddress(42);
+ return true;
+ });
+ assert(result.empty()==(mode<=2||mode==9));assert(called==(mode<=2||mode>=6?1:0));
+ assert(patch->output_index==original.output_index && patch->output_sub_index==original.output_sub_index && patch->dest_index==original.dest_index);
+ assert(patch->source.address()==original.source.address() && patch->dest.address()==original.dest.address());
+ assert(std::memcmp(patch->volume_matrix,original.volume_matrix,16)==0 && sys->voice_scheduler.queue==original_queue);
+ assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
+ patch->~Patch();v->~Voice();d->~Voice();rack->~Rack();sys->~System();
+ }
+ std::cout<<"NGS production probe: 135 capture/patch-routing/patch-volume/input-buffer/scheduler/output-buffer/all-parameters/metadata/parameters/runtime-history/joint/rollback/refusal and 26 record parsing cases passed\n";
 }
 """.replace('FUNCTION',t[a:b]).replace('PARSER',parser)
 with tempfile.TemporaryDirectory() as d:

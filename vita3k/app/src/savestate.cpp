@@ -142,7 +142,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 22; // v22: fixed-routing patch volume matrices
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 23; // v23: same-storage patch routing and activation
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -1002,7 +1002,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
         }
     }
     // Snapshot every routing slot, including null and inactive entries. Restore
-    // volumes only when routing identities and active membership are unchanged.
+    // routes only when the same slot/storage identities remain available.
     std::set<uint32_t> patch_addresses;
     for (size_t i=0;i<targets.size();++i) {
         auto &record=captured[i];const auto &ports=targets[i]->patches;
@@ -1072,7 +1072,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     size_t effect_blocks=0,effect_bytes=0,changed_effect_blocks=0;
     size_t output_buffers=0,output_bytes=0,changed_output_buffers=0;
     size_t input_buffers=0,input_bytes=0,changed_input_buffers=0;
-    size_t patch_volumes=0,changed_patch_volumes=0;
+    size_t patch_volumes=0,changed_patch_volumes=0,patch_routes=0,changed_patch_routes=0;
     std::vector<std::unique_lock<std::mutex>> codec_locks;
     SnapshotValueProbe transaction;
     for (size_t i=0;i<captured.size();++i) {
@@ -1083,10 +1083,22 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
         if (before.patch_count!=after.patch_count) return "NGS patch layout changed since saving";
         for (size_t j=0;j<after.patch_count;++j) {
             const auto &a=after.patches[j];const auto &b=before.patches[j];
-            if (a.address!=b.address || a.port!=b.port || a.slot!=b.slot || a.active!=b.active
-                || a.dest!=b.dest || a.dest_index!=b.dest_index) return "NGS patch routing changed since saving";
-            if (!a.active) continue;
+            if (a.address!=b.address || a.port!=b.port || a.slot!=b.slot)
+                return "NGS patch storage changed since saving";
+            if (!a.address) continue;
             auto *patch=voice.patches[a.port][a.slot].get(mem);
+            ++patch_routes;
+            if (a.active!=b.active || a.dest!=b.dest || a.dest_index!=b.dest_index) ++changed_patch_routes;
+            // Inactive patches only define the -1 sentinel. Leave their dormant
+            // fields untouched; activating restores all meaningful route fields.
+            transaction.stage(patch->output_sub_index,a.active ? static_cast<int32_t>(a.slot) : int32_t(-1));
+            if (!a.active) continue;
+            transaction.stage(patch->output_index,static_cast<int32_t>(a.port));
+            transaction.stage(patch->dest_index,static_cast<int32_t>(a.dest_index));
+            const auto dest=std::decay_t<decltype(patch->dest)>(a.dest);
+            const auto source=std::decay_t<decltype(patch->source)>(after.voice);
+            transaction.stage_object_bytes(patch->dest,&dest);
+            transaction.stage_object_bytes(patch->source,&source);
             for (size_t row=0;row<2;++row) for (size_t col=0;col<2;++col)
                 transaction.stage_object_bytes(patch->volume_matrix[row][col],a.volume.data()+(row*2+col)*sizeof(float));
             ++patch_volumes;if (a.volume!=b.volume) ++changed_patch_volumes;
@@ -1245,7 +1257,8 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     LOG_INFO("Savestate NGS metadata probe: {} modules, {} changed modules; saved bypass and guest callback registrations MATCH; original registrations restored; no callbacks invoked.",metadata_modules,changed_metadata_modules);
     LOG_INFO("Savestate NGS non-playback parameter probe: {} blocks, {} bytes, {} changed blocks; saved bytes MATCH; original bytes restored; no effects processing executed.",effect_blocks,effect_bytes,changed_effect_blocks);
     LOG_INFO("Savestate NGS scheduler probe: {} systems, {} saved queued voices, {} current queued voices, {} changed queues; saved membership/order MATCH; original queues and storage restored; no scheduling executed.",emuenv.ngs.systems.size(),saved_queued,queued_voices,changed_schedulers);
-    LOG_INFO("Savestate NGS patch volume probe: {} active patches, {} changed matrices; saved volume bits MATCH; original matrices restored; fixed routes only, no mixing executed.",patch_volumes,changed_patch_volumes);
+    LOG_INFO("Savestate NGS patch routing probe: {} allocated patches, {} changed routes; saved routing/activation MATCH; original fields restored; same storage only, no scheduling or mixing executed.",patch_routes,changed_patch_routes);
+    LOG_INFO("Savestate NGS patch volume probe: {} active patches, {} changed matrices; saved volume bits MATCH; original matrices restored; no mixing executed.",patch_volumes,changed_patch_volumes);
     LOG_INFO("Savestate NGS input buffer probe: {} buffers, {} bytes, {} changed buffers; saved PCM bytes MATCH; original bytes restored in place; no mixing executed.",input_buffers,input_bytes,changed_input_buffers);
     LOG_INFO("Savestate NGS output buffer probe: {} buffers, {} bytes, {} changed buffers; saved PCM bytes MATCH; original bytes restored in place; no output submitted.",output_buffers,output_bytes,changed_output_buffers);
     size_t saved_pending_bytes=0;
@@ -2030,7 +2043,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU/sync/NGS-patch-volume/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU/sync/NGS-patch-routing/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
