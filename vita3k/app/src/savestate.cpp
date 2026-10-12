@@ -2094,11 +2094,44 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     }
     gxm::ContextPreflightResult contexts;
     bool graphics_called = false;
+    auto image_result = renderer::SnapshotImageValidation::NotReady;
+    bool images_called = false;
+    const auto image_stage = [&]() -> const char * {
+        switch (image_result) {
+        case renderer::SnapshotImageValidation::LiveRoundTripPassed: return "joint-live-gpu-roundtrip-passed";
+        case renderer::SnapshotImageValidation::LiveUploadMismatch: return "live-gpu-upload-mismatch (original images restored)";
+        case renderer::SnapshotImageValidation::TransferFailed: return "gpu-transfer-failed (restart session before further use)";
+        case renderer::SnapshotImageValidation::InvalidData: return "invalid-data";
+        case renderer::SnapshotImageValidation::Unsupported: return "unsupported-backend";
+        default: return "joint-live-gpu-check-incomplete";
+        }
+    };
     const SnapshotRamJointCheck graphics_checkpoint = [&](const std::function<bool()> &verify_ram) {
         if (graphics_called) return false;
         graphics_called = true;
         contexts = {gxm::ContextPreflightError::JointCheckFailed,0};
-        contexts = gxm::probe_context_restore_joint(emuenv,host_pause,saved_graphics,verify_ram);
+        contexts = gxm::probe_context_restore_joint(emuenv,host_pause,saved_graphics,[&] {
+            if (!verify_ram || !verify_ram() || images_called) return false;
+            images_called = true;
+            // The outer file/RAM/CPU/sync/NGS and context transactions remain
+            // applied and locked throughout this GPU batch. Its intermediate
+            // readback observes saved images before the in-batch GPU rollback.
+            // No guest execution or host worker resumes between these steps.
+            try {
+                image_result = emuenv.renderer->validate_snapshot_image_section(bytes, host_pause,
+                    std::chrono::steady_clock::now() + std::chrono::seconds(8));
+            } catch (...) {
+                image_result = renderer::SnapshotImageValidation::TransferFailed;
+            }
+            if (image_result == renderer::SnapshotImageValidation::TransferFailed) {
+                kernel.snapshot_restore_failed = true;
+                emuenv.renderer->render_abort.store(true);
+            }
+            LOG_INFO("Savestate joint GPU probe: {}; saved host domains held throughout GPU upload/readback/rollback; no game rewind committed.", image_stage());
+            // Prepared or scratch-only success cannot pass the joint test.
+            return image_result == renderer::SnapshotImageValidation::LiveRoundTripPassed
+                && verify_ram();
+        });
         return bool(contexts);
     };
     if (session_check) {
@@ -2106,37 +2139,27 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         if (!mismatch.empty()) {
             LOG_INFO("Savestate session preflight: REFUSED: {}; no saved state retained unless rollback failed.", mismatch);
             if (out_detail) *out_detail = fmt::format(
-                "Joint preflight refused: {}; graphics called {}, context reason {}, capture reason {}, address 0x{:08X}; no saved state retained unless rollback failed",
-                mismatch,graphics_called,static_cast<int>(contexts.error),static_cast<int>(contexts.capture_error),contexts.offending_address);
+                "Joint preflight refused: {}; GPU stage {}, GPU called {}, graphics called {}, context reason {}, capture reason {}, address 0x{:08X}; no saved state retained unless rollback failed",
+                mismatch,image_stage(),images_called,graphics_called,static_cast<int>(contexts.error),static_cast<int>(contexts.capture_error),contexts.offending_address);
             return SaveStateResult::ErrorMismatch;
         }
         LOG_INFO("Savestate session preflight: MATCH (memory layout, thread IDs, sync object IDs and graphics counts); not a full restore authorization.");
     }
     // Continuous exclusion covers temporary context application AND rollback.
     // Successful diagnostics do not commit a game restore.
-    if (!graphics_called || !contexts) {
+    if (!graphics_called || !contexts || !images_called
+        || image_result != renderer::SnapshotImageValidation::LiveRoundTripPassed) {
         if (out_detail) *out_detail = "Joint graphics checkpoint was not reached; no saved state retained";
         return SaveStateResult::ErrorMismatch;
     }
     LOG_INFO("Savestate load diagnostic: context preparation reason {}, capture reason {}, address 0x{:08X}; temporary context changes rolled back.",
         static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
-    const auto result = emuenv.renderer->validate_snapshot_image_section(bytes, host_pause,
-        std::chrono::steady_clock::now() + std::chrono::seconds(8));
-    const char *stage = result == renderer::SnapshotImageValidation::LiveRoundTripPassed ? "live-gpu-roundtrip-passed"
-        : result == renderer::SnapshotImageValidation::LiveUploadMismatch ? "live-gpu-upload-mismatch (original images restored)"
-        : result == renderer::SnapshotImageValidation::LiveRollbackPassed ? "live-gpu-rollback-passed"
-        : result == renderer::SnapshotImageValidation::RoundTripPassed ? "gpu-roundtrip-passed"
-        : result == renderer::SnapshotImageValidation::RoundTripMismatch ? "gpu-roundtrip-mismatch"
-        : result == renderer::SnapshotImageValidation::TransferFailed ? "gpu-transfer-failed (restart session before further use)"
-        : result == renderer::SnapshotImageValidation::Prepared ? "prepared"
-        : result == renderer::SnapshotImageValidation::InvalidData ? "invalid-data"
-        : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
+    const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU/sync/NGS-products/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU/sync/NGS/context/GPU roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
-    return result == renderer::SnapshotImageValidation::InvalidData
-        ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
+    return SaveStateResult::ErrorUnsupportedHostState;
 }
 
 SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::string *out_detail) {
@@ -2361,7 +2384,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 + (ngs_error.empty() ? "" : "; " + ngs_error);
             if (!ram_probe.empty()) return joint_error.empty() ? ram_probe : ram_probe + "; " + joint_error;
             if (!simultaneous_check) return "Joint files/RAM/CPU/sync/context checkpoint was not reached";
-            LOG_INFO("Savestate joint probe: files/RAM/CPU/sync/NGS/context saved values coexisted; all rollbacks MATCH; no guest instructions, wait replay or game rewind.");
+            LOG_INFO("Savestate joint probe: files/RAM/CPU/sync/NGS/context/GPU saved values coexisted; all rollbacks MATCH; no guest instructions, wait replay or game rewind.");
             return {};
         }); // Unconditional return: no retained RAM changes, wait aborts or replay.
     }

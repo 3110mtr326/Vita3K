@@ -4,7 +4,52 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Symbolic voice products checkpoint (latest change, format v25)
+## Joint host and GPU checkpoint (latest change, format v25 unchanged)
+
+The GPU image diagnostic now runs INSIDE the saved context transaction, while
+the outer read-only file positions, eligible RAM, CPU, sync and NGS transactions
+remain applied. Existing renderer/writeback exclusion, kernel locks and memory
+metadata locks remain held. The GPU path uses only pinned cache metadata and
+detached image data; it does not reenter guest memory or schedule host workers.
+Its existing single submission uploads saved images, records their intermediate
+readback, then restores original images. CPU-side domains stay installed for
+that entire submission. RAM/file verification runs before and after it; each
+outer transaction retains its own saved-value and rollback verification.
+
+Only LiveRoundTripPassed passes this nested checkpoint. Prepared, isolated image
+success, upload mismatch, missing verifier and unavailable backends fail closed.
+Transfer failures and exceptions set both persistent kernel restore failure and
+renderer abort, preventing Resume with an uncertain GPU outcome. Host-domain
+rollback still runs on failure. No second GPU probe runs after host rollback.
+UI success marker: joint-live-gpu-roundtrip-passed; domain list ends context/GPU.
+The wire format remains v25. A fresh save is recommended for device evidence.
+
+Validation: production savestate.cpp host syntax; 29 extracted Load control-flow
+cases (saved host/context lifetime, before/after checks, non-success statuses,
+duplicate/missing callback, exception cleanup and failure veto); existing live
+GPU batch simulation, joint RAM/CPU/sync rollback, context adapter, session-layout
+and NGS 156 adapter / 26 parser cases passed. These use mocks for GPU execution.
+Android build and device validation of the new nesting remain pending.
+
+This is still diagnostic, not retained rewind. Coverage is restricted to the
+existing eligible RAM, same-session objects and captured base GPU images.
+Remaining work includes a full host-state coverage audit, retained restoration
+with safe guest wait/thread continuation, renderer cache/resource consistency,
+audio restart/output continuity, and repeated real-device rewind tests. The
+40-50% estimate communicated for usable FFX save/load is a rough engineering
+judgment, not measured completion or a remaining-time forecast.
+
+## Symbolic voice products checkpoint (previous checkpoint, format v25)
+
+Device result 2026-10-13 02:13 (PCSG00219): Save completed; the Load diagnostic
+passed. Products: five nonnull references, zero changed symbolic references;
+saved buffer references MATCH, original references restored after buffer rollback.
+This run exercises live nonnull references but does not demonstrate changed
+buffer-kind/index/offset restoration on the phone. Scratch buffers were empty.
+Input: 34 buffers / 139264 bytes, one changed; output: one / 2048 bytes,
+changed; saved bytes and rollback MATCH. Joint files/RAM/CPU/sync/NGS/context
+rollback and separate live GPU roundtrip passed. User reports normal operation.
+Full retained rewind remains unsupported. Detailed log read 2026-10-13.
 
 Stores the four VoiceProduct data references as kind/index/byte-offset triples:
 null, voice input, playback scratch, or decoded PCM. Native host pointers are
@@ -29,7 +74,7 @@ Host checks passed: actual savestate.cpp syntax, 156 production adapter cases,
 cases cover each buffer kind, null/nonnull transitions, changed PCM allocation,
 aliasing, invalid kind/index/offset, unknown live pointers, nested exceptions and
 buffer mutation, including exact original pointer restoration. Android build and
-phone behavior are pending. Full retained rewind and unsupported host state
+phone behavior were subsequently confirmed by the device result above. Full retained rewind and unsupported host state
 remain unfinished; graphics images still use a separate diagnostic probe.
 
 ## Playback scratch checkpoint (previous checkpoint, format v24)
