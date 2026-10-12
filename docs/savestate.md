@@ -4,7 +4,42 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Same-storage patch routing checkpoint (latest change, format v23)
+## Playback scratch checkpoint (latest change, format v24)
+
+Player/ATRAC9 scratch_data provides padded stereo float output when decoded PCM
+has fewer than granularity frames. NPC4 now serializes this byte vector after
+each playback record's pending input. Limits: 8192 bytes per buffer, 8-byte
+alignment, 1 MiB aggregate, existing 2048 PCM record maximum. Reader checks limits
+before allocation and commits decoded records only after complete validation.
+The outer format advances to v24; use a fresh save. Fixed voice record layout
+remains 162696 bytes; scratch payload is variable-length rather than padded.
+
+Capture bounds scratch before copying. Load requires the same current/saved
+size and stages each byte in place alongside existing joint state, preserving
+storage referenced by voice products. Nested failure or mutation restores the
+original bytes. Logs report nonempty buffers, total bytes and changed buffers;
+UI marker NGS-scratch. No decoding, mixing or guest execution occurs. Newly
+created/resized scratch buffers are refused. Product-pointer serialization and
+full retained rewind remain unfinished; GPU probing is still separate.
+
+Validation passed: actual savestate.cpp syntax; 144 production adapter scenarios
+and 26 parser cases; NPC4 roundtrip, every truncation, scratch alignment/per-buffer/
+aggregate limits; existing PCM/accessor, session layout and Load checks. New
+adapter cases include changed bytes, maximum size, empty buffer, size mismatch,
+invalid lengths, exception/mutation rollback and preserved allocation/capacity.
+Android build and device behavior are pending. Previous v23 phone results below.
+
+## Same-storage patch routing checkpoint (previous checkpoint, format v23)
+
+Device result 2026-10-13 00:41 (PCSG00219): Save completed. Load checked
+33 allocated patches, zero changed routes, and 33 active patches with zero
+changed volume matrices. Saved routing/activation and volume bits MATCH;
+original fields restored. Changed-route/activation hardware coverage is not
+established by this run. Input: 34 buffers / 139264 bytes, one changed; output:
+one / 2048 bytes, changed; both saved bytes and rollback MATCH. Joint
+files/RAM/CPU/sync/NGS/context and separate live GPU upload/rollback all MATCH.
+User reports normal operation. Full retained rewind remains unsupported.
+Detailed log read from Downloads/vita3k_log.txt on 2026-10-13.
 
 Extends v22 volume probing to saved routing and active/inactive membership when
 the same allocated patch remains in the same port/slot. Slot counts, guest patch

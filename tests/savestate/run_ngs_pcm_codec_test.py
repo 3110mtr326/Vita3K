@@ -12,15 +12,15 @@ using namespace app;
 int main(){
  NgsPcmRecord r{4096,0,0x5CE6,1,{std::bit_cast<float>(0x80000000u),std::bit_cast<float>(0x7fc01234u),3,4}};
  r.history={std::bit_cast<float>(0x7fc05678u),std::bit_cast<float>(0x80000000u)};r.history_offset=1;r.needs_reset=1;
- r.pending_input={0,255,127,3,8};
+ r.pending_input={0,255,127,3,8};r.scratch={0,255,1,2,3,4,5,6};
  std::ostringstream out;assert(write_ngs_pcm(out,{r}));const auto bytes=out.str();
  std::vector<NgsPcmRecord>decoded;
  std::istringstream in(bytes+"TAIL");assert(read_ngs_pcm(in,decoded));assert(in.get()=='T');
- assert(decoded[0].pending_input==r.pending_input);
+ assert(decoded[0].pending_input==r.pending_input && decoded[0].scratch==r.scratch);
  assert(decoded[0].history_offset==1 && decoded[0].needs_reset==1 && std::memcmp(decoded[0].history.data(),r.history.data(),8)==0);
  assert(decoded.size()==1 && decoded[0].offset==1 && std::memcmp(decoded[0].samples.data(),r.samples.data(),16)==0);
  for(size_t n=0;n<bytes.size();++n){std::istringstream bad(bytes.substr(0,n));decoded={r};assert(!read_ngs_pcm(bad,decoded));assert(decoded.size()==1);}
- for(int mode=0;mode<14;++mode){auto invalid=r;
+ for(int mode=0;mode<17;++mode){auto invalid=r;
  if(mode==0)invalid.voice=0;if(mode==1)invalid.index=256;if(mode==2)invalid.module_id=0;
  if(mode==3)invalid.offset=3;if(mode==4)invalid.samples.push_back(0);
  if(mode==5)invalid.samples.resize(NGS_PCM_MAX_SAMPLES+2);
@@ -31,6 +31,9 @@ int main(){
  if(mode==11)records[0].history.resize(NGS_PCM_MAX_SAMPLES+2);
  if(mode==12)records[0].pending_input.resize(NGS_PENDING_MAX_BYTES+1);
  if(mode==13){records.clear();for(uint32_t j=0;j<17;++j){auto big=r;big.voice+=j;big.pending_input.resize(NGS_PENDING_MAX_BYTES);records.push_back(std::move(big));}}
+ if(mode==14)records[0].scratch.resize(NGS_SCRATCH_MAX_BYTES+8);
+ if(mode==15)records[0].scratch.resize(7);
+ if(mode==16){records.clear();for(uint32_t j=0;j<129;++j){auto big=r;big.voice+=j;big.scratch.resize(NGS_SCRATCH_MAX_BYTES);records.push_back(std::move(big));}}
  if(mode==6)records.push_back(invalid);
  if(mode==7){records.clear();for(uint32_t j=0;j<17;++j){auto big=r;big.voice+=j;big.samples.resize(NGS_PCM_MAX_SAMPLES);records.push_back(std::move(big));}}
  std::ostringstream refused;assert(!write_ngs_pcm(refused,records));assert(refused.str().empty());
@@ -51,7 +54,7 @@ int main(){
  }
  {uint32_t value=7,saved=9;SnapshotValueProbe probe;bool caught=false;
  try{probe.stage_access_bytes<uint32_t>(&value,&saved,[](uint32_t&){return false;},[&](const uint32_t&){assert(false);return false;});}catch(...){caught=true;}assert(caught&&value==7);}
- std::cout<<"PASS: PCM/resampler/pending codec bit patterns, framing/truncation, identity/size limits; vector rollback and runtime accessor apply/read/write/rollback failure handling\n";
+ std::cout<<"PASS: PCM/resampler/pending/scratch codec bit patterns, framing/truncation, identity/size limits; vector rollback and runtime accessor apply/read/write/rollback failure handling\n";
 }
 """
 with tempfile.TemporaryDirectory() as d:

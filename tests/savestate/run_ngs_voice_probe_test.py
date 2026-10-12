@@ -55,7 +55,7 @@ enum VoiceState{VOICE_STATE_AVAILABLE,VOICE_STATE_ACTIVE,VOICE_STATE_FINALIZING,
 struct Rack;
 struct Voice;
 struct ParamPtr{uint32_t address=16384;void*get(Mem&m)const{return address?m.memory.get()+address:nullptr;}};
-struct ModuleData{GuestAddress callback,user_data;bool is_bypassed=false;uint8_t flags=0;struct{ParamPtr data;uint32_t size=84;}info;std::unique_ptr<ModuleRuntimeState>runtime_state{new PlayerRuntimeState};std::unique_ptr<ModuleLogicalState>logical_state{new PlayerLogicalState};Voice*parent=nullptr;uint32_t index=0;std::vector<uint8_t>guest_state_data=std::vector<uint8_t>(24);};
+struct ModuleData{std::vector<uint8_t>scratch_data;GuestAddress callback,user_data;bool is_bypassed=false;uint8_t flags=0;struct{ParamPtr data;uint32_t size=84;}info;std::unique_ptr<ModuleRuntimeState>runtime_state{new PlayerRuntimeState};std::unique_ptr<ModuleLogicalState>logical_state{new PlayerLogicalState};Voice*parent=nullptr;uint32_t index=0;std::vector<uint8_t>guest_state_data=std::vector<uint8_t>(24);};
 struct Module{uint32_t id=0x5CE6;uint32_t module_id()const{return id;}uint32_t get_guest_state_size()const{return 24;}uint32_t get_buffer_parameter_size()const{return id==0?0:(id==0x5CE6?84:96);}};
 struct Patch{int32_t output_index=0,output_sub_index=0,dest_index=0;GuestAddress dest,source;float volume_matrix[2][2]{};};
 struct PatchPtr{Patch*v=nullptr;Patch*get(Mem&)const{return v;}};
@@ -415,7 +415,36 @@ int main(){
  assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
  patch->~Patch();v->~Voice();d->~Voice();rack->~Rack();sys->~System();
  }
- std::cout<<"NGS production probe: 135 capture/patch-routing/patch-volume/input-buffer/scheduler/output-buffer/all-parameters/metadata/parameters/runtime-history/joint/rollback/refusal and 26 record parsing cases passed\n";
+
+ for(int mode=0;mode<9;++mode){
+ EmuEnvState e;Renderer r;e.renderer=&r;
+ auto*sys=new(e.mem.memory.get()+4096)ngs::System;auto*rack=new(e.mem.memory.get()+8192)ngs::Rack;
+ auto*v=new(e.mem.memory.get()+12288)ngs::Voice;
+ v->rack=rack;rack->system=sys;rack->voices={{v}};sys->racks={rack};e.ngs.systems={sys};
+ v->datas[0].parent=v;rack->modules.push_back(std::make_unique<ngs::Module>());
+ auto &scratch=v->datas[0].scratch_data;scratch.assign(mode==1?8192:48,17);
+ if(mode==8)scratch.clear();
+ std::vector<NgsVoiceRecord> saved,current;std::vector<NgsPcmRecord> ps,pc;
+ assert(snapshot_ngs_voices(e,saved,nullptr,{},false,&ps).empty());
+ if(mode!=8){ps[0].scratch.front()=255;ps[0].scratch.back()=93;}
+ saved[0].frames=42;
+ if(mode==2)scratch.clear();
+ if(mode==3)ps[0].scratch.resize(40);
+ if(mode==4)ps[0].scratch.resize(8200);
+ if(mode==5)scratch.resize(49);
+ const auto original=scratch;auto*storage=scratch.data();const auto capacity=scratch.capacity();int called=0;
+ auto result=snapshot_ngs_voices(e,current,&saved,[&]{
+ ++called;assert(scratch==ps[0].scratch && scratch.data()==storage && v->frame_count==42);
+ if(mode==6){scratch.front()=7;throw std::runtime_error("scratch failure");}
+ if(mode==7)scratch.back()=7;
+ return true;
+ },false,&pc,&ps);
+ assert(result.empty()==(mode<=1||mode==8));assert(called==(mode<=1||mode>=6?1:0));
+ assert(scratch==original && scratch.data()==storage && scratch.capacity()==capacity && v->frame_count==100);
+ assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
+ v->~Voice();rack->~Rack();sys->~System();
+ }
+ std::cout<<"NGS production probe: 144 capture/scratch/patch-routing/patch-volume/input-buffer/scheduler/output-buffer/all-parameters/metadata/parameters/runtime-history/joint/rollback/refusal and 26 record parsing cases passed\n";
 }
 """.replace('FUNCTION',t[a:b]).replace('PARSER',parser)
 with tempfile.TemporaryDirectory() as d:

@@ -142,7 +142,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 23; // v23: same-storage patch routing and activation
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 24; // v24: bounded playback scratch bytes (NPC4)
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -817,7 +817,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     if (saved_pcm && (!captured_pcm || !saved || !valid_ngs_pcm(*saved_pcm))) return "Invalid NGS PCM records";
     if (saved && captured_pcm && !saved_pcm) return "Missing saved NGS PCM records";
     if (captured_pcm) captured_pcm->clear();
-    size_t pcm_samples=0,resampler_samples=0,pending_bytes=0;
+    size_t pcm_samples=0,resampler_samples=0,pending_bytes=0,scratch_bytes=0;
     auto &mem = emuenv.mem;
     std::unique_lock<std::mutex> allocation(mem.generation_mutex, std::defer_lock);
     std::unique_lock<std::mutex> protection(mem.protect_mutex, std::defer_lock);
@@ -977,8 +977,14 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
                         if (pending_input->size()>NGS_PENDING_MAX_BYTES
                             || pending_input->size()>NGS_PENDING_TOTAL_BYTES-pending_bytes) return "NGS pending input exceeds snapshot limits";
                         pending_bytes+=pending_input->size();
+                        const auto scratch_size=data.scratch_data.size();
+                        if (scratch_size>NGS_SCRATCH_MAX_BYTES || scratch_size%8
+                            || scratch_size>NGS_SCRATCH_TOTAL_BYTES-scratch_bytes)
+                            return "NGS playback scratch exceeds snapshot limits";
+                        scratch_bytes+=scratch_size;
+
                         captured_pcm->push_back({voice_id,static_cast<uint32_t>(index),id,pcm_queue->read_offset_frames,pcm_queue->samples,
-                            rate->input_history.read_offset_frames,uint32_t(rate->needs_reset),rate->input_history.samples,*pending_input});
+                            rate->input_history.read_offset_frames,uint32_t(rate->needs_reset),rate->input_history.samples,*pending_input,data.scratch_data});
                     }
                 }
                 targets.push_back(voice);
@@ -1068,6 +1074,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     if (saved->size() != captured.size()) return "NGS voice count changed since saving";
     if (saved_pcm && saved_pcm->size()!=captured_pcm->size()) return "NGS PCM queue count changed";
     size_t pcm_index=0,pcm_decoders=0,atrac_decoders=0,absent_decoders=0;
+    size_t scratch_buffers=0,changed_scratch_buffers=0;
     size_t parameter_bytes=0,changed_parameter_blocks=0,metadata_modules=0,changed_metadata_modules=0;
     size_t effect_blocks=0,effect_bytes=0,changed_effect_blocks=0;
     size_t output_buffers=0,output_bytes=0,changed_output_buffers=0;
@@ -1212,6 +1219,13 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
                     ? static_cast<ngs::PlayerLogicalState*>(data.logical_state.get())->adpcm_buffer
                     : static_cast<ngs::Atrac9LogicalState*>(data.logical_state.get())->superframe_staging;
                 transaction.stage_vector_bytes(pending,pcm.pending_input);
+                // Scratch products can directly reference this allocation.
+                // Keep storage stable; resized/missing buffers are unsupported.
+                if (data.scratch_data.size()!=pcm.scratch.size()) return "NGS playback scratch layout changed";
+                if (!pcm.scratch.empty()) ++scratch_buffers;
+                if (data.scratch_data!=pcm.scratch) ++changed_scratch_buffers;
+                for (size_t k=0;k<pcm.scratch.size();++k) transaction.stage(data.scratch_data[k],pcm.scratch[k]);
+
             }
             if (source.module_id==0x5CE6) {
                 auto *logical=static_cast<ngs::PlayerLogicalState *>(data.logical_state.get());
@@ -1257,6 +1271,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     LOG_INFO("Savestate NGS metadata probe: {} modules, {} changed modules; saved bypass and guest callback registrations MATCH; original registrations restored; no callbacks invoked.",metadata_modules,changed_metadata_modules);
     LOG_INFO("Savestate NGS non-playback parameter probe: {} blocks, {} bytes, {} changed blocks; saved bytes MATCH; original bytes restored; no effects processing executed.",effect_blocks,effect_bytes,changed_effect_blocks);
     LOG_INFO("Savestate NGS scheduler probe: {} systems, {} saved queued voices, {} current queued voices, {} changed queues; saved membership/order MATCH; original queues and storage restored; no scheduling executed.",emuenv.ngs.systems.size(),saved_queued,queued_voices,changed_schedulers);
+    LOG_INFO("Savestate NGS scratch probe: {} nonempty buffers, {} bytes, {} changed buffers; saved scratch bytes MATCH; original bytes restored in place; no decoding executed.",scratch_buffers,scratch_bytes,changed_scratch_buffers);
     LOG_INFO("Savestate NGS patch routing probe: {} allocated patches, {} changed routes; saved routing/activation MATCH; original fields restored; same storage only, no scheduling or mixing executed.",patch_routes,changed_patch_routes);
     LOG_INFO("Savestate NGS patch volume probe: {} active patches, {} changed matrices; saved volume bits MATCH; original matrices restored; no mixing executed.",patch_volumes,changed_patch_volumes);
     LOG_INFO("Savestate NGS input buffer probe: {} buffers, {} bytes, {} changed buffers; saved PCM bytes MATCH; original bytes restored in place; no mixing executed.",input_buffers,input_bytes,changed_input_buffers);
@@ -2043,7 +2058,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU/sync/NGS-patch-routing/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU/sync/NGS-scratch/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;
