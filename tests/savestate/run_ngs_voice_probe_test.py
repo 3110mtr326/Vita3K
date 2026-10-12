@@ -57,7 +57,9 @@ struct Voice;
 struct ParamPtr{uint32_t address=16384;void*get(Mem&m)const{return address?m.memory.get()+address:nullptr;}};
 struct ModuleData{GuestAddress callback,user_data;bool is_bypassed=false;uint8_t flags=0;struct{ParamPtr data;uint32_t size=84;}info;std::unique_ptr<ModuleRuntimeState>runtime_state{new PlayerRuntimeState};std::unique_ptr<ModuleLogicalState>logical_state{new PlayerLogicalState};Voice*parent=nullptr;uint32_t index=0;std::vector<uint8_t>guest_state_data=std::vector<uint8_t>(24);};
 struct Module{uint32_t id=0x5CE6;uint32_t module_id()const{return id;}uint32_t get_guest_state_size()const{return 24;}uint32_t get_buffer_parameter_size()const{return id==0?0:(id==0x5CE6?84:96);}};
-struct Voice {struct{std::vector<std::vector<uint8_t>> inputs;}inputs;GuestAddress finished_callback,finished_callback_user_data;Rack*rack=nullptr;std::unique_ptr<std::mutex>voice_mutex{new std::mutex};std::vector<ModuleData>datas=std::vector<ModuleData>(1);
+struct Patch{int32_t output_index=0,output_sub_index=0,dest_index=0;GuestAddress dest,source;float volume_matrix[2][2]{};};
+struct PatchPtr{Patch*v=nullptr;Patch*get(Mem&)const{return v;}};
+struct Voice {std::array<std::vector<PatchPtr>,4>patches;struct{std::vector<std::vector<uint8_t>> inputs;}inputs;GuestAddress finished_callback,finished_callback_user_data;Rack*rack=nullptr;std::unique_ptr<std::mutex>voice_mutex{new std::mutex};std::vector<ModuleData>datas=std::vector<ModuleData>(1);
  VoiceState state=VOICE_STATE_ACTIVE;bool is_pending=false,is_paused=false,is_keyed_off=false;uint32_t frame_count=100;};
 struct VoicePtr{Voice*v;Voice*get(Mem&)const{return v;}};
 struct System;
@@ -344,7 +346,40 @@ int main(){
  assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
  v->~Voice();rack->~Rack();sys->~System();
  }
- std::cout<<"NGS production probe: 111 capture/input-buffer/scheduler/output-buffer/all-parameters/metadata/parameters/runtime-history/joint/rollback/refusal and 26 record parsing cases passed\n";
+
+ for(int mode=0;mode<14;++mode){
+ EmuEnvState e;Renderer r;e.renderer=&r;
+ auto*sys=new(e.mem.memory.get()+4096)ngs::System;auto*rack=new(e.mem.memory.get()+8192)ngs::Rack;
+ auto*v=new(e.mem.memory.get()+12288)ngs::Voice;auto*patch=new(e.mem.memory.get()+16384)ngs::Patch;
+ v->datas.clear();v->rack=rack;rack->system=sys;rack->voices={{v}};sys->racks={rack};e.ngs.systems={sys};
+ v->inputs.inputs={std::vector<uint8_t>(48)};v->patches[0]={{patch},{nullptr}};
+ patch->source=GuestAddress(12288);patch->dest=GuestAddress(12288);
+ if(mode==2)v->patches[0][0]={nullptr};
+ if(mode==3)patch->output_sub_index=-1;
+ std::vector<NgsVoiceRecord> saved,current;assert(snapshot_ngs_voices(e,saved).empty());
+ auto &entry=saved[0].patches[0];assert(saved[0].patch_count==2 && entry.active==(mode<=1||mode>=4?1:0));
+ uint32_t bits[4]={0x3f000000,0x80000000,0x3f800000,0x40000000};
+ if(mode==1)bits[0]=0x7fc01234;std::memcpy(entry.volume.data(),bits,16);
+ if(mode==4)entry.address++;
+ if(mode==5)entry.port=4;
+ if(mode==6)entry.dest=32768;
+ if(mode==7)saved[0].patch_count=0;
+ if(mode==8)patch->source=GuestAddress(24576);
+ if(mode==9)e.mem.protect_tree[16384]={0,4096};
+ if(mode==12)v->patches[1]={{patch}};
+ if(mode==13)v->patches[0].resize(65);
+ int called=0;auto result=snapshot_ngs_voices(e,current,&saved,[&]{
+ ++called;if(mode<=1||mode>=4)assert(std::memcmp(patch->volume_matrix,bits,16)==0);
+ if(mode==10){patch->volume_matrix[0][0]=99;throw std::runtime_error("volume failure");}
+ if(mode==11)patch->volume_matrix[1][1]=99;
+ return true;
+ });
+ assert(result.empty()==(mode<=3));assert(called==(mode<=3||mode==10||mode==11?1:0));
+ uint8_t zero[16]{};assert(std::memcmp(patch->volume_matrix,zero,16)==0);
+ assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
+ patch->~Patch();v->~Voice();rack->~Rack();sys->~System();
+ }
+ std::cout<<"NGS production probe: 125 capture/patch-volume/input-buffer/scheduler/output-buffer/all-parameters/metadata/parameters/runtime-history/joint/rollback/refusal and 26 record parsing cases passed\n";
 }
 """.replace('FUNCTION',t[a:b]).replace('PARSER',parser)
 with tempfile.TemporaryDirectory() as d:

@@ -142,7 +142,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 21; // v21: bounded voice input PCM bytes
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 22; // v22: fixed-routing patch volume matrices
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -718,6 +718,10 @@ struct NgsModuleRecord {
     uint32_t parameter_address=0, parameter_size=0;
     std::array<uint8_t,256> parameters{};
 };
+struct NgsPatchRecord {
+    uint32_t address=0, port=0, slot=0, active=0, dest=0, dest_index=0;
+    std::array<uint8_t,16> volume{};
+};
 struct NgsVoiceRecord {
     uint32_t system, rack, voice, state, pending, paused, keyed_off, frames, modules;
     uint32_t playback_count = 0;
@@ -729,13 +733,16 @@ struct NgsVoiceRecord {
     uint32_t scheduler_position = UINT32_MAX; // Unqueued, otherwise zero-based within system.
     uint32_t input_count=0, input_size=0;
     std::array<uint8_t,8192> input_bytes{};
+    uint32_t patch_count=0;
+    std::array<NgsPatchRecord,256> patches{};
 };
 static_assert(sizeof(SceNgsPlayerParams) == 84);
 static_assert(sizeof(SceNgsAT9Params) == 96);
 static_assert(sizeof(ADPCMHistory)*2 == 32);
 static_assert(sizeof(Atrac9DecoderSavedState) == 4096);
 static_assert(sizeof(NgsPlaybackRecord) == 4276);
-static_assert(sizeof(NgsVoiceRecord) == 152452);
+static_assert(sizeof(NgsPatchRecord) == 40);
+static_assert(sizeof(NgsVoiceRecord) == 162696);
 
 static bool valid_ngs_records(const std::vector<NgsVoiceRecord> &records) {
     if (records.size() > 128) return false;
@@ -746,6 +753,17 @@ static bool valid_ngs_records(const std::vector<NgsVoiceRecord> &records) {
             || r.state > uint32_t(ngs::VOICE_STATE_UNLOADING)
             || r.pending > 1 || r.paused > 1 || r.keyed_off > 1 || r.modules > 256
             || r.playback_count > r.playback.size()) return false;
+        if (r.patch_count>r.patches.size()) return false;
+        std::array<uint32_t,4> slots{};
+        for (size_t i=0;i<r.patch_count;++i) {
+            const auto &p=r.patches[i];
+            if (p.port>=slots.size() || p.slot>=64 || p.slot!=slots[p.port]++ || p.active>1) return false;
+            if (p.active) {
+                if (!p.address || !p.dest || p.dest_index!=0) return false;
+                const auto dest=std::find_if(records.begin(),records.end(),[&](const auto &v){return v.voice==p.dest;});
+                if (dest==records.end() || dest->system!=r.system || dest->input_count!=1) return false;
+            } else if (p.dest || p.dest_index) return false;
+        }
         if (r.input_count>1 || r.input_size>r.input_bytes.size() || r.input_size%8
             || (r.input_count==0)!=(r.input_size==0)) return false;
         if (r.scheduler_position!=UINT32_MAX
@@ -983,6 +1001,33 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
             ++queued_voices;
         }
     }
+    // Snapshot every routing slot, including null and inactive entries. Restore
+    // volumes only when routing identities and active membership are unchanged.
+    std::set<uint32_t> patch_addresses;
+    for (size_t i=0;i<targets.size();++i) {
+        auto &record=captured[i];const auto &ports=targets[i]->patches;
+        if (ports.size()!=4) return "Unsupported NGS patch ports";
+        for (size_t port=0;port<ports.size();++port) {
+            if (ports[port].size()>64) return "Too many NGS patch slots";
+            for (size_t slot=0;slot<ports[port].size();++slot) {
+                auto &entry=record.patches[record.patch_count++];
+                entry.port=static_cast<uint32_t>(port);entry.slot=static_cast<uint32_t>(slot);
+                auto *patch=ports[port][slot].get(mem);
+                if (!patch) continue;
+                entry.address=checked_span(patch,sizeof(*patch));
+                if (!entry.address || !patch_addresses.insert(entry.address).second) return "Invalid NGS patch storage";
+                for (const auto &[address,size]:host_objects)
+                    if (uint64_t(entry.address)<uint64_t(address)+size && uint64_t(address)<uint64_t(entry.address)+sizeof(*patch))
+                        return "NGS patch overlaps host object";
+                host_objects.emplace_back(entry.address,sizeof(*patch));
+                if (patch->output_sub_index==-1) continue;
+                if (patch->output_index!=static_cast<int32_t>(port) || patch->output_sub_index!=static_cast<int32_t>(slot)
+                    || patch->source.address()!=record.voice || patch->dest_index!=0) return "Invalid NGS patch route";
+                entry.active=1;entry.dest=patch->dest.address();entry.dest_index=0;
+                std::memcpy(entry.volume.data(),patch->volume_matrix,entry.volume.size());
+            }
+        }
+    }
     // Validate every range against every host object and parameter block before
     // reading parameters. Never serialize or later overwrite placement-new C++ data.
     std::vector<std::pair<uint32_t,size_t>> parameter_ranges;
@@ -1027,6 +1072,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     size_t effect_blocks=0,effect_bytes=0,changed_effect_blocks=0;
     size_t output_buffers=0,output_bytes=0,changed_output_buffers=0;
     size_t input_buffers=0,input_bytes=0,changed_input_buffers=0;
+    size_t patch_volumes=0,changed_patch_volumes=0;
     std::vector<std::unique_lock<std::mutex>> codec_locks;
     SnapshotValueProbe transaction;
     for (size_t i=0;i<captured.size();++i) {
@@ -1034,6 +1080,18 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
         if (before.system!=after.system || before.rack!=after.rack || before.voice!=after.voice || before.modules!=after.modules)
             return "NGS voice layout changed since saving";
         auto &voice=*targets[i];
+        if (before.patch_count!=after.patch_count) return "NGS patch layout changed since saving";
+        for (size_t j=0;j<after.patch_count;++j) {
+            const auto &a=after.patches[j];const auto &b=before.patches[j];
+            if (a.address!=b.address || a.port!=b.port || a.slot!=b.slot || a.active!=b.active
+                || a.dest!=b.dest || a.dest_index!=b.dest_index) return "NGS patch routing changed since saving";
+            if (!a.active) continue;
+            auto *patch=voice.patches[a.port][a.slot].get(mem);
+            for (size_t row=0;row<2;++row) for (size_t col=0;col<2;++col)
+                transaction.stage_object_bytes(patch->volume_matrix[row][col],a.volume.data()+(row*2+col)*sizeof(float));
+            ++patch_volumes;if (a.volume!=b.volume) ++changed_patch_volumes;
+        }
+
         if (before.input_count!=after.input_count || before.input_size!=after.input_size)
             return "NGS input buffer layout changed since saving";
         if (after.input_count) {
@@ -1187,6 +1245,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     LOG_INFO("Savestate NGS metadata probe: {} modules, {} changed modules; saved bypass and guest callback registrations MATCH; original registrations restored; no callbacks invoked.",metadata_modules,changed_metadata_modules);
     LOG_INFO("Savestate NGS non-playback parameter probe: {} blocks, {} bytes, {} changed blocks; saved bytes MATCH; original bytes restored; no effects processing executed.",effect_blocks,effect_bytes,changed_effect_blocks);
     LOG_INFO("Savestate NGS scheduler probe: {} systems, {} saved queued voices, {} current queued voices, {} changed queues; saved membership/order MATCH; original queues and storage restored; no scheduling executed.",emuenv.ngs.systems.size(),saved_queued,queued_voices,changed_schedulers);
+    LOG_INFO("Savestate NGS patch volume probe: {} active patches, {} changed matrices; saved volume bits MATCH; original matrices restored; fixed routes only, no mixing executed.",patch_volumes,changed_patch_volumes);
     LOG_INFO("Savestate NGS input buffer probe: {} buffers, {} bytes, {} changed buffers; saved PCM bytes MATCH; original bytes restored in place; no mixing executed.",input_buffers,input_bytes,changed_input_buffers);
     LOG_INFO("Savestate NGS output buffer probe: {} buffers, {} bytes, {} changed buffers; saved PCM bytes MATCH; original bytes restored in place; no output submitted.",output_buffers,output_bytes,changed_output_buffers);
     size_t saved_pending_bytes=0;
@@ -1971,7 +2030,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU/sync/NGS-input-buffer/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU/sync/NGS-patch-volume/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;

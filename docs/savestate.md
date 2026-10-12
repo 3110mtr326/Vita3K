@@ -4,7 +4,43 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Voice input PCM checkpoint (latest change, format v21)
+## Fixed-route patch volume checkpoint (latest change, format v22)
+
+Capture records all routing slots (including null/inactive), at most four ports
+with 64 slots each per voice. Records hold guest patch identity, port/slot,
+active membership, destination/input and 16 volume-matrix bytes. Host pointers
+are not serialized. Patch storage must be ordinary accessible guest memory,
+unique and non-overlapping with validated host objects or parameters. Active
+source/port/slot must match ownership; destination must be a known voice in the
+same system with input zero present. Other input indices remain unsupported.
+Inactive patch stale routing/volume fields are not read or restored.
+
+Load refuses any difference in slot counts, identities, active membership or
+routes before applying any state. With matching routes, each active 2x2 volume
+matrix joins the existing reversible transaction using exact float object bytes
+(including signed zero/NaN payloads). Original volume bits are restored even on
+nested failure. No route mutation, scheduling, mixing or audio submission occurs.
+The record is 162696 bytes, maximum 128 voices; a fresh v22 save is required.
+UI marker NGS-patch-volume; logs report active patches and changed matrices.
+
+Host validation passed: actual savestate.cpp syntax, 125 production adapter
+cases plus 26 parser cases, PCM/accessor rollback, session-layout and Load tests.
+New cases include differing matrix bits, NaN/signed zero, null/inactive slots,
+changed identities/routes/counts, protected/duplicate storage, slot limits and
+nested failure/mutation rollback. Android build and device test remain pending.
+This remains diagnostic: retained rewind and changed routing restoration are
+unsupported. The earlier successful v21 input-buffer device evidence is below.
+
+## Voice input PCM checkpoint (previous checkpoint, format v21)
+
+Device result 2026-10-12 23:06 (PCSG00219): Save completed and two Load
+probes passed. Both checked 34 input buffers / 139264 bytes, with one changed
+buffer; saved PCM bytes and in-place rollback MATCH. One 2048-byte output
+buffer also differed and passed. Joint files/RAM/CPU/sync/NGS/context rollback
+and separate live GPU saved upload/rollback all MATCH on both probes. Scheduler
+had two saved/current queued voices and zero changed queues. User reports normal
+operation. This confirms changed input-buffer diagnostic coverage, not retained
+rewind or audio processing of the restored state. Detailed log read 2026-10-12.
 
 Captures VoiceInputManager input PCM bytes, currently zero or one input per
 voice, bounded to 8192 bytes (1024 stereo float frames). Nonempty live storage
