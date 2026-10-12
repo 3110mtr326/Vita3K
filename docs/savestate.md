@@ -4,7 +4,41 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Scheduler membership/order checkpoint (latest change, format v20)
+## Voice input PCM checkpoint (latest change, format v21)
+
+Captures VoiceInputManager input PCM bytes, currently zero or one input per
+voice, bounded to 8192 bytes (1024 stereo float frames). Nonempty live storage
+must match system granularity * 8. Unsupported input counts, sizes, granularity
+and saved/current layout differences are rejected before mutation. Reader checks
+count/size consistency, 8-byte alignment and the bound. Voice record size is
+152452 bytes, still capped at 128 records. A fresh v21 save is required.
+
+Input bytes join the existing joint file/RAM/CPU/sync/NGS/context transaction.
+Each byte is staged in place, preserving vector storage and any mixer product
+pointer into that storage. Nested failure or mutation restores original bytes.
+No mixing, callbacks, guest instructions or audio submission is executed. Logs
+report input buffers, bytes and differing buffers; UI marker NGS-input-buffer.
+Scheduler and earlier checkpoints remain included. Full retained rewind is still
+unsupported, and GPU image probing remains separate from the joint transaction.
+Audio routes, backend queues and other uncovered state remain future work.
+
+Validation: actual savestate.cpp syntax; 111 production adapter cases and 26
+parser cases; existing PCM/accessor, session layout and Load diagnostic tests.
+New cases cover changed input bytes jointly with voice scalars, 8192-byte maximum,
+invalid count/size, saved/live layout differences, nested exception/mutation and
+unchanged allocation/capacity after rollback. Android build and device testing
+are outstanding. Previous v20 hardware evidence is recorded below.
+
+## Scheduler membership/order checkpoint (previous checkpoint, format v20)
+
+Device result 2026-10-12 21:32/21:33 (PCSG00219): Save completed;
+34 voices, one system, two saved/current queued voices, zero changed queues.
+Scheduler membership/order and original storage rollback MATCH. This run does
+not exercise changed scheduler order/membership. One 2048-byte output buffer
+DID differ and its saved bytes and in-place rollback both MATCH. Joint
+files/RAM/CPU/sync/NGS/context and the separate live GPU probe all MATCH.
+User reports normal operation after the test. Full retained rewind remains
+unsupported. Detailed evidence: Downloads/vita3k_log.txt, read 2026-10-12.
 
 Previous v19 phone screenshot 2026-10-09 17:22 shows NGS-output-buffer and
 live-gpu-roundtrip-passed; user reports normal operation. Its detailed log was

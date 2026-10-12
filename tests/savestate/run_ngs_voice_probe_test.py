@@ -57,7 +57,7 @@ struct Voice;
 struct ParamPtr{uint32_t address=16384;void*get(Mem&m)const{return address?m.memory.get()+address:nullptr;}};
 struct ModuleData{GuestAddress callback,user_data;bool is_bypassed=false;uint8_t flags=0;struct{ParamPtr data;uint32_t size=84;}info;std::unique_ptr<ModuleRuntimeState>runtime_state{new PlayerRuntimeState};std::unique_ptr<ModuleLogicalState>logical_state{new PlayerLogicalState};Voice*parent=nullptr;uint32_t index=0;std::vector<uint8_t>guest_state_data=std::vector<uint8_t>(24);};
 struct Module{uint32_t id=0x5CE6;uint32_t module_id()const{return id;}uint32_t get_guest_state_size()const{return 24;}uint32_t get_buffer_parameter_size()const{return id==0?0:(id==0x5CE6?84:96);}};
-struct Voice {GuestAddress finished_callback,finished_callback_user_data;Rack*rack=nullptr;std::unique_ptr<std::mutex>voice_mutex{new std::mutex};std::vector<ModuleData>datas=std::vector<ModuleData>(1);
+struct Voice {struct{std::vector<std::vector<uint8_t>> inputs;}inputs;GuestAddress finished_callback,finished_callback_user_data;Rack*rack=nullptr;std::unique_ptr<std::mutex>voice_mutex{new std::mutex};std::vector<ModuleData>datas=std::vector<ModuleData>(1);
  VoiceState state=VOICE_STATE_ACTIVE;bool is_pending=false,is_paused=false,is_keyed_off=false;uint32_t frame_count=100;};
 struct VoicePtr{Voice*v;Voice*get(Mem&)const{return v;}};
 struct System;
@@ -315,7 +315,36 @@ int main(){
  assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
  v1->~Voice();v2->~Voice();rack->~Rack();rack2->~Rack();sys->~System();sys2->~System();
  }
- std::cout<<"NGS production probe: 101 capture/scheduler/output-buffer/all-parameters/metadata/parameters/runtime-history/joint/rollback/refusal and 26 record parsing cases passed\n";
+
+ for(int mode=0;mode<10;++mode){
+ EmuEnvState e;Renderer r;e.renderer=&r;
+ auto*sys=new(e.mem.memory.get()+4096)ngs::System;
+ auto*rack=new(e.mem.memory.get()+8192)ngs::Rack;
+ auto*v=new(e.mem.memory.get()+12288)ngs::Voice;
+ v->datas.clear();v->rack=rack;rack->system=sys;rack->voices={{v}};sys->racks={rack};e.ngs.systems={sys};
+ if(mode==1)sys->granularity=1024;
+ v->inputs.inputs={std::vector<uint8_t>(sys->granularity*8,17)};
+ std::vector<NgsVoiceRecord> saved,current;assert(snapshot_ngs_voices(e,saved).empty());
+ saved[0].input_bytes[0]=255;saved[0].input_bytes[saved[0].input_size-1]=93;saved[0].frames=42;
+ if(mode==2)saved[0].input_count=2;
+ if(mode==3)saved[0].input_size=8193;
+ if(mode==4)saved[0].input_size=40;
+ if(mode==5){saved[0].input_count=0;saved[0].input_size=0;}
+ if(mode==6)v->inputs.inputs.push_back(std::vector<uint8_t>(48));
+ if(mode==7)v->inputs.inputs[0].resize(40);
+ auto &input=v->inputs.inputs[0];const auto original=input;auto*address=input.data();auto capacity=input.capacity();int called=0;
+ auto result=snapshot_ngs_voices(e,current,&saved,[&]{
+ ++called;assert(input.data()==address && input.front()==255 && input.back()==93 && v->frame_count==42);
+ if(mode==8){input[0]=0;throw std::runtime_error("input exception");}
+ if(mode==9)input.back()=0;
+ return true;
+ });
+ assert(result.empty()==(mode<=1));assert(called==(mode<=1||mode>=8?1:0));
+ assert(input==original && input.data()==address && input.capacity()==capacity && v->frame_count==100);
+ assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
+ v->~Voice();rack->~Rack();sys->~System();
+ }
+ std::cout<<"NGS production probe: 111 capture/input-buffer/scheduler/output-buffer/all-parameters/metadata/parameters/runtime-history/joint/rollback/refusal and 26 record parsing cases passed\n";
 }
 """.replace('FUNCTION',t[a:b]).replace('PARSER',parser)
 with tempfile.TemporaryDirectory() as d:
