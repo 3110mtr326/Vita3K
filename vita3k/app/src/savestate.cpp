@@ -142,7 +142,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 24; // v24: bounded playback scratch bytes (NPC4)
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 25; // v25: symbolic voice product references
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -722,6 +722,9 @@ struct NgsPatchRecord {
     uint32_t address=0, port=0, slot=0, active=0, dest=0, dest_index=0;
     std::array<uint8_t,16> volume{};
 };
+struct NgsProductRecord {
+    uint32_t kind=0,index=0,offset=0; // null, input, scratch, decoded PCM; byte offset
+};
 struct NgsVoiceRecord {
     uint32_t system, rack, voice, state, pending, paused, keyed_off, frames, modules;
     uint32_t playback_count = 0;
@@ -735,6 +738,7 @@ struct NgsVoiceRecord {
     std::array<uint8_t,8192> input_bytes{};
     uint32_t patch_count=0;
     std::array<NgsPatchRecord,256> patches{};
+    std::array<NgsProductRecord,4> products{};
 };
 static_assert(sizeof(SceNgsPlayerParams) == 84);
 static_assert(sizeof(SceNgsAT9Params) == 96);
@@ -742,7 +746,8 @@ static_assert(sizeof(ADPCMHistory)*2 == 32);
 static_assert(sizeof(Atrac9DecoderSavedState) == 4096);
 static_assert(sizeof(NgsPlaybackRecord) == 4276);
 static_assert(sizeof(NgsPatchRecord) == 40);
-static_assert(sizeof(NgsVoiceRecord) == 162696);
+static_assert(sizeof(NgsProductRecord) == 12);
+static_assert(sizeof(NgsVoiceRecord) == 162744);
 
 static bool valid_ngs_records(const std::vector<NgsVoiceRecord> &records) {
     if (records.size() > 128) return false;
@@ -753,6 +758,12 @@ static bool valid_ngs_records(const std::vector<NgsVoiceRecord> &records) {
             || r.state > uint32_t(ngs::VOICE_STATE_UNLOADING)
             || r.pending > 1 || r.paused > 1 || r.keyed_off > 1 || r.modules > 256
             || r.playback_count > r.playback.size()) return false;
+        for (const auto &p:r.products) {
+            if (p.kind>3 || p.offset%4 || (!p.kind && (p.index || p.offset))) return false;
+            if (p.kind==1 && (p.index>=r.input_count || p.offset>=r.input_size)) return false;
+            if (p.kind>=2 && (p.index>=r.modules
+                || (r.module_metadata[p.index].module_id!=0x5CE6 && r.module_metadata[p.index].module_id!=0x5CAA))) return false;
+        }
         if (r.patch_count>r.patches.size()) return false;
         std::array<uint32_t,4> slots{};
         for (size_t i=0;i<r.patch_count;++i) {
@@ -1007,6 +1018,43 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
             ++queued_voices;
         }
     }
+    // Never serialize host addresses. Recognize only known live byte ranges;
+    // unknown/stale pointers are refused without dereferencing their targets.
+    const auto product_span=[](ngs::Voice &voice,uint32_t kind,uint32_t index,uint8_t *&base,size_t &size) {
+        base=nullptr;size=0;
+        if (kind==1) {
+            if (index>=voice.inputs.inputs.size()) return false;
+            auto &buffer=voice.inputs.inputs[index];base=buffer.data();size=buffer.size();return true;
+        }
+        if (index>=voice.datas.size() || index>=voice.rack->modules.size()) return false;
+        const auto id=voice.rack->modules[index]->module_id();
+        if (id!=0x5CE6 && id!=0x5CAA) return false;
+        auto &data=voice.datas[index];
+        if (kind==2) {base=data.scratch_data.data();size=data.scratch_data.size();return true;}
+        if (kind!=3 || !data.logical_state) return false;
+        auto &pcm=id==0x5CE6 ? static_cast<ngs::PlayerLogicalState*>(data.logical_state.get())->decoded_pcm
+            : static_cast<ngs::Atrac9LogicalState*>(data.logical_state.get())->decoded_pcm;
+        base=reinterpret_cast<uint8_t*>(pcm.samples.data());size=pcm.samples.size()*sizeof(float);return true;
+    };
+    const auto describe_product=[&](ngs::Voice &voice,const uint8_t *pointer,NgsProductRecord &out) {
+        out={};if (!pointer) return true;
+        const auto address=reinterpret_cast<uintptr_t>(pointer);
+        for (uint32_t kind=1;kind<=3;++kind) {
+            const auto count=kind==1 ? voice.inputs.inputs.size() : voice.datas.size();
+            for (uint32_t index=0;index<count;++index) {
+                uint8_t *base=nullptr;size_t size=0;
+                if (!product_span(voice,kind,index,base,size) || !size) continue;
+                const auto begin=reinterpret_cast<uintptr_t>(base);
+                if (address>=begin && address-begin<size && (address-begin)%4==0) {
+                    out={kind,index,static_cast<uint32_t>(address-begin)};return true;
+                }
+            }
+        }
+        return false;
+    };
+    for (size_t i=0;i<targets.size();++i) for (size_t j=0;j<captured[i].products.size();++j)
+        if (!describe_product(*targets[i],targets[i]->products[j].data,captured[i].products[j]))
+            return "Unknown NGS product buffer reference";
     // Snapshot every routing slot, including null and inactive entries. Restore
     // routes only when the same slot/storage identities remain available.
     std::set<uint32_t> patch_addresses;
@@ -1258,6 +1306,32 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
         if (queue!=system->voice_scheduler.queue) ++changed_schedulers;
         transaction.stage_vector_bytes(system->voice_scheduler.queue,queue);
     }
+    // Access fields are staged LAST: SnapshotValueProbe applies and undoes in
+    // insertion order, so buffer vectors are installed/restored before pointers
+    // are resolved. No raw host pointer from the file is ever accepted.
+    size_t product_refs=0,changed_products=0;
+    for (size_t i=0;i<targets.size();++i) for (size_t j=0;j<(*saved)[i].products.size();++j) {
+        auto *voice=targets[i];const auto expected=(*saved)[i].products[j];
+        if (expected.kind>=2) {
+            if (!saved_pcm) return "Missing saved NGS product buffer payload";
+            const auto found=std::find_if(saved_pcm->begin(),saved_pcm->end(),[&](const auto &r){
+                return r.voice==(*saved)[i].voice && r.index==expected.index;
+            });
+            if (found==saved_pcm->end()) return "Missing saved NGS product module";
+            const auto size=expected.kind==2 ? found->scratch.size() : found->samples.size()*sizeof(float);
+            if (expected.offset>=size) return "Invalid saved NGS product offset";
+        }
+        if (expected.kind) ++product_refs;
+        if (std::memcmp(&expected,&captured[i].products[j],sizeof(expected))) ++changed_products;
+        transaction.stage_access_bytes<NgsProductRecord>(&voice->products[j].data,&expected,
+            [&,voice,j](NgsProductRecord &value){return describe_product(*voice,voice->products[j].data,value);},
+            [&,voice,j](const NgsProductRecord &value){
+                if (!value.kind) {voice->products[j].data=nullptr;return true;}
+                uint8_t *base=nullptr;size_t size=0;
+                if (!product_span(*voice,value.kind,value.index,base,size) || value.offset>=size || value.offset%4) return false;
+                voice->products[j].data=base+value.offset;return true;
+            });
+    }
     const auto result=transaction.probe_with([&] { return !during || during(); });
     if (result==SnapshotValueProbe::Result::RollbackFailed) {
         emuenv.kernel.snapshot_restore_failed=true;
@@ -1271,6 +1345,7 @@ static std::string snapshot_ngs_voices(EmuEnvState &emuenv,
     LOG_INFO("Savestate NGS metadata probe: {} modules, {} changed modules; saved bypass and guest callback registrations MATCH; original registrations restored; no callbacks invoked.",metadata_modules,changed_metadata_modules);
     LOG_INFO("Savestate NGS non-playback parameter probe: {} blocks, {} bytes, {} changed blocks; saved bytes MATCH; original bytes restored; no effects processing executed.",effect_blocks,effect_bytes,changed_effect_blocks);
     LOG_INFO("Savestate NGS scheduler probe: {} systems, {} saved queued voices, {} current queued voices, {} changed queues; saved membership/order MATCH; original queues and storage restored; no scheduling executed.",emuenv.ngs.systems.size(),saved_queued,queued_voices,changed_schedulers);
+    LOG_INFO("Savestate NGS product reference probe: {} nonnull references, {} changed references; saved buffer references MATCH; original references restored after buffers; no audio executed.",product_refs,changed_products);
     LOG_INFO("Savestate NGS scratch probe: {} nonempty buffers, {} bytes, {} changed buffers; saved scratch bytes MATCH; original bytes restored in place; no decoding executed.",scratch_buffers,scratch_bytes,changed_scratch_buffers);
     LOG_INFO("Savestate NGS patch routing probe: {} allocated patches, {} changed routes; saved routing/activation MATCH; original fields restored; same storage only, no scheduling or mixing executed.",patch_routes,changed_patch_routes);
     LOG_INFO("Savestate NGS patch volume probe: {} active patches, {} changed matrices; saved volume bits MATCH; original matrices restored; no mixing executed.",patch_volumes,changed_patch_volumes);
@@ -2058,7 +2133,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
         : result == renderer::SnapshotImageValidation::Unsupported ? "unsupported-backend" : "not-ready";
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU/sync/NGS-scratch/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU/sync/NGS-products/context roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Context apply/rollback tested when reason 0. Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return result == renderer::SnapshotImageValidation::InvalidData
         ? SaveStateResult::ErrorMismatch : SaveStateResult::ErrorUnsupportedHostState;

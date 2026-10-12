@@ -59,7 +59,7 @@ struct ModuleData{std::vector<uint8_t>scratch_data;GuestAddress callback,user_da
 struct Module{uint32_t id=0x5CE6;uint32_t module_id()const{return id;}uint32_t get_guest_state_size()const{return 24;}uint32_t get_buffer_parameter_size()const{return id==0?0:(id==0x5CE6?84:96);}};
 struct Patch{int32_t output_index=0,output_sub_index=0,dest_index=0;GuestAddress dest,source;float volume_matrix[2][2]{};};
 struct PatchPtr{Patch*v=nullptr;Patch*get(Mem&)const{return v;}};
-struct Voice {std::array<std::vector<PatchPtr>,4>patches;struct{std::vector<std::vector<uint8_t>> inputs;}inputs;GuestAddress finished_callback,finished_callback_user_data;Rack*rack=nullptr;std::unique_ptr<std::mutex>voice_mutex{new std::mutex};std::vector<ModuleData>datas=std::vector<ModuleData>(1);
+struct Voice {struct{uint8_t*data=nullptr;}products[4];std::array<std::vector<PatchPtr>,4>patches;struct{std::vector<std::vector<uint8_t>> inputs;}inputs;GuestAddress finished_callback,finished_callback_user_data;Rack*rack=nullptr;std::unique_ptr<std::mutex>voice_mutex{new std::mutex};std::vector<ModuleData>datas=std::vector<ModuleData>(1);
  VoiceState state=VOICE_STATE_ACTIVE;bool is_pending=false,is_paused=false,is_keyed_off=false;uint32_t frame_count=100;};
 struct VoicePtr{Voice*v;Voice*get(Mem&)const{return v;}};
 struct System;
@@ -444,7 +444,45 @@ int main(){
  assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
  v->~Voice();rack->~Rack();sys->~System();
  }
- std::cout<<"NGS production probe: 144 capture/scratch/patch-routing/patch-volume/input-buffer/scheduler/output-buffer/all-parameters/metadata/parameters/runtime-history/joint/rollback/refusal and 26 record parsing cases passed\n";
+
+ // Symbolic products must resolve AFTER vector swaps and return to original
+ // native addresses after rollback, including aliases and callback failures.
+ for(int mode=0;mode<12;++mode){
+ EmuEnvState e;Renderer r;e.renderer=&r;
+ auto*sys=new(e.mem.memory.get()+4096)ngs::System;auto*rack=new(e.mem.memory.get()+8192)ngs::Rack;
+ auto*v=new(e.mem.memory.get()+12288)ngs::Voice;
+ v->rack=rack;rack->system=sys;rack->voices={{v}};sys->racks={rack};e.ngs.systems={sys};
+ v->datas[0].parent=v;rack->modules.push_back(std::make_unique<ngs::Module>());
+ auto &scratch=v->datas[0].scratch_data;scratch.assign(48,17);v->inputs.inputs={std::vector<uint8_t>(48)};
+ auto &pcm=static_cast<ngs::PlayerLogicalState*>(v->datas[0].logical_state.get())->decoded_pcm;
+ v->products[0].data=mode==0?v->inputs.inputs[0].data()+4:mode==1?scratch.data()+4:reinterpret_cast<uint8_t*>(pcm.samples.data())+4;
+ if(mode==3)v->products[0].data=nullptr;
+ if(mode==11)v->products[1].data=v->products[0].data;
+ std::vector<NgsVoiceRecord> saved,current;std::vector<NgsPcmRecord> ps,pc;
+ assert(snapshot_ngs_voices(e,saved,nullptr,{},false,&ps).empty());
+ assert(saved[0].products[0].kind==uint32_t(mode==0?1:mode==1?2:mode==3?0:3));
+ ps[0].samples={9,8,7,6,5,4};ps[0].offset=0;
+ v->products[0].data=mode==10?nullptr:reinterpret_cast<uint8_t*>(pcm.samples.data())+8;
+ if(mode==4)saved[0].products[0].kind=4;
+ if(mode==5)saved[0].products[0].index=1;
+ if(mode==6)saved[0].products[0].offset=24;
+ if(mode==7)v->products[0].data=reinterpret_cast<uint8_t*>(uintptr_t(1));
+ auto *original=v->products[0].data;auto *alias=v->products[1].data;auto *storage=pcm.samples.data();int called=0;
+ auto result=snapshot_ngs_voices(e,current,&saved,[&]{
+ ++called;assert(pcm.samples.data()!=storage && pcm.samples==ps[0].samples);
+ auto *expected=mode==0?v->inputs.inputs[0].data()+4:mode==1?scratch.data()+4:mode==3?nullptr:reinterpret_cast<uint8_t*>(pcm.samples.data())+4;
+ assert(v->products[0].data==expected);
+ if(mode==11)assert(v->products[1].data==expected);
+ if(mode==8){v->products[0].data=nullptr;throw std::runtime_error("product failure");}
+ if(mode==9)pcm.samples.resize(100); // pointer verification and vector mismatch
+ return true;
+ },false,&pc,&ps);
+ assert(result.empty()==(mode<=3||mode>=10));assert(called==(mode<=3||mode>=8?1:0));
+ assert(v->products[0].data==original && v->products[1].data==alias && pcm.samples.data()==storage);
+ assert(!e.kernel.snapshot_restore_failed && !r.render_abort);
+ v->~Voice();rack->~Rack();sys->~System();
+ }
+ std::cout<<"NGS production probe: 156 capture/products/scratch/patch-routing/patch-volume/input-buffer/scheduler/output-buffer/all-parameters/metadata/parameters/runtime-history/joint/rollback/refusal and 26 record parsing cases passed\n";
 }
 """.replace('FUNCTION',t[a:b]).replace('PARSER',parser)
 with tempfile.TemporaryDirectory() as d:

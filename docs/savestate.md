@@ -4,7 +4,44 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Playback scratch checkpoint (latest change, format v24)
+## Symbolic voice products checkpoint (latest change, format v25)
+
+Stores the four VoiceProduct data references as kind/index/byte-offset triples:
+null, voice input, playback scratch, or decoded PCM. Native host pointers are
+never serialized. Capture compares pointer values with validated buffer ranges,
+without dereferencing an unknown target; unknown, out-of-range or unaligned
+references are refused. Only Player/ATRAC9 playback module references are allowed.
+Parser validates kinds, indices, alignment and null representation. Saved payload
+bounds are checked before transaction application. Record size is 162744 bytes;
+NPC4 remains unchanged, but outer format is v25 and needs a fresh save.
+
+Product accessors are staged last. SnapshotValueProbe applies AND undoes fields
+in insertion order, so PCM vector swaps complete before symbolic references are
+resolved in either direction. This is an explicit ordering requirement: changing
+transaction undo order would require changing this adapter. References therefore
+point into the currently installed saved buffers during the nested check, then
+return to original native addresses after buffer rollback. Null pointers and
+multiple products aliasing one buffer are supported. No audio processing occurs.
+Logs show nonnull and changed references; UI marker NGS-products.
+
+Host checks passed: actual savestate.cpp syntax, 156 production adapter cases,
+26 parser cases, existing PCM/scratch codec, session-layout and Load tests. New
+cases cover each buffer kind, null/nonnull transitions, changed PCM allocation,
+aliasing, invalid kind/index/offset, unknown live pointers, nested exceptions and
+buffer mutation, including exact original pointer restoration. Android build and
+phone behavior are pending. Full retained rewind and unsupported host state
+remain unfinished; graphics images still use a separate diagnostic probe.
+
+## Playback scratch checkpoint (previous checkpoint, format v24)
+
+Device result 2026-10-13 01:27 (PCSG00219): Save completed; Load passed.
+Scratch: zero nonempty buffers, zero bytes, zero changed buffers. This run
+checks the empty scratch path only, not restoration of nonempty scratch data.
+Routing: 33 allocated patches, zero changed routes, saved/rollback MATCH.
+Input: 34 buffers / 139264 bytes, one changed; output: one / 2048 bytes,
+changed; saved bytes and rollback MATCH. Joint files/RAM/CPU/sync/NGS/context
+and separate live GPU upload/rollback all MATCH. User reports normal operation.
+Full retained rewind remains unsupported. Detailed log read 2026-10-13.
 
 Player/ATRAC9 scratch_data provides padded stereo float output when decoded PCM
 has fewer than granularity frames. NPC4 now serializes this byte vector after
