@@ -35,6 +35,7 @@ RAM
 struct Thread{int id;};struct Region{uint32_t addr,saved_size;};
 struct Counts {int sync_objects=1,render_targets=1,deferred_contexts=0,immediate_context=4096;};
 struct Kernel {std::map<int,int> threads{{1,0}};int sets=0;};
+std::string audit_saved_wait_targets(Kernel&,const std::vector<Thread>&){return {};}
 int collect_kernel_object_sets(Kernel &k,bool held){assert(held);return k.sets;}
 std::string compare_object_sets(int a,int b){return a==b?"":"object IDs changed";}
 bool records_match_object_set(int records,const char*,int){return records==0;}

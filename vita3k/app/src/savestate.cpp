@@ -99,6 +99,7 @@
 #include <app/savestate_stream_skip.h>
 #include <app/savestate_cpu_probe.h>
 #include <app/savestate_wait_audit.h>
+#include <app/savestate_wait_targets.h>
 #include <app/savestate_value_probe.h>
 #include <app/savestate_ram_audit.h>
 #include <app/savestate_ram_probe.h>
@@ -143,7 +144,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 25; // v25: symbolic voice product references
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 26; // v26: wait registry membership and active import NID
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -456,7 +457,34 @@ struct ThreadRecord {
     uint64_t start_tick;
     uint64_t last_vblank_waited;
     uint32_t returned_value;
+    uint32_t wait_nid;
+    SnapshotWaitTargets wait_targets;
 };
+
+// Read-only comparison before any temporary CPU/RAM mutation. Membership and
+// import identity alone do not reconstruct host wait stacks or timeout state.
+static std::string audit_saved_wait_targets(KernelState &kernel,const std::vector<ThreadRecord> &records) {
+    size_t changed_targets=0,changed_imports=0;
+    for (const auto &record:records) {
+        const auto it=kernel.threads.find(record.id);
+        if (it==kernel.threads.end() || !it->second) return "Wait audit thread missing";
+        const auto current=collect_snapshot_wait_targets(kernel,it->second);
+        if (!current || !valid_snapshot_wait_targets(record.wait_targets)) return "Invalid or oversized wait registry audit";
+        const uint32_t nid=it->second->status==ThreadStatus::wait
+            ? it->second->active_import_nid.load(std::memory_order_acquire) : 0;
+        changed_targets += *current!=record.wait_targets;
+        changed_imports += nid!=record.wait_nid;
+        if (record.wait_nid || nid || record.wait_targets.count || current->count) {
+            LOG_INFO("Savestate wait target audit: thread {}, saved NID 0x{:08X}, current NID 0x{:08X}, saved targets {}, current targets {}; no wait reconstruction.",record.id,record.wait_nid,nid,record.wait_targets.count,current->count);
+            for (uint32_t i=0;i<record.wait_targets.count;++i)
+                LOG_INFO("Savestate saved wait target: thread {}, kind {}, UID {}",record.id,record.wait_targets.targets[i].kind,record.wait_targets.targets[i].uid);
+            for (uint32_t i=0;i<current->count;++i)
+                LOG_INFO("Savestate current wait target: thread {}, kind {}, UID {}",record.id,current->targets[i].kind,current->targets[i].uid);
+        }
+    }
+    LOG_INFO("Savestate wait target summary: {} threads, {} changed target sets, {} changed import identities; registry membership only, host wait continuation unverified.",records.size(),changed_targets,changed_imports);
+    return {};
+}
 
 // Called only with the snapshot guard's kernel/primitive/thread locks held.
 static std::string probe_saved_cpu_contexts(KernelState &kernel,const std::vector<ThreadRecord> &records,
@@ -1970,6 +1998,14 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             rec.start_tick = thread->start_tick;
             rec.last_vblank_waited = thread->last_vblank_waited;
             rec.returned_value = thread->returned_value;
+            rec.wait_nid = thread->status==ThreadStatus::wait
+                ? thread->active_import_nid.load(std::memory_order_acquire) : 0;
+            const auto wait_targets=collect_snapshot_wait_targets(kernel,thread);
+            if (!wait_targets) {
+                if (out_detail) *out_detail="Wait registry audit is invalid or exceeds 16 targets per thread";
+                return SaveStateResult::ErrorThreadNotSafe;
+            }
+            rec.wait_targets=*wait_targets;
             thread_records.push_back(rec);
         }
 
@@ -2343,6 +2379,8 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             || (status != ThreadStatus::wait && status != ThreadStatus::suspend && status != ThreadStatus::dormant)
             || rec.resume_status > static_cast<uint8_t>(ThreadStatus::wait)
             || rec.in_condvar > 1
+            || !valid_snapshot_wait_targets(rec.wait_targets)
+            || (status != ThreadStatus::wait && rec.wait_nid != 0)
             || (rec.in_condvar && status != ThreadStatus::wait)
             || (status == ThreadStatus::wait && ((rec.ctx.cpsr & 0x20) != 0 || rec.ctx.get_pc() < 4))) {
             if (out_detail)
@@ -2363,6 +2401,8 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 return "Thread count changed since saving";
             for (const auto &rec : thread_records)
                 if (!kernel.threads.count(rec.id)) return "Thread IDs changed since saving";
+            if (const auto wait_error=audit_saved_wait_targets(kernel,thread_records); !wait_error.empty())
+                return wait_error;
             auto mismatch = compare_object_sets(saved_object_sets, collect_kernel_object_sets(kernel, true));
             if (!mismatch.empty()) return mismatch;
             if (!records_match_object_set(sema_records, "semaphores", saved_object_sets)

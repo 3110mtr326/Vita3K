@@ -4,7 +4,39 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Wait continuation audit (latest change, format v25 unchanged)
+## Wait registry audit (latest change, format v26)
+
+Each thread record now carries the active import NID plus up to 16 sorted
+wait-registration pairs (kind and UID) for semaphore, mutex, lightweight mutex,
+event flag, condvar, lightweight condvar, simple event and thread-end waiters.
+Save gathers them under the existing kernel, primitive and thread locks. The
+reader validates the bounded, canonical list before any scene advance. Load
+compares saved/current registration sets and import NIDs before RAM mutation,
+and logs per-thread differences. It does not serialize queue order, timeout
+pointer/data, host stack or cancellation flags, nor reconstruct or signal waits.
+The format is v26; old slots need a fresh save.
+
+Device result 2026-10-13 17:15 predates this format and recorded 12 saved versus
+10 current waits, including transitions for threads 137 and 138. That evidence
+motivated this registry audit but cannot serve as v26 validation. Device test
+is required. Host validation passed: production collector/comparator across all
+8 registry types, NID/UID differences, malformed/canonical/bounds/overflow/null
+cases; savestate.cpp syntax, 15 session mismatch + 2 NGS failure cases, and the
+29 joint GPU Load cases. Retained rewind remains disabled.
+
+## Wait continuation audit (previous checkpoint, format v25)
+
+Device result 2026-10-13 17:15 (PCSG00219): 12 saved waits, 10 current waits,
+two wait/nonwait transitions (threads 137 and 138), five changed wait contexts.
+Threads 135, 136 and 200 remained waiting but had control/FPU differences;
+136 additionally changed GPR r6 (mask 0x0040). Threads 137/138 changed all GPRs
+(0xFFFF), control and FPU; TLS was unchanged for all audited threads.
+This demonstrates that current waits cannot simply be assumed to match saved
+waits. It does not identify their wait targets or prove any continuation safe.
+The joint GPU diagnostic and all domain rollbacks passed. Thread metadata:
+23 threads, one changed field, saved/rollback MATCH. RAM staged 15481636 bytes
+in 296 chunks; batch including nested checks took 916 ms. User reports normal
+operation. Detailed log read 2026-10-13; retained rewind remains unsupported.
 
 Before temporary CPU installation, inspect saved versus live wait status and
 CPU context under the existing kernel/thread guard. Log each thread waiting in
@@ -23,7 +55,8 @@ wait continuation remains unverified. Wire format remains v25.
 Validation passed: savestate.cpp syntax; classifier tests for all 16 GPR mask
 bits, four wait-status combinations, control/TLS, signed zero and NaN payloads,
 nonwait exclusion and input immutability; 14 production CPU/metadata cases;
-29 production joint GPU Load cases. Android build/device audit pending.
+29 production joint GPU Load cases. Android build/device audit subsequently
+confirmed by the result above.
 
 ## Thread metadata checkpoint (previous checkpoint, format v25 unchanged)
 
