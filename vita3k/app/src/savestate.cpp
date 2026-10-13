@@ -100,6 +100,7 @@
 #include <app/savestate_cpu_probe.h>
 #include <app/savestate_wait_audit.h>
 #include <app/savestate_wait_targets.h>
+#include <app/savestate_semaphore_wait.h>
 #include <app/savestate_value_probe.h>
 #include <app/savestate_ram_audit.h>
 #include <app/savestate_ram_probe.h>
@@ -144,7 +145,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 26; // v26: wait registry membership and active import NID
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 27; // v27: semaphore wait requirements and queue position
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -459,6 +460,7 @@ struct ThreadRecord {
     uint32_t returned_value;
     uint32_t wait_nid;
     SnapshotWaitTargets wait_targets;
+    SnapshotSemaphoreWait semaphore_wait;
 };
 
 // Read-only comparison before any temporary CPU/RAM mutation. Membership and
@@ -483,6 +485,34 @@ static std::string audit_saved_wait_targets(KernelState &kernel,const std::vecto
         }
     }
     LOG_INFO("Savestate wait target summary: {} threads, {} changed target sets, {} changed import identities; registry membership only, host wait continuation unverified.",records.size(),changed_targets,changed_imports);
+    return {};
+}
+
+// Called only with the snapshot guard's kernel/primitive/thread locks held.
+static std::string audit_saved_semaphore_waits(KernelState &kernel, const std::vector<ThreadRecord> &records) {
+    size_t saved_count = 0, current_count = 0, changed = 0, timed_saved = 0, timed_current = 0;
+    for (const auto &record : records) {
+        const auto it = kernel.threads.find(record.id);
+        if (it == kernel.threads.end() || !it->second) return "Semaphore audit thread missing";
+        const auto targets = collect_snapshot_wait_targets(kernel, it->second);
+        if (!targets) return "Invalid current semaphore registry";
+        const auto current = collect_snapshot_semaphore_wait(kernel, it->second, *targets);
+        const auto &saved = record.semaphore_wait;
+        if (!current || !valid_snapshot_semaphore_wait(saved, record.wait_targets))
+            return "Invalid semaphore wait description";
+        saved_count += saved.uid != 0;
+        current_count += current->uid != 0;
+        changed += saved != *current;
+        timed_saved += saved.timeout_present;
+        timed_current += current->timeout_present;
+        if (saved.uid || current->uid) {
+            LOG_INFO("Savestate semaphore wait: thread {}; saved UID {}, need {}, priority {}, position {}/{}, attr 0x{:X}, timed {}, entry budget {} us; current UID {}, need {}, priority {}, position {}/{}, attr 0x{:X}, timed {}, entry budget {} us. Positions zero-based; budgets are not remaining time.",
+                record.id, saved.uid, saved.signal, saved.priority, saved.position, saved.queue_size, saved.attr, saved.timeout_present, saved.timeout_us,
+                current->uid, current->signal, current->priority, current->position, current->queue_size, current->attr, current->timeout_present, current->timeout_us);
+        }
+    }
+    LOG_INFO("Savestate semaphore wait summary: {} saved, {} current, {} changed descriptions, {} saved timed, {} current timed; no queue replacement or wait replay; host continuation unverified.",
+        saved_count, current_count, changed, timed_saved, timed_current);
     return {};
 }
 
@@ -2006,6 +2036,12 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 return SaveStateResult::ErrorThreadNotSafe;
             }
             rec.wait_targets=*wait_targets;
+            const auto semaphore_wait = collect_snapshot_semaphore_wait(kernel, thread, *wait_targets);
+            if (!semaphore_wait) {
+                if (out_detail) *out_detail = "Semaphore wait description is invalid or oversized";
+                return SaveStateResult::ErrorThreadNotSafe;
+            }
+            rec.semaphore_wait = *semaphore_wait;
             thread_records.push_back(rec);
         }
 
@@ -2228,7 +2264,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-wait-audit/sync/NGS/context/GPU roundtrip checked; wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-semaphore-audit/sync/NGS/context/GPU roundtrip checked; wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
@@ -2380,6 +2416,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             || rec.resume_status > static_cast<uint8_t>(ThreadStatus::wait)
             || rec.in_condvar > 1
             || !valid_snapshot_wait_targets(rec.wait_targets)
+            || !valid_snapshot_semaphore_wait(rec.semaphore_wait, rec.wait_targets)
             || (status != ThreadStatus::wait && rec.wait_nid != 0)
             || (rec.in_condvar && status != ThreadStatus::wait)
             || (status == ThreadStatus::wait && ((rec.ctx.cpsr & 0x20) != 0 || rec.ctx.get_pc() < 4))) {
@@ -2403,6 +2440,8 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 if (!kernel.threads.count(rec.id)) return "Thread IDs changed since saving";
             if (const auto wait_error=audit_saved_wait_targets(kernel,thread_records); !wait_error.empty())
                 return wait_error;
+            if (const auto sema_error = audit_saved_semaphore_waits(kernel, thread_records); !sema_error.empty())
+                return sema_error;
             auto mismatch = compare_object_sets(saved_object_sets, collect_kernel_object_sets(kernel, true));
             if (!mismatch.empty()) return mismatch;
             if (!records_match_object_set(sema_records, "semaphores", saved_object_sets)

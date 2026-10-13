@@ -1071,6 +1071,8 @@ SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thr
         data.thread = thread;
         data.priority = thread->priority;
         data.signal = needCount;
+        data.snapshot_timeout_present = pTimeout ? 1 : 0;
+        data.snapshot_timeout_us = pTimeout ? *pTimeout : 0;
 
         bool was_canceled = false;
         data.was_canceled = &was_canceled;

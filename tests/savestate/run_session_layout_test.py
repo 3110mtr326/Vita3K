@@ -36,6 +36,8 @@ struct Thread{int id;};struct Region{uint32_t addr,saved_size;};
 struct Counts {int sync_objects=1,render_targets=1,deferred_contexts=0,immediate_context=4096;};
 struct Kernel {std::map<int,int> threads{{1,0}};int sets=0;};
 std::string audit_saved_wait_targets(Kernel&,const std::vector<Thread>&){return {};}
+bool reject_semaphore=false;
+std::string audit_saved_semaphore_waits(Kernel&,const std::vector<Thread>&){return reject_semaphore?"Semaphore audit refused":"";}
 int collect_kernel_object_sets(Kernel &k,bool held){assert(held);return k.sets;}
 std::string compare_object_sets(int a,int b){return a==b?"":"object IDs changed";}
 bool records_match_object_set(int records,const char*,int){return records==0;}
@@ -51,6 +53,7 @@ struct NgsVoiceRecord{};struct NgsPcmRecord{};
 template<class E,class F>std::string snapshot_ngs_voices(E&,std::vector<NgsVoiceRecord>&,const std::vector<NgsVoiceRecord>*,F f,bool held,std::vector<NgsPcmRecord>*,const std::vector<NgsPcmRecord>*){assert(held);if(ngs_mode==16)return "NGS refused";bool ok=f();return ok&&ngs_mode!=17?"":"NGS failed";}
 std::string validate(int mode){
  ngs_mode=mode;
+ reject_semaphore=mode==18;
  std::vector<NgsVoiceRecord> saved_ngs_records;std::vector<NgsPcmRecord>saved_ngs_pcm;
  int saved_io_files=0;
  const auto graphics_checkpoint=[](const std::function<bool()> &verify){return verify();};
@@ -80,8 +83,8 @@ int main(){
    std::istringstream in(bad);assert(parse(in,true)==SaveStateResult::ErrorMismatch);
  }
  std::istringstream huge("x");assert(!skip_savestate_bytes(huge,0xffffffffu));
- for(int mode=0;mode<18;++mode)assert(validate(mode).empty()==(mode==0));
- std::cout<<"PASS: RAM indexing without payload allocation; truncation, bounds, tail position; 15 session mismatch and 2 NGS failure cases\n";
+ for(int mode=0;mode<19;++mode)assert(validate(mode).empty()==(mode==0));
+ std::cout<<"PASS: RAM indexing without payload allocation; truncation, bounds, tail position; 15 session mismatch, 2 NGS failure and semaphore audit refusal cases\n";
 }
 '''.replace('RAM\n',ram).replace(' CHECK\n',check)
 with tempfile.TemporaryDirectory() as d:

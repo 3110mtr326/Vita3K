@@ -28,6 +28,10 @@ struct WaitingThreadData {
     int32_t priority;
     bool *was_canceled;
 
+    // Semaphore diagnostic entry budget; never a remaining-time estimate.
+    uint32_t snapshot_timeout_present = 0;
+    uint32_t snapshot_timeout_us = 0;
+
     // additional fields for each primitive
     union {
         struct { // mutex

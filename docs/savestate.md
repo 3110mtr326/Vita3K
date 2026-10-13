@@ -4,7 +4,51 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Wait registry audit (latest change, format v26)
+## Semaphore wait requirements (latest change, format v27)
+
+Semaphore queue entries now record whether the caller supplied a timeout and
+its observed entry budget. These fields are initialized before registration
+under the semaphore/thread locks; normal wait, signal and timeout behavior is
+unchanged. Save serializes a pointer-free per-thread description: semaphore UID,
+requested count, queued priority, zero-based queue position, queue size, attributes,
+timeout presence and entry budget. The budget is NOT remaining time. Host
+deadlines, cancellation pointers and blocked stack frames are not serialized.
+
+Load rejects malformed descriptions before the bounded drain and compares live
+descriptions before any RAM/CPU mutation. Differences are evidence, not proof
+of a resumable wait. The collector bounds queue traversal, rejects duplicate or
+missing membership and leaves queue nodes and retained iterators untouched.
+Replacing these nodes would invalidate the iterator retained by handle_timeout;
+safe continuation must address this before restoring saved wait registrations.
+Marker: CPU-semaphore-audit. Logs: Savestate semaphore wait / summary.
+Format v27 requires a fresh Save; retained restoration remains disabled.
+
+Host checks: production savestate.cpp and sync_primitives.cpp syntax; real FIFO
+and priority queues with preserved iterators, changed registrations, timed,
+untimed and zero budgets, invalid descriptions; registry collector regression;
+session compatibility including semaphore audit refusal; 29 joint GPU cases.
+Android build and device checks remain required. On device, compare the entry
+requirements and ordering for UID 133/134 (and other live semaphores), then
+verify normal rendering, audio and input after Resume. Timed waits require
+deadline reconstruction even when the saved/live entry budgets match.
+
+## Wait registry audit (previous checkpoint, format v26)
+
+Device result 2026-10-13 18:42 (PCSG00219): 23 threads audited, three changed
+wait-target sets and three changed active import identities. Thread 8 gained
+a semaphore registration for UID 133; thread 136 lost its UID 134 semaphore
+registration, while thread 137 gained one. Thread 138 retained UID 134.
+These are differences between snapshots, not proof of a direct wake/handoff.
+Wait audit: 10 saved versus 11 current waits, three wait/nonwait transitions,
+five changed wait contexts. This identifies semaphore continuation as the next
+area to investigate; registry equality alone cannot validate a host stack,
+queue order or deadline, and no waits were reconstructed or replayed.
+Joint GPU diagnostic passed (joint-live-gpu-roundtrip-passed), with domain
+rollbacks MATCH. Thread metadata: 23 threads, one changed field, saved/rollback
+MATCH. RAM compared 311733256 bytes and simultaneously staged 16083644 bytes
+in 306 chunks; batch including nested checks took 561 ms, saved/rollback MATCH.
+User reports normal operation. Detailed log read 2026-10-13. This validates the
+diagnostic checkpoint only; retained restoration remains unsupported.
 
 Each thread record now carries the active import NID plus up to 16 sorted
 wait-registration pairs (kind and UID) for semaphore, mutex, lightweight mutex,
@@ -18,8 +62,9 @@ The format is v26; old slots need a fresh save.
 
 Device result 2026-10-13 17:15 predates this format and recorded 12 saved versus
 10 current waits, including transitions for threads 137 and 138. That evidence
-motivated this registry audit but cannot serve as v26 validation. Device test
-is required. Host validation passed: production collector/comparator across all
+motivated this registry audit but cannot serve as v26 validation. The later
+18:42 result above provides v26 device evidence. Host validation passed:
+production collector/comparator across all
 8 registry types, NID/UID differences, malformed/canonical/bounds/overflow/null
 cases; savestate.cpp syntax, 15 session mismatch + 2 NGS failure cases, and the
 29 joint GPU Load cases. Retained rewind remains disabled.
