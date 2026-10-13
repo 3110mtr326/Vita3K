@@ -98,6 +98,7 @@
 #include <app/savestate_image_section.h>
 #include <app/savestate_stream_skip.h>
 #include <app/savestate_cpu_probe.h>
+#include <app/savestate_wait_audit.h>
 #include <app/savestate_value_probe.h>
 #include <app/savestate_ram_audit.h>
 #include <app/savestate_ram_probe.h>
@@ -465,12 +466,27 @@ static std::string probe_saved_cpu_contexts(KernelState &kernel,const std::vecto
     SnapshotValueProbe metadata;
     std::set<const void *> metadata_targets;
     size_t changed_metadata = 0;
+    size_t saved_waits = 0, current_waits = 0, wait_transitions = 0, changed_wait_contexts = 0;
     for(const auto &record:records) {
         const auto it=kernel.threads.find(record.id);
         if(it==kernel.threads.end() || !it->second->cpu || it->second->status==ThreadStatus::run)
             return "CPU target missing or still running";
         targets.push_back({it->second->cpu.get(),{record.ctx,record.tpidruro}});
         auto &thread = *it->second;
+        // Observe live CPU values BEFORE any domain is temporarily installed.
+        // KernelSnapshotGuard owns the thread lock; no guest pointer is read.
+        const auto audit = audit_snapshot_wait(
+            static_cast<ThreadStatus>(record.status) == ThreadStatus::wait,
+            thread.status == ThreadStatus::wait, {record.ctx,record.tpidruro},
+            {save_context(*thread.cpu),read_tpidruro(*thread.cpu)});
+        saved_waits += audit.saved_wait;
+        current_waits += audit.current_wait;
+        wait_transitions += audit.transition;
+        changed_wait_contexts += audit.changed_context();
+        if (audit.saved_wait || audit.current_wait)
+            LOG_INFO("Savestate wait audit: thread {}, saved wait {}, current wait {}, changed GPR mask 0x{:04X}, control {}, TLS {}, FPU {}; observation only, host continuation unverified.",
+                record.id,audit.saved_wait,audit.current_wait,audit.changed_registers,
+                audit.changed_control,audit.changed_tls,audit.changed_fpu);
         changed_metadata += thread.start_tick != record.start_tick;
         changed_metadata += thread.last_vblank_waited != record.last_vblank_waited;
         changed_metadata += thread.returned_value != record.returned_value;
@@ -480,6 +496,8 @@ static std::string probe_saved_cpu_contexts(KernelState &kernel,const std::vecto
         metadata.stage(thread.last_vblank_waited, record.last_vblank_waited);
         metadata.stage(thread.returned_value, record.returned_value);
     }
+    LOG_INFO("Savestate wait audit summary: {} saved waits, {} current waits, {} wait/nonwait transitions, {} changed wait contexts; equal contexts do not prove resumable host waits; no waits signalled or replayed.",
+        saved_waits,current_waits,wait_transitions,changed_wait_contexts);
     auto metadata_result = SnapshotValueProbe::Result::ApplyMismatch;
     const auto result=probe_snapshot_cpu_values<CPUState>(targets,
         [](CPUState &cpu){return SnapshotCpuValues{save_context(cpu),read_tpidruro(cpu)};},
@@ -2174,7 +2192,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-thread-metadata/sync/NGS/context/GPU roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-wait-audit/sync/NGS/context/GPU roundtrip checked; wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }

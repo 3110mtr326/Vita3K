@@ -6,6 +6,7 @@ s=Path(__file__).resolve().parents[2];t=(s/'vita3k/app/src/savestate.cpp').read_
 a=t.index('static std::string probe_saved_cpu_contexts(');b=t.index('// Plain-data copies',a)
 code=r'''
 #include <app/savestate_cpu_probe.h>
+#include <app/savestate_wait_audit.h>
 #include <app/savestate_value_probe.h>
 #include <map>
 #include <functional>
@@ -26,7 +27,7 @@ void load_context(CPUState &c,const CPUContext &v){if(++c.writes==2&&c.fail_undo
 enum class ThreadStatus{run,wait,suspend};
 struct Thread {uint64_t start_tick=10,last_vblank_waited=20;uint32_t returned_value=30;ThreadStatus status=ThreadStatus::wait;std::unique_ptr<CPUState> cpu=std::make_unique<CPUState>();};
 struct KernelState {bool snapshot_restore_failed=false;std::map<int,std::shared_ptr<Thread>>threads{{1,std::make_shared<Thread>()}};};
-struct ThreadRecord{uint64_t start_tick=40,last_vblank_waited=50;uint32_t returned_value=60;int id=1;CPUContext ctx{};uint32_t tpidruro=123;};
+struct ThreadRecord{uint8_t status=static_cast<uint8_t>(ThreadStatus::wait);uint64_t start_tick=40,last_vblank_waited=50;uint32_t returned_value=60;int id=1;CPUContext ctx{};uint32_t tpidruro=123;};
 METHOD
 int main(){for(int mode=0;mode<14;++mode){KernelState kernel;auto thread=kernel.threads[1];
  if(mode==1)kernel.snapshot_restore_failed=true;

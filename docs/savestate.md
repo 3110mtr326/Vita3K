@@ -4,7 +4,38 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Thread metadata checkpoint (latest change, format v25 unchanged)
+## Wait continuation audit (latest change, format v25 unchanged)
+
+Before temporary CPU installation, inspect saved versus live wait status and
+CPU context under the existing kernel/thread guard. Log each thread waiting in
+either state, with a changed GPR bitmask (bits 0-15), control-register, TLS and
+bitwise FPU differences. Summarize saved/current waits, wait/nonwait transitions
+and changed contexts. No guest pointers are dereferenced and no wait state is
+modified by this audit. Nonwaiting contexts are excluded from its difference
+count. The existing metadata and joint GPU roundtrip are unchanged.
+
+Equal contexts do NOT prove equal host stacks, registered wait targets, timeout
+deadlines or callback state, and do not authorize retained restoration. This
+checkpoint gathers device evidence needed to choose a continuation strategy;
+it neither signals nor replays waits. UI marker CPU-wait-audit explicitly says
+wait continuation remains unverified. Wire format remains v25.
+
+Validation passed: savestate.cpp syntax; classifier tests for all 16 GPR mask
+bits, four wait-status combinations, control/TLS, signed zero and NaN payloads,
+nonwait exclusion and input immutability; 14 production CPU/metadata cases;
+29 production joint GPU Load cases. Android build/device audit pending.
+
+## Thread metadata checkpoint (previous checkpoint, format v25 unchanged)
+
+Device result 2026-10-13 16:07 (PCSG00219): 23 threads checked, one changed
+metadata field; saved metadata and original-value rollback MATCH. The log does
+not identify which of the three field types changed, so it does not establish
+changed-value coverage for all three types. CPU registers, one context, three
+read-only file offsets and the full joint GPU checkpoint passed with all
+rollbacks MATCH. RAM compared 311733336 bytes and staged 15992344 bytes in
+292 chunks; the RAM batch including nested checks took 656 ms. User reports
+normal operation. This confirms diagnostic application/rollback, not thread
+continuation or retained rewind. Detailed log read 2026-10-13.
 
 The CPU wrapper now stages the already serialized start_tick,
 last_vblank_waited and returned_value fields under the snapshot's thread locks.
@@ -25,7 +56,8 @@ Validation passed: production savestate.cpp syntax, 14 extracted CPU/metadata
 cases covering simultaneous values, multiple threads, unchanged/extreme values,
 missing/running/duplicate/aliased targets, nested rejection/exception/mutation,
 exact rollback and persistent CPU rollback veto. Existing 29 joint GPU Load
-cases and session-layout tests passed. Android build and device checks pending.
+cases and session-layout tests passed. Android build and device checks were
+subsequently confirmed by the device result above.
 
 ## Joint host and GPU checkpoint (previous checkpoint, format v25 unchanged)
 
