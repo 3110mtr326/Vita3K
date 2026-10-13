@@ -4,7 +4,42 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Joint host and GPU checkpoint (latest change, format v25 unchanged)
+## Thread metadata checkpoint (latest change, format v25 unchanged)
+
+The CPU wrapper now stages the already serialized start_tick,
+last_vblank_waited and returned_value fields under the snapshot's thread locks.
+All targets and original values are collected before mutation; duplicate thread
+objects are refused. Metadata is applied inside the CPU transaction, enclosing
+the sync/NGS/context/GPU checks. Saved metadata is verified after the nested
+check, then original fields are restored and verified before CPU rollback.
+Exceptions, rejected nested checks and unexpected metadata changes cannot
+commit the saved values. Either domain's rollback failure blocks Resume.
+
+This does not change thread status, pending resume status, wait registrations,
+host time or deadlines. Absolute saved timestamps are only temporarily applied;
+time rebasing and safe continuation of host waits remain unresolved. The wire
+format stays v25. UI marker CPU-thread-metadata; the log reports thread count
+and number of changed metadata fields. A fresh Save is recommended for testing.
+
+Validation passed: production savestate.cpp syntax, 14 extracted CPU/metadata
+cases covering simultaneous values, multiple threads, unchanged/extreme values,
+missing/running/duplicate/aliased targets, nested rejection/exception/mutation,
+exact rollback and persistent CPU rollback veto. Existing 29 joint GPU Load
+cases and session-layout tests passed. Android build and device checks pending.
+
+## Joint host and GPU checkpoint (previous checkpoint, format v25 unchanged)
+
+Device result 2026-10-13 14:01 (PCSG00219): Save captured 13 memory regions
+and 23 threads (12 waiting). Load reported joint-live-gpu-roundtrip-passed:
+saved GPU upload and rollback MATCH while saved host domains remained applied;
+one context and the complete files/RAM/CPU/sync/NGS/context/GPU joint probe
+reported rollback MATCH. RAM compared 311733448 bytes and simultaneously staged
+15793904 bytes in 295 chunks; RAM batch including nested probes took 615 ms.
+Three read-only file offsets passed. Products: five nonnull references, zero
+changed symbolic references; scratch empty, so those changed/nonempty paths
+remain unproven on device. User reports normal operation after the diagnostic.
+This confirms the new nesting on this device, not retained rewind or guest
+execution from saved state. Detailed log read 2026-10-13.
 
 The GPU image diagnostic now runs INSIDE the saved context transaction, while
 the outer read-only file positions, eligible RAM, CPU, sync and NGS transactions
@@ -29,7 +64,8 @@ cases (saved host/context lifetime, before/after checks, non-success statuses,
 duplicate/missing callback, exception cleanup and failure veto); existing live
 GPU batch simulation, joint RAM/CPU/sync rollback, context adapter, session-layout
 and NGS 156 adapter / 26 parser cases passed. These use mocks for GPU execution.
-Android build and device validation of the new nesting remain pending.
+Android build and device validation of the new nesting were subsequently
+confirmed by the device result above.
 
 This is still diagnostic, not retained rewind. Coverage is restricted to the
 existing eligible RAM, same-session objects and captured base GPU images.

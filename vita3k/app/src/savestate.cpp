@@ -462,17 +462,33 @@ static std::string probe_saved_cpu_contexts(KernelState &kernel,const std::vecto
     const std::function<bool()> &during = {}) {
     if(kernel.snapshot_restore_failed)return "CPU rollback previously failed; restart the app";
     std::vector<SnapshotCpuTarget<CPUState>> targets;targets.reserve(records.size());
+    SnapshotValueProbe metadata;
+    std::set<const void *> metadata_targets;
+    size_t changed_metadata = 0;
     for(const auto &record:records) {
         const auto it=kernel.threads.find(record.id);
         if(it==kernel.threads.end() || !it->second->cpu || it->second->status==ThreadStatus::run)
             return "CPU target missing or still running";
         targets.push_back({it->second->cpu.get(),{record.ctx,record.tpidruro}});
+        auto &thread = *it->second;
+        changed_metadata += thread.start_tick != record.start_tick;
+        changed_metadata += thread.last_vblank_waited != record.last_vblank_waited;
+        changed_metadata += thread.returned_value != record.returned_value;
+        if (!metadata_targets.insert(&thread).second)
+            return "Duplicate thread metadata target";
+        metadata.stage(thread.start_tick, record.start_tick);
+        metadata.stage(thread.last_vblank_waited, record.last_vblank_waited);
+        metadata.stage(thread.returned_value, record.returned_value);
     }
+    auto metadata_result = SnapshotValueProbe::Result::ApplyMismatch;
     const auto result=probe_snapshot_cpu_values<CPUState>(targets,
         [](CPUState &cpu){return SnapshotCpuValues{save_context(cpu),read_tpidruro(cpu)};},
         [](CPUState &cpu,const SnapshotCpuValues &v){load_context(cpu,v.context);write_tpidruro(cpu,v.tpidruro);},
-        [&] { return !during || during(); });
-    if(result==SnapshotCpuProbe::RollbackFailed) {
+        [&] {
+            metadata_result = metadata.probe_with([&] { return !during || during(); });
+            return metadata_result == SnapshotValueProbe::Result::Passed;
+        });
+    if(result==SnapshotCpuProbe::RollbackFailed || metadata_result==SnapshotValueProbe::Result::RollbackFailed) {
         kernel.snapshot_restore_failed=true;
         LOG_ERROR("Savestate CPU probe: rollback FAILED; guest resume blocked, restart app required.");
         return "CPU rollback failed; restart the app without Resume";
@@ -482,6 +498,7 @@ static std::string probe_saved_cpu_contexts(KernelState &kernel,const std::vecto
         return "CPU verification failed; original CPU values retained";
     }
     LOG_INFO("Savestate CPU probe: saved registers MATCH; rollback MATCH; {} threads; no guest instructions executed.",targets.size());
+    LOG_INFO("Savestate thread metadata probe: {} threads, {} changed fields; saved start ticks/vblank waits/return values MATCH; rollback MATCH; no thread status, wait queues or host clock changed.",targets.size(),changed_metadata);
     return {};
 }
 
@@ -2157,7 +2174,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU/sync/NGS/context/GPU roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-thread-metadata/sync/NGS/context/GPU roundtrip checked; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
