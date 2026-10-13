@@ -28,7 +28,7 @@ struct KernelState {
  std::mutex mutex;std::map<int,SemaphorePtr> semaphores;std::map<int,ThreadStatePtr> threads;
  ThreadStatePtr get_thread(int id){std::lock_guard lock(mutex);return threads.at(id);}
 };
-#include <app/savestate_semaphore_queue.h>
+#include <app/savestate_semaphore_rebind.h>
 struct Record {int id;uint8_t status=static_cast<uint8_t>(ThreadStatus::wait);app::SnapshotWaitTargets wait_targets{};app::SnapshotSemaphoreWait semaphore_wait{};};
 template<class M>auto lock_and_find(int id,M &m,std::mutex &mutex){std::lock_guard lock(mutex);return m.count(id)?m.at(id):typename M::mapped_type{};}
 constexpr bool LOG_SYNC_PRIMITIVES=false;
@@ -46,7 +46,7 @@ WaitingThreadQueuePtr queue(bool priority){
 int main(){
  int cases=0;
  for(bool priority:{false,true})for(int mode=0;mode<12;++mode){
-  KernelState k;auto sema=std::make_shared<Semaphore>();sema->waiting_threads=queue(priority);k.semaphores[1]=sema;
+  KernelState k;auto sema=std::make_shared<Semaphore>();sema->attr=priority?SCE_KERNEL_ATTR_TH_PRIO:0;sema->waiting_threads=queue(priority);k.semaphores[1]=sema;
   auto thread=std::make_shared<ThreadState>();k.threads[1]=thread;
   uint32_t budget=mode==2?0:mode==3||mode==8?100000:2000000;
   int rc=999;
@@ -61,7 +61,13 @@ int main(){
      if(!sema->waiting_threads->empty()){
       auto e=*sema->waiting_threads->begin();assert(e.semaphore_wait_control);
       assert(e.was_canceled==&e.semaphore_wait_control->canceled);weak=e.semaphore_wait_control;
-        if(mode>=5&&mode<=8){auto replacement=queue(priority);replacement->push(e);sema->waiting_threads=std::move(replacement);}
+        if(mode>=5&&mode<=8){
+         std::lock_guard kernel_lock(k.mutex),thread_lock(thread->mutex);
+         auto *before=sema->waiting_threads.get();
+         auto rebound=app::rebind_current_semaphore_queues(k);
+         assert(rebound.error.empty()&&rebound.waiters==1&&rebound.queues==1);
+         assert(sema->waiting_threads.get()!=before);
+        }
         if(mode>=9){
          std::lock_guard kernel_lock(k.mutex),thread_lock(thread->mutex);
          Record record{1};record.wait_targets.count=1;record.wait_targets.targets[0]={1,1};
@@ -76,6 +82,7 @@ int main(){
          });
          assert(probe.error.empty()==(mode==9));
          assert(!k.snapshot_restore_failed&&sema->waiting_threads.get()==before);
+         if(mode==9)assert(app::rebind_current_semaphore_queues(k).error.empty());
         }
       break;
      }

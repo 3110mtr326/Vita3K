@@ -102,6 +102,7 @@
 #include <app/savestate_wait_targets.h>
 #include <app/savestate_semaphore_wait.h>
 #include <app/savestate_semaphore_queue.h>
+#include <app/savestate_semaphore_rebind.h>
 #include <app/savestate_value_probe.h>
 #include <app/savestate_ram_audit.h>
 #include <app/savestate_ram_probe.h>
@@ -2266,7 +2267,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-semaphore-owner/sync/NGS/context/GPU roundtrip checked; wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-semaphore-rebind/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
@@ -2514,6 +2515,12 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             if (!ram_probe.empty()) return joint_error.empty() ? ram_probe : ram_probe + "; " + joint_error;
             if (!simultaneous_check) return "Joint files/RAM/CPU/sync/context checkpoint was not reached";
             LOG_INFO("Savestate joint probe: files/RAM/CPU/sync/semaphore-queues/NGS/context/GPU saved values coexisted; all rollbacks MATCH; no guest instructions, wait replay or game rewind.");
+            // All saved host values have rolled back. Retain only equivalent
+            // CURRENT queue nodes with the same live invocation ownership.
+            const auto rebound = rebind_current_semaphore_queues(kernel);
+            if (!rebound.error.empty()) return rebound.error;
+            LOG_INFO("Savestate current semaphore rebind: {} queues, {} live waiters; order/requirements/invocation ownership MATCH; new current nodes retained for Resume, old nodes retired; no saved waits or game rewind committed.",
+                rebound.queues, rebound.waiters);
             return {};
         }); // Unconditional return: no retained RAM changes, wait aborts or replay.
     }

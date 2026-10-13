@@ -4,7 +4,59 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Semaphore invocation ownership (latest checkpoint v27c, format v27 unchanged)
+## Live semaphore queue rebind (latest checkpoint v27d, format v27 unchanged)
+
+After every saved-value transaction has rolled back successfully, rebuild all
+CURRENT semaphore queues using new queue objects/nodes and the same live
+invocation controls. Preserve exact ordering, thread identities, requested
+counts, queued priorities, cancellation bindings and timeout metadata. The
+existing blocked calls keep their original deadlines and return paths; only
+node storage changes. No saved wait state is retained. This is the first
+device checkpoint intended to Resume with replacement live semaphore nodes.
+
+Allocate and validate all replacements before any slot changes. Reject invalid
+thread/control identity, nonwaiting registrations, duplicate objects/waiters/
+controls, malformed timeout metadata and unreproducible priority order. Swap
+all slots under the continuous kernel/primitive/thread exclusion, verify them,
+then retire old queues. On verification failure or exception, restore every
+original slot and verify it; rollback failure sets the persistent Resume veto.
+Failed earlier diagnostics never enter the rebind. The previous saved-queue
+roundtrip still restores its original queue objects before this separate step.
+
+Marker: CPU-semaphore-rebind. Log: Savestate current semaphore rebind, with
+queue/live-waiter counts and ownership MATCH. Format stays v27. Saved-thread
+continuation (especially changed wait membership), deadline reconstruction and
+full game rewind remain unsupported. This tests continuation of CURRENT waits
+after replacing their nodes, not continuation of saved waits.
+
+Host checks passed: production savestate.cpp syntax; 34 live-rebind cases with
+FIFO/priority/equal-priority, timed/empty queues, invalid identities, atomic
+commit/rollback, injected failure/exception and persistent veto; 29 real-host-
+thread semaphore lifecycle cases now using the production rebind for node
+replacement before signal/cancel/timeout/abort, including after saved-queue
+diagnostics. Thread/kernel surroundings in that harness remain mocks. Session
+callback tests verify rebind occurs only after all saved probes roll back and
+that rebind refusal propagates; 29 joint GPU diagnostic cases passed. Android
+build and device validation remain required. Check normal play and audio/input,
+then Save / advance / Load / Resume; repeat Load once to check successive rebinds.
+
+## Semaphore invocation ownership (previous checkpoint v27c, format v27 unchanged)
+
+Device result 2026-10-14 02:20 (PCSG00219): user reports normal operation.
+Queue probe: 15 queues, six saved and six current waiters, one changed queue;
+saved order/requirements MATCH, original queue objects/entries restored MATCH,
+invocation ownership MATCH. UID 134 saved order was 136, 137, 135, 138;
+current order was 136, 135, 138, 137. UID 170/199 each retained one waiter.
+All observed semaphore waits requested one count without a timeout. Registry
+audit: 23 threads, no changed target sets or import identities. General wait
+audit: 12 saved and 12 current waits, no wait/nonwait transitions, five changed
+wait contexts. This validates changed-order rollback with ownership checks;
+it does not exercise changed membership or timed wait completion on device.
+Joint GPU passed and all joint domain rollbacks MATCH. Thread metadata:
+23 threads, one changed field, saved/rollback MATCH. RAM compared 311733368
+bytes and staged 15981436 bytes in 297 chunks; nested batch took 486 ms.
+Detailed log read 2026-10-14. Diagnostic nodes were not resumed or retained;
+saved host continuation and game rewind remain unsupported.
 
 Normal semaphore waits now own a shared SemaphoreWaitControl. The queue entry
 and blocked call share the cancellation storage; was_canceled points into that
@@ -34,7 +86,8 @@ resume after successful/failed/throwing queue diagnostics); 42 queue transaction
 cases using production WaitingThreadData and real FIFO/priority containers;
 session callback refusal/failure propagation and 29 joint GPU diagnostic cases.
 Thread/kernel surroundings in the lifecycle harness are mocks; Android runtime
-behavior remains a device test requirement. Verify ordinary play first, then a
+behavior was subsequently checked by the device result above, within its stated
+coverage. For further device tests, verify ordinary play first, then a
 fresh Save / advance / Load diagnostic / Resume, including audio and input.
 
 ## Semaphore queue roundtrip (previous checkpoint v27b, format v27 unchanged)
