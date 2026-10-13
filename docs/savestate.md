@@ -4,7 +4,61 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Semaphore wait requirements (latest change, format v27)
+## Semaphore queue roundtrip (latest checkpoint v27b, format v27 unchanged)
+
+The previous device capture showed UID 134 changing from three saved waiters
+to one live waiter, all requesting one count without timeouts. The next step
+reconstructs the saved semaphore queue shape under the existing exclusion and
+temporarily installs it inside the joint CPU/sync/NGS/context/GPU diagnostic.
+All candidate queues are allocated and checked before any queue slot changes.
+Saved positions must be unique/complete, per-queue sizes consistent, attributes
+unchanged, referenced threads present, and priority-queue ordering reproducible.
+Current duplicate waiters and aliased semaphore objects are rejected.
+
+Original queue objects and nodes remain alive in the transaction, preserving
+the iterators held by blocked handle_timeout calls. With all primitive/thread
+locks continuously held, unique_ptr swaps install the candidates, run the nested
+checkpoint, verify the candidates, then unconditionally restore the exact old
+queue objects. Original ordered entry values and cancellation pointers are
+verified after restoration. Failure/exception still restores every queue;
+rollback verification failure sets the persistent kernel Resume veto.
+
+Candidate nodes have null cancellation pointers and no blocked host stack.
+They are DIAGNOSTIC ONLY and must never be signalled, cancelled, resumed or
+retained. Thread statuses, other primitive queues and host deadlines are not
+reconstructed. Timed entry budgets are copied only as metadata. This tests
+queue structure installation/rollback, NOT executable wait continuation.
+Marker: CPU-semaphore-queue. Log: Savestate semaphore queue probe, including
+queue/waiter/change counts. Wire format remains v27; use a fresh Save for testing.
+
+Host validation passed: production savestate.cpp syntax; 34 production queue
+transaction cases using actual FIFO/priority containers, original iterator
+preservation, nested refusal/exception, changed/invalid membership and ordering,
+candidate corruption and persistent rollback veto. Session callback tests verify
+that candidate queues enclose the NGS/GPU checkpoint and both queue refusal and
+post-check failure propagate; 29 existing joint GPU diagnostic cases passed.
+Android compilation and device testing of this checkpoint remain required.
+
+## Semaphore wait requirements (previous checkpoint, format v27)
+
+Device result 2026-10-13 20:28 (PCSG00219): user reports normal operation.
+Four saved and three current semaphore waits, four changed descriptions;
+all observed semaphore waits requested one count and had no timeout specified.
+This is evidence for this capture pair, not all scenes or wait types.
+UID 134 saved queue order was threads 136, 135, 137 (positions 0, 1, 2);
+current queue held only thread 137 at position 0. Thread 138 newly registered
+on UID 130. Thread 200 retained UID 199 at position 0. Attributes were 0x2000;
+queued priorities were 189 for threads 135-138 and 188 for thread 200.
+Registry audit: 23 threads, three changed target sets, five changed import
+identities. General wait audit: 12 saved versus 13 current waits, five status
+transitions, eight changed wait contexts. Queue membership/order therefore
+still requires safe continuation even without semaphore timeouts in this run.
+Joint GPU diagnostic passed; all domain rollbacks MATCH. RAM compared 311733448
+bytes, staged 15776804 bytes in 288 chunks, batch including nested checks 512 ms.
+CPU registers (23 threads), metadata (one changed field), sync (349 fields),
+NGS, one context and three read-only file offsets passed. No saved state was
+retained, no waits replayed and no guest instructions executed by the diagnostic.
+Detailed log read 2026-10-13; retained rewind remains unsupported.
 
 Semaphore queue entries now record whether the caller supplied a timeout and
 its observed entry budget. These fields are initialized before registration
@@ -27,7 +81,8 @@ Host checks: production savestate.cpp and sync_primitives.cpp syntax; real FIFO
 and priority queues with preserved iterators, changed registrations, timed,
 untimed and zero budgets, invalid descriptions; registry collector regression;
 session compatibility including semaphore audit refusal; 29 joint GPU cases.
-Android build and device checks remain required. On device, compare the entry
+Android build and device checks were subsequently confirmed by the result above.
+For further device coverage, compare the entry
 requirements and ordering for UID 133/134 (and other live semaphores), then
 verify normal rendering, audio and input after Resume. Timed waits require
 deadline reconstruction even when the saved/live entry budgets match.

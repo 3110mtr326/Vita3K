@@ -49,14 +49,21 @@ template<class E,class R>std::string audit_saved_ram(E&,std::istream&,const R&){
 template<class E,class R,class F>std::string probe_saved_ram(E&,std::istream&,const R&,F f){return f([]{return true;})?"":"RAM failed";}
 template<class E,class F>std::string probe_saved_file_positions(E&,int,F f){return f([]{return true;})?"":"files failed";}
 int ngs_mode=0;
+bool queue_active=false;
+struct QueueResult {std::string error;int queues=1,saved_waiters=1,current_waiters=1,changed_queues=1;};
+template<class F>QueueResult probe_snapshot_semaphore_queues(Kernel&,const std::vector<Thread>&,F f){
+ if(ngs_mode==19)return {"queue refused"};
+ queue_active=true;bool ok=f();queue_active=false;
+ return {ok&&ngs_mode!=20?"":"queue failed"};
+}
 struct NgsVoiceRecord{};struct NgsPcmRecord{};
-template<class E,class F>std::string snapshot_ngs_voices(E&,std::vector<NgsVoiceRecord>&,const std::vector<NgsVoiceRecord>*,F f,bool held,std::vector<NgsPcmRecord>*,const std::vector<NgsPcmRecord>*){assert(held);if(ngs_mode==16)return "NGS refused";bool ok=f();return ok&&ngs_mode!=17?"":"NGS failed";}
+template<class E,class F>std::string snapshot_ngs_voices(E&,std::vector<NgsVoiceRecord>&,const std::vector<NgsVoiceRecord>*,F f,bool held,std::vector<NgsPcmRecord>*,const std::vector<NgsPcmRecord>*){assert(held&&queue_active);if(ngs_mode==16)return "NGS refused";bool ok=f();return ok&&ngs_mode!=17?"":"NGS failed";}
 std::string validate(int mode){
  ngs_mode=mode;
  reject_semaphore=mode==18;
  std::vector<NgsVoiceRecord> saved_ngs_records;std::vector<NgsPcmRecord>saved_ngs_pcm;
  int saved_io_files=0;
- const auto graphics_checkpoint=[](const std::function<bool()> &verify){return verify();};
+ const auto graphics_checkpoint=[](const std::function<bool()> &verify){assert(queue_active);return verify();};
  std::istringstream in;
  Kernel kernel;Mem mem;struct {Counts gxm;} emuenv;
  std::vector<Thread> thread_records{{1}};
@@ -83,8 +90,8 @@ int main(){
    std::istringstream in(bad);assert(parse(in,true)==SaveStateResult::ErrorMismatch);
  }
  std::istringstream huge("x");assert(!skip_savestate_bytes(huge,0xffffffffu));
- for(int mode=0;mode<19;++mode)assert(validate(mode).empty()==(mode==0));
- std::cout<<"PASS: RAM indexing without payload allocation; truncation, bounds, tail position; 15 session mismatch, 2 NGS failure and semaphore audit refusal cases\n";
+ for(int mode=0;mode<21;++mode){assert(validate(mode).empty()==(mode==0));assert(!queue_active);}
+ std::cout<<"PASS: RAM indexing, 15 session mismatch, 2 NGS failure, semaphore audit refusal, 2 queue failure cases; saved queues enclose NGS/GPU checkpoint\n";
 }
 '''.replace('RAM\n',ram).replace(' CHECK\n',check)
 with tempfile.TemporaryDirectory() as d:
