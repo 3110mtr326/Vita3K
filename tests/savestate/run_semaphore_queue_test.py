@@ -25,7 +25,7 @@ struct Record {
 };
 int main() {
     int exercised=0;
-    for (bool priority : {false,true}) for (int mode=0;mode<17;++mode) {
+    for (bool priority : {false,true}) for (int mode=0;mode<21;++mode) {
         Kernel k;
         for (int id : {135,136,137,138}) k.threads[id]=std::make_shared<ThreadState>();
         auto o=std::make_shared<Object>(), empty_saved=std::make_shared<Object>();
@@ -34,11 +34,15 @@ int main() {
         else o->waiting_threads=std::make_unique<FIFOThreadDataQueue<WaitingThreadData>>();
         empty_saved->waiting_threads=std::make_unique<FIFOThreadDataQueue<WaitingThreadData>>();
         k.semaphores[134]=o;k.semaphores[130]=empty_saved;
-        bool cancellation=false;
+        const auto control=std::make_shared<SemaphoreWaitControl>();
         WaitingThreadData live{};live.thread=k.threads[137];live.signal=2;live.priority=189;
-        live.was_canceled=&cancellation;
+        live.semaphore_wait_control=control;live.was_canceled=&control->canceled;
+        if(mode==17)live.semaphore_wait_control.reset();
+        if(mode==18)live.was_canceled=nullptr;
+        if(mode==19)control->canceled=true;
         auto retained=o->waiting_threads->push(live);
-        live.thread=k.threads[138];empty_saved->waiting_threads->push(live);
+        live.thread=k.threads[138];live.semaphore_wait_control=std::make_shared<SemaphoreWaitControl>();
+        live.was_canceled=&live.semaphore_wait_control->canceled;empty_saved->waiting_threads->push(live);
         auto *original=o->waiting_threads.get(), *original_empty=empty_saved->waiting_threads.get();
         std::vector<Record> records;
         for(int id:{136,135,137}) {
@@ -76,15 +80,16 @@ int main() {
             if(mode==2)throw std::runtime_error("nested failure");
             if(mode==3)o->waiting_threads->pop(); // saved verification failure
             if(mode==16)original->push(live); // injected damage to original; persistent veto
+            if(mode==20)control->canceled=true;
             return true;
         });
-        const bool reject_before= (mode>=4&&mode<=12)||mode==15||(mode==14&&priority);
+        const bool reject_before= (mode>=4&&mode<=12)||mode==15||(mode==14&&priority)||(mode>=17&&mode<=19);
         assert(called!=reject_before);
         assert(outcome.error.empty()==(mode==0||mode==13||(mode==14&&!priority)));
         assert(o->waiting_threads.get()==original && empty_saved->waiting_threads.get()==original_empty);
-        assert((*retained).was_canceled==&cancellation && (*retained).signal==2);
-        assert(!cancellation);
-        assert(k.snapshot_restore_failed==(mode==11||mode==16));
+        assert((*retained).was_canceled==(mode==18?nullptr:&control->canceled) && (*retained).signal==2);
+        assert(control->canceled==(mode==19||mode==20));
+        assert(k.snapshot_restore_failed==(mode==11||mode==16||mode==20));
         if(!reject_before) {
             assert(outcome.saved_waiters==3 && outcome.current_waiters==2);
             assert(outcome.queues==2 && outcome.changed_queues==2);
@@ -99,21 +104,14 @@ with tempfile.TemporaryDirectory() as d:
     stub=tmp/'kernel/thread/thread_state.h'
     stub.parent.mkdir(parents=True)
     stub.write_text('#pragma once\n#include <memory>\n#include <vector>\nstruct ThreadState;\nusing ThreadStatePtr=std::shared_ptr<ThreadState>;\nstruct ThreadState{};\nenum class ThreadStatus{run,wait};\n')
+    production_header=(root/'vita3k/kernel/include/kernel/sync_primitives.h').read_text()
+    production_entry=production_header[production_header.index('struct SemaphoreWaitControl'):production_header.index('// NOTE: uid')]
     (tmp/'kernel/sync_primitives.h').write_text('''#pragma once
 #include <kernel/thread/thread_data_queue.h>
 #include <cstdint>
 #define SCE_KERNEL_ATTR_TH_PRIO 0x2000U
-struct WaitingThreadData {
- ThreadStatePtr thread; int32_t priority; bool *was_canceled;
- uint32_t snapshot_timeout_present=0, snapshot_timeout_us=0;
- int32_t signal;
- bool operator<(const WaitingThreadData &v)const{return priority<v.priority;}
- bool operator>(const WaitingThreadData &v)const{return priority>v.priority;}
- bool operator==(const WaitingThreadData &v)const{return thread==v.thread;}
- bool operator==(const ThreadStatePtr &v)const{return thread==v;}
-};
-using WaitingThreadQueuePtr=std::unique_ptr<ThreadDataQueue<WaitingThreadData>>;
-''')
+using SceSize=uint32_t;
+'''+production_entry)
     cpp=tmp/'test.cpp';cpp.write_text(code)
     exe=tmp/'test.exe'
     subprocess.run([args.compiler,'-std=c++20','-Wall','-Wextra','-Werror',

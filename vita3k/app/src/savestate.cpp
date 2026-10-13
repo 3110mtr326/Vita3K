@@ -2266,7 +2266,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-semaphore-queue/sync/NGS/context/GPU roundtrip checked; wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-semaphore-owner/sync/NGS/context/GPU roundtrip checked; wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
@@ -2496,7 +2496,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                                     simultaneous_check = false;
                                     return false;
                                 }
-                                LOG_INFO("Savestate semaphore queue probe: saved order/requirements MATCH; original queue objects and entries restored MATCH; {} queues, {} saved waiters, {} current waiters, {} changed queues; diagnostic nodes only, no host continuation or wait replay.",
+                                LOG_INFO("Savestate semaphore queue probe: saved order/requirements MATCH; original queue objects and entries restored MATCH; invocation ownership MATCH; {} queues, {} saved waiters, {} current waiters, {} changed queues; diagnostic nodes only, no host continuation or wait replay.",
                                     queue_result.queues, queue_result.saved_waiters, queue_result.current_waiters, queue_result.changed_queues);
                                 return true;
                             });

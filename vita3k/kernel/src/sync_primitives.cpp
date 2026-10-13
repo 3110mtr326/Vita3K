@@ -80,10 +80,10 @@ inline static int find_condvar(CondvarPtr &condvar_out, CondvarPtrs **condvars_o
 
 // TODO: Write remaining time to timeout ptr when it's successfully signaled
 // Assumes primitive_lock is locked and thread_lock is unlocked
-inline static int handle_timeout(KernelState &kernel, const ThreadStatePtr &thread, std::unique_lock<std::mutex> &thread_lock,
-    std::unique_lock<std::mutex> &primitive_lock, WaitingThreadQueuePtr &queue,
-    const ThreadDataQueueInterator<WaitingThreadData> &data_it, const char *export_name,
-    SceUInt *const timeout) {
+template <class Unregister>
+inline static int handle_timeout_with_unregister(KernelState &kernel, const ThreadStatePtr &thread, std::unique_lock<std::mutex> &thread_lock,
+    std::unique_lock<std::mutex> &primitive_lock, const char *export_name,
+    SceUInt *const timeout, Unregister unregister) {
     // A wait can also end because a savestate load asked this thread to abort
     // (thread->abort_wait). In that case the thread is still `wait` and still
     // queued, so it is handled exactly like a timeout: unregister and fail.
@@ -96,7 +96,7 @@ inline static int handle_timeout(KernelState &kernel, const ThreadStatePtr &thre
         thread->update_status(ThreadStatus::run, ThreadStatus::wait);
         thread_lock.unlock();
 
-        queue->erase(data_it);
+        unregister();
 
         return RET_ERROR(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
     };
@@ -125,6 +125,29 @@ inline static int handle_timeout(KernelState &kernel, const ThreadStatePtr &thre
     }
 
     return SCE_KERNEL_OK;
+}
+
+// Existing non-semaphore waits keep their original iterator-based cleanup.
+inline static int handle_timeout(KernelState &kernel, const ThreadStatePtr &thread, std::unique_lock<std::mutex> &thread_lock,
+    std::unique_lock<std::mutex> &primitive_lock, WaitingThreadQueuePtr &queue,
+    const ThreadDataQueueInterator<WaitingThreadData> &data_it, const char *export_name,
+    SceUInt *const timeout) {
+    return handle_timeout_with_unregister(kernel, thread, thread_lock, primitive_lock,
+        export_name, timeout, [&] { queue->erase(data_it); });
+}
+
+// Identify this invocation, not a node that may have moved. The primitive lock
+// is held throughout lookup/removal. A newer wait by the same thread must not
+// be removed by an older invocation's cleanup.
+inline static void unregister_semaphore_wait(WaitingThreadQueuePtr &queue,
+    const ThreadStatePtr &thread, const std::shared_ptr<SemaphoreWaitControl> &control) {
+    for (auto it = queue->begin(); it != queue->end(); ++it) {
+        const auto entry = *it;
+        if (entry.thread == thread && entry.semaphore_wait_control == control) {
+            queue->erase(it);
+            return;
+        }
+    }
 }
 
 // *****************
@@ -1064,6 +1087,7 @@ SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thr
     std::unique_lock<std::mutex> semaphore_lock(semaphore->mutex);
 
     if (semaphore->val < needCount) {
+        const auto control = std::make_shared<SemaphoreWaitControl>();
         std::unique_lock<std::mutex> thread_lock(thread->mutex);
         thread->update_status(ThreadStatus::wait, ThreadStatus::run);
 
@@ -1074,14 +1098,15 @@ SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thr
         data.snapshot_timeout_present = pTimeout ? 1 : 0;
         data.snapshot_timeout_us = pTimeout ? *pTimeout : 0;
 
-        bool was_canceled = false;
-        data.was_canceled = &was_canceled;
+        data.semaphore_wait_control = control;
+        data.was_canceled = &control->canceled;
 
-        const auto data_it = semaphore->waiting_threads->push(data);
+        semaphore->waiting_threads->push(data);
         thread_lock.unlock();
 
-        auto res = handle_timeout(kernel, thread, thread_lock, semaphore_lock, semaphore->waiting_threads, data_it, export_name, pTimeout);
-        if (was_canceled)
+        auto res = handle_timeout_with_unregister(kernel, thread, thread_lock, semaphore_lock,
+            export_name, pTimeout, [&] { unregister_semaphore_wait(semaphore->waiting_threads, thread, control); });
+        if (control->canceled)
             res = SCE_KERNEL_ERROR_WAIT_CANCEL;
         return res;
     } else {

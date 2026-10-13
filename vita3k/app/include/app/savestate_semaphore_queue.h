@@ -19,8 +19,8 @@ struct SnapshotSemaphoreQueueResult {
 // Diagnostic only. Caller continuously holds kernel, ALL primitive and thread
 // locks, and must never execute/signal/cancel a wait from `during`. Candidate
 // entries deliberately have no host cancellation pointer or blocked stack.
-// Original queues remain alive: handle_timeout retains iterators into them and
-// references the unique_ptr slot. Restore that exact queue before unlocking.
+// Original queues remain alive; invocation controls and nodes are restored
+// before unlocking. This probe does not bind saved nodes to host continuations.
 template<class Kernel, class Records>
 SnapshotSemaphoreQueueResult probe_snapshot_semaphore_queues(
     Kernel &kernel, const Records &records, const std::function<bool()> &during) {
@@ -40,13 +40,17 @@ SnapshotSemaphoreQueueResult probe_snapshot_semaphore_queues(
         return a.thread == b.thread && a.priority == b.priority && a.signal == b.signal
             && a.snapshot_timeout_present == b.snapshot_timeout_present
             && a.snapshot_timeout_us == b.snapshot_timeout_us
-            && (!pointers || a.was_canceled == b.was_canceled);
+            && (!pointers || (a.was_canceled == b.was_canceled
+                && a.semaphore_wait_control == b.semaphore_wait_control));
     };
     const auto matches = [&](auto &queue, const auto &entries) {
         if (!queue || queue->size() != entries.size()) return false;
         size_t i = 0;
-        for (auto it = queue->begin(); it != queue->end(); ++it, ++i)
-            if (i >= entries.size() || !equal_entry(*it, entries[i], true)) return false;
+        for (auto it = queue->begin(); it != queue->end(); ++it, ++i) {
+            const auto entry = *it;
+            if (i >= entries.size() || !equal_entry(entry, entries[i], true)
+                || (entry.semaphore_wait_control && entry.semaphore_wait_control->canceled)) return false;
+        }
         return i == entries.size();
     };
     // Complete every allocation and consistency check before touching any slot.
@@ -91,6 +95,8 @@ SnapshotSemaphoreQueueResult probe_snapshot_semaphore_queues(
             for (auto it = (*plan.slot)->begin(); it != (*plan.slot)->end(); ++it) {
                 const auto entry = *it;
                 if (!entry.thread || !queued_threads.insert(entry.thread.get()).second
+                    || !entry.semaphore_wait_control || entry.semaphore_wait_control->canceled
+                    || entry.was_canceled != &entry.semaphore_wait_control->canceled
                     || plan.original.size() >= 4096)
                     throw std::runtime_error("Invalid current semaphore waiter");
                 plan.original.push_back(entry);

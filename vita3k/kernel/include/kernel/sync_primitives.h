@@ -23,6 +23,12 @@
 
 struct KernelState;
 
+// One host semaphore wait invocation. Shared ownership keeps cancellation
+// storage alive when queue nodes are rebuilt; never serialized as a pointer.
+struct SemaphoreWaitControl {
+    bool canceled = false; // Protected by the semaphore mutex.
+};
+
 struct WaitingThreadData {
     ThreadStatePtr thread;
     int32_t priority;
@@ -31,6 +37,7 @@ struct WaitingThreadData {
     // Semaphore diagnostic entry budget; never a remaining-time estimate.
     uint32_t snapshot_timeout_present = 0;
     uint32_t snapshot_timeout_us = 0;
+    std::shared_ptr<SemaphoreWaitControl> semaphore_wait_control;
 
     // additional fields for each primitive
     union {

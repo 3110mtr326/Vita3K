@@ -4,7 +4,56 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Semaphore queue roundtrip (latest checkpoint v27b, format v27 unchanged)
+## Semaphore invocation ownership (latest checkpoint v27c, format v27 unchanged)
+
+Normal semaphore waits now own a shared SemaphoreWaitControl. The queue entry
+and blocked call share the cancellation storage; was_canceled points into that
+control instead of a stack-local bool. Timeout/abort cleanup finds the exact
+thread + invocation control in the current queue, rather than retaining an
+iterator into an old node. Copying/rebuilding nodes with the same control no
+longer invalidates cleanup. A different invocation of the same thread is not
+removed by old cleanup. Signal/cancel return codes and timeout budget handling
+retain the existing implementation. Other wait types retain iterator cleanup
+through a wrapper around the common timeout body.
+
+The reversible semaphore queue diagnostic now verifies original invocation
+ownership and cancellation-pointer binding, rejects missing/canceled/misbound
+controls before mutation, and verifies ownership again after rollback. A changed
+cancellation flag during the checkpoint causes persistent Resume veto. Candidate
+saved nodes still have NO invocation control and remain diagnostic-only: this
+change does not create a host wait for a previously nonwaiting thread, bind
+saved nodes to running calls, reconstruct deadlines or enable retained rewind.
+UI marker: CPU-semaphore-owner. Queue success log includes invocation ownership
+MATCH. The wire format stays v27 because no host pointer/control is serialized.
+
+Host validation passed: actual sync_primitives.cpp and savestate.cpp syntax;
+29 extracted production semaphore lifecycle cases with real std::threads and
+condition variables (signal, cancel, zero/finite timeout, abort, rebuilt queue
+nodes, distinct invocation isolation, ownership release, legacy cleanup and
+resume after successful/failed/throwing queue diagnostics); 42 queue transaction
+cases using production WaitingThreadData and real FIFO/priority containers;
+session callback refusal/failure propagation and 29 joint GPU diagnostic cases.
+Thread/kernel surroundings in the lifecycle harness are mocks; Android runtime
+behavior remains a device test requirement. Verify ordinary play first, then a
+fresh Save / advance / Load diagnostic / Resume, including audio and input.
+
+## Semaphore queue roundtrip (previous checkpoint v27b, format v27 unchanged)
+
+Device result 2026-10-13 23:02 (PCSG00219): 15 semaphore queues, six saved
+and six current waiters, one changed queue. Saved order/requirements MATCH;
+original queue objects and entries restored MATCH. UID 134 saved order was
+138, 135, 137, 136; current order was 137, 136, 138, 135. Thus this capture
+exercised changed ordering with unchanged semaphore membership, not changed
+membership. UID 170 and 199 each retained one waiter. All observed semaphore
+waits requested one count without timeouts. Registry audit: 23 threads, one
+changed target set/import identity. General wait audit: 13 saved versus 12
+current waits, one wait/nonwait transition, six changed wait contexts.
+Joint GPU passed; all joint domain rollbacks MATCH. RAM compared 311733448
+bytes and staged 15720700 bytes in 283 chunks, batch including nested checks
+481 ms. Thread metadata: 23 threads, one changed field, saved/rollback MATCH.
+User reports normal operation after the diagnostic. Detailed log read
+2026-10-13. This confirms reversible queue structure installation; executable
+host wait continuation and retained rewind remain unverified/unsupported.
 
 The previous device capture showed UID 134 changing from three saved waiters
 to one live waiter, all requesting one count without timeouts. The next step
@@ -37,7 +86,8 @@ preservation, nested refusal/exception, changed/invalid membership and ordering,
 candidate corruption and persistent rollback veto. Session callback tests verify
 that candidate queues enclose the NGS/GPU checkpoint and both queue refusal and
 post-check failure propagate; 29 existing joint GPU diagnostic cases passed.
-Android compilation and device testing of this checkpoint remain required.
+Android compilation and device testing were subsequently confirmed by the
+result above; changed-membership device coverage remains outstanding.
 
 ## Semaphore wait requirements (previous checkpoint, format v27)
 
