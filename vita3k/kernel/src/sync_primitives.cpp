@@ -1108,6 +1108,13 @@ SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thr
             export_name, pTimeout, [&] { unregister_semaphore_wait(semaphore->waiting_threads, thread, control); });
         if (control->canceled)
             res = SCE_KERNEL_ERROR_WAIT_CANCEL;
+        // The semaphore mutex is still held. Report once per original blocked
+        // call, only if it survived a committed live-node replacement. This is
+        // current host-wait completion, not evidence of saved-state rewind.
+        if (control->snapshot_rebind_count) {
+            LOG_INFO("Savestate rebound semaphore wait completed: uid {}, thread {}, replacements {}, timed {}, result {}; current invocation only, no saved continuation",
+                semaId, thread_id, control->snapshot_rebind_count, pTimeout != nullptr, res);
+        }
         return res;
     } else {
         semaphore->val -= needCount;

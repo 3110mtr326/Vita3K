@@ -67,6 +67,12 @@ int main(){
   }else{
    assert(first->waiting_threads.get()==old_first&&second->waiting_threads.get()==old_second);
   }
+  assert(control->snapshot_rebind_count==((success&&mode!=14)?1U:0U));
+  if(mode==0){
+   control->snapshot_rebind_count=UINT32_MAX;
+   assert(rebind_current_semaphore_queues(k).error.empty());
+   assert(control->snapshot_rebind_count==UINT32_MAX);
+  }
   ++count;
  }
  std::cout<<"PASS: "<<count<<" production live queue rebind cases; FIFO/priority/ties, empty/timed, all-slot commit/rollback, invalid ownership, nested failure/exception and persistent veto\n";

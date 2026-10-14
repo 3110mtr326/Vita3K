@@ -27,6 +27,8 @@ struct KernelState;
 // storage alive when queue nodes are rebuilt; never serialized as a pointer.
 struct SemaphoreWaitControl {
     bool canceled = false; // Protected by the semaphore mutex.
+    // Diagnostic only, protected by the same mutex; never serialized.
+    uint32_t snapshot_rebind_count = 0;
 };
 
 struct WaitingThreadData {

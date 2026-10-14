@@ -4,7 +4,57 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Live semaphore queue rebind (latest checkpoint v27d, format v27 unchanged)
+## Live semaphore completion evidence (latest checkpoint v27e, format v27 unchanged)
+
+Track committed live-node replacements in each shared SemaphoreWaitControl.
+Increment only after all replacement verification succeeds, while primitive
+locks remain held; saturate at UINT32_MAX. Failed/rolled-back replacements do
+not increment the count. This is host-only diagnostic data, never serialized.
+
+When the original blocked semaphore_wait returns, log its semaphore/thread IDs,
+replacement count, presence of a timeout and actual final return code. Emit once
+per replaced invocation, after cancellation has selected the final return code,
+while still owning the semaphore mutex. Untouched invocations emit nothing.
+A successful queue-rebind message alone does not demonstrate wait completion;
+look for `Savestate rebound semaphore wait completed` after Resume. A waiter
+may legitimately remain blocked, so missing completion is not proof of failure.
+The timeout return code also covers abort in existing behavior; this diagnostic
+must not label every timeout-code return as a deadline expiry.
+
+Marker: CPU-semaphore-completion. Saved continuation and full rewind remain
+unsupported. The v27d queue replacement behavior is unchanged. This checkpoint
+closes the gap between observing installation and observing a real blocked
+CURRENT call finish; it does not implement another saved-state domain.
+
+Host checks: 34 production rebind cases verify committed-only counting and
+saturation in addition to prior atomicity checks. 29 production semaphore
+lifecycle cases use real host threads; replaced signal/cancel/abort/timed waits
+now undergo THREE successive replacements before completion and assert exactly
+one completion record, correct IDs/count/timeout flag and unchanged return code.
+Ordinary and failed-probe paths assert no completion records. Thread/kernel
+surroundings remain mocks. Full sync_primitives.cpp and savestate.cpp syntax
+checks passed. Android build and device test are pending.
+
+Device procedure: normal play, fresh Save, advance 5-10 seconds, Load diagnostic,
+Resume for 30 seconds, then repeat Load/Resume once. Send the full post-Resume
+log, not just a screenshot before Resume, to check actual wait completions.
+
+## Live semaphore queue rebind (previous checkpoint v27d, format v27 unchanged)
+
+Device result 2026-10-14 18:56 (PCSG00219): user reports normal operation.
+Current semaphore rebind passed for 15 queues and six live waiters, with exact
+order/requirements/invocation ownership MATCH. Replacement CURRENT nodes were
+retained for Resume and old nodes retired. Together with the user's normal-play
+report, this supports current-wait continuation after node replacement, not
+saved-wait continuation or game rewind. The supplied log contains one successful
+rebind; successive rebinds and timed wait completion are not established here.
+The preceding saved-queue probe had five saved and six current waiters, one
+changed queue, and saved/rollback/ownership MATCH. UID 134 changed from saved
+order 138, 135, 137 to current order 137, 138, 135, 136, exercising both changed
+membership and order in the reversible diagnostic. Observed waits were untimed.
+Joint GPU passed and all joint rollbacks MATCH. RAM compared 311730936 bytes,
+staged 17234560 bytes in 373 chunks, and took 540 ms. Detailed log read
+2026-10-14. Full saved-state restoration remains unsupported.
 
 After every saved-value transaction has rolled back successfully, rebuild all
 CURRENT semaphore queues using new queue objects/nodes and the same live
@@ -37,8 +87,9 @@ replacement before signal/cancel/timeout/abort, including after saved-queue
 diagnostics. Thread/kernel surroundings in that harness remain mocks. Session
 callback tests verify rebind occurs only after all saved probes roll back and
 that rebind refusal propagates; 29 joint GPU diagnostic cases passed. Android
-build and device validation remain required. Check normal play and audio/input,
-then Save / advance / Load / Resume; repeat Load once to check successive rebinds.
+runtime was subsequently checked by the device result above within its stated
+coverage. Further device coverage should repeat Load / Resume to check
+successive rebinds, including normal play and audio/input.
 
 ## Semaphore invocation ownership (previous checkpoint v27c, format v27 unchanged)
 

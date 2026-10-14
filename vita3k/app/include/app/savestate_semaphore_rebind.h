@@ -97,7 +97,16 @@ SnapshotSemaphoreRebindResult rebind_current_semaphore_queues(Kernel &kernel,
     } catch (...) {
         valid = false;
     }
-    if (valid) return result; // Retain CURRENT state in new nodes; retire old nodes.
+    if (valid) {
+        // Publish only committed replacements. Failed probes must not claim
+        // continuation through replacement nodes. Saturate diagnostic counts.
+        for (const auto &plan : plans)
+            for (const auto &entry : plan.entries) {
+                auto &count = entry.semaphore_wait_control->snapshot_rebind_count;
+                if (count != UINT32_MAX) ++count;
+            }
+        return result; // Retain CURRENT state in new nodes; retire old nodes.
+    }
 
     for (auto &plan : plans) plan.slot->swap(plan.replacement);
     bool restored = true;

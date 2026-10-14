@@ -33,6 +33,12 @@ struct Record {int id;uint8_t status=static_cast<uint8_t>(ThreadStatus::wait);ap
 template<class M>auto lock_and_find(int id,M &m,std::mutex &mutex){std::lock_guard lock(mutex);return m.count(id)?m.at(id):typename M::mapped_type{};}
 constexpr bool LOG_SYNC_PRIMITIVES=false;
 #define LOG_DEBUG(...) ((void)0)
+struct Completion {int uid,thread;uint32_t replacements;bool timed;int result;};
+std::vector<Completion> completions;
+void completion_log(const char *,int uid,int thread,uint32_t replacements,bool timed,int result){
+ completions.push_back({uid,thread,replacements,timed,result});
+}
+#define LOG_INFO(...) completion_log(__VA_ARGS__)
 #define RET_ERROR(x) (x)
 constexpr int SCE_KERNEL_OK=0,SCE_KERNEL_ERROR_WAIT_TIMEOUT=-1,SCE_KERNEL_ERROR_WAIT_CANCEL=-2,
  SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID=-3,SCE_KERNEL_ERROR_SEMA_OVF=-4,SCE_KERNEL_ERROR_ILLEGAL_COUNT=-5;
@@ -49,7 +55,7 @@ int main(){
   KernelState k;auto sema=std::make_shared<Semaphore>();sema->attr=priority?SCE_KERNEL_ATTR_TH_PRIO:0;sema->waiting_threads=queue(priority);k.semaphores[1]=sema;
   auto thread=std::make_shared<ThreadState>();k.threads[1]=thread;
   uint32_t budget=mode==2?0:mode==3||mode==8?100000:2000000;
-  int rc=999;
+  int rc=999;completions.clear();
   // 0 signal, 1 cancel, 2 zero timeout, 3 timeout, 4 abort,
   // 5 rebuilt+signal, 6 rebuilt+cancel, 7 rebuilt+abort, 8 rebuilt+timeout.
   std::thread worker([&]{rc=semaphore_wait(k,"test",1,1,1,(mode==2||mode==3||mode==8)?&budget:nullptr);});
@@ -67,6 +73,10 @@ int main(){
          auto rebound=app::rebind_current_semaphore_queues(k);
          assert(rebound.error.empty()&&rebound.waiters==1&&rebound.queues==1);
          assert(sema->waiting_threads.get()!=before);
+         assert(e.semaphore_wait_control->snapshot_rebind_count==1);
+         assert(app::rebind_current_semaphore_queues(k).error.empty());
+         assert(app::rebind_current_semaphore_queues(k).error.empty());
+         assert(e.semaphore_wait_control->snapshot_rebind_count==3);
         }
         if(mode>=9){
          std::lock_guard kernel_lock(k.mutex),thread_lock(thread->mutex);
@@ -98,6 +108,13 @@ int main(){
   assert(rc==((mode==0||mode==5||mode==9)?SCE_KERNEL_OK:(mode==1||mode==6||mode==11)?SCE_KERNEL_ERROR_WAIT_CANCEL:SCE_KERNEL_ERROR_WAIT_TIMEOUT));
   assert(sema->waiting_threads->empty()&&thread->status==ThreadStatus::run);
   assert(weak.expired());
+  const bool rebound=(mode>=5&&mode<=9);
+  assert(completions.size()==(rebound?1U:0U));
+  if(rebound){
+   const auto &c=completions.front();
+   assert(c.uid==1&&c.thread==1&&c.result==rc);
+   assert(c.replacements==(mode==9?1U:3U)&&c.timed==(mode==8));
+  }
   if(mode==2||mode==3||mode==8)assert(budget==0);
   ++cases;
  }
