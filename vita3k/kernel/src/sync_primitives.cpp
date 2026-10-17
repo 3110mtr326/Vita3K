@@ -174,6 +174,17 @@ inline static void unregister_condvar_wait(WaitingThreadQueuePtr &queue,
     }
 }
 
+inline static void unregister_mutex_wait(WaitingThreadQueuePtr &queue,
+    const ThreadStatePtr &thread, const std::shared_ptr<MutexWaitControl> &control) {
+    for (auto it = queue->begin(); it != queue->end(); ++it) {
+        const auto entry = *it;
+        if (entry.thread == thread && entry.mutex_wait_control == control) {
+            queue->erase(it);
+            return;
+        }
+    }
+}
+
 // *****************
 // * Simple events *
 // *****************
@@ -726,19 +737,24 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
             return RET_ERROR(SCE_KERNEL_ERROR_MUTEX_FAILED_TO_OWN);
         }
 
-        // Sleep thread!
+        // Allocate invocation identity before changing the thread status.
+        const auto control = std::make_shared<MutexWaitControl>();
         std::unique_lock<std::mutex> thread_lock(thread->mutex);
         thread->update_status(ThreadStatus::wait, ThreadStatus::run);
 
-        WaitingThreadData data;
+        WaitingThreadData data{};
         data.thread = thread;
         data.lock_count = lock_count;
         data.priority = thread->priority;
 
-        const auto data_it = mutex->waiting_threads->push(data);
+        data.mutex_wait_control = control;
+        data.snapshot_timeout_present = timeout ? 1 : 0;
+        data.snapshot_timeout_us = timeout ? *timeout : 0;
+        mutex->waiting_threads->push(data);
         thread_lock.unlock();
 
-        int res = handle_timeout(kernel, thread, thread_lock, mutex_lock, mutex->waiting_threads, data_it, export_name, timeout);
+        int res = handle_timeout_with_unregister(kernel, thread, thread_lock, mutex_lock,
+            export_name, timeout, [&] { unregister_mutex_wait(mutex->waiting_threads, thread, control); });
 
         if (weight == SyncWeight::Light) {
             mutex->workarea.get(mem)->lockCount = mutex->lock_count;
@@ -747,6 +763,11 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
             }
         }
 
+        if (control->snapshot_rebind_count) {
+            LOG_INFO("Savestate rebound mutex wait completed: uid {}, thread {}, replacements {}, timed {}, result {}; owns mutex {}, lock count {}; current invocation only, no saved continuation",
+                mutex->uid, thread_id, control->snapshot_rebind_count, timeout != nullptr, res,
+                mutex->owner == thread, mutex->lock_count);
+        }
         return res;
     }
     // Not owned

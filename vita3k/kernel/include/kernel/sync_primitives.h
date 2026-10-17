@@ -42,6 +42,11 @@ struct CondvarWaitControl {
     uint32_t snapshot_rebind_count = 0;
 };
 
+// Identity of one live mutex acquisition; protected by the mutex object.
+struct MutexWaitControl {
+    uint32_t snapshot_rebind_count = 0;
+};
+
 struct WaitingThreadData {
     ThreadStatePtr thread;
     int32_t priority;
@@ -53,6 +58,7 @@ struct WaitingThreadData {
     std::shared_ptr<SemaphoreWaitControl> semaphore_wait_control;
     std::shared_ptr<SimpleEventWaitControl> simple_event_wait_control;
     std::shared_ptr<CondvarWaitControl> condvar_wait_control;
+    std::shared_ptr<MutexWaitControl> mutex_wait_control;
 
     // additional fields for each primitive
     union {
