@@ -4,7 +4,70 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Live semaphore completion evidence (latest checkpoint v27e, format v27 unchanged)
+## Live simple-event queue rebind (latest checkpoint v27f, format v27 unchanged)
+
+Simple-event waits now own a shared invocation identity, and timeout/abort
+cleanup scans for the exact thread + identity rather than retaining an iterator
+into an old queue node. Entry timeout metadata is observational only. The blocked
+call retains its original deadline and result/user-data output pointers. Timer
+fallback and other wait primitives retain their existing behavior.
+
+After every saved-value probe rolls back, and after current semaphore rebind,
+rebuild CURRENT simple-event queues atomically under the existing continuous
+kernel/primitive/thread lock scope. Preserve exact order, priorities, patterns,
+output pointer bindings, invocation identity and entry timeout metadata. Prepare
+all allocations before swapping. Verify candidates and installed queues; on
+failure restore every original queue and verify identity and contents. Failed
+rollback sets the persistent Resume veto. A refusal after semaphore rebind
+leaves equivalent current semaphore nodes installed, with no saved state retained.
+Do not dereference output pointers during preparation/verification or serialize
+them. This is only a transfer of live node storage for existing blocked calls.
+
+Committed replacements increment an invocation-local saturating count. When
+the blocked call completes, emit `Savestate rebound simple event wait completed`
+with UID, thread, replacement count, timeout presence and actual return code.
+The return code for timeout can also mean abort; no deadline-expiry inference.
+Queue installation is logged as `Savestate current simple event rebind`.
+Marker: CPU-simple-event-rebind. Full rewind, saved simple-event registrations,
+new host continuations, and saved output/deadline reconstruction remain unsupported.
+
+Host validation: 40 actual queue transaction cases cover FIFO/priority/ties,
+empty/timed queues, owner rejection, output-binding/pattern corruption,
+all-slot rollback, exceptions, persistent veto and saturating commit counts.
+28 production simple-event lifecycle cases use real host threads and test
+three replacements before set/pulse/timeout/abort, auto-reset, unrelated bits,
+null outputs, refused/throwing rebinds, output values, poll/fast path, timer
+fallback dispatch and invocation-specific cleanup. Kernel/thread surroundings
+are mocks; timer execution itself is not tested. Existing semaphore lifecycle
+29 cases and rebind 34 cases passed. Production session callback tests confirm
+event rebind follows all saved rollbacks and successful semaphore rebind, and
+propagates event refusal. Full sync_primitives.cpp and savestate.cpp syntax
+checks passed. Android build and device validation are pending.
+
+Device procedure: verify ordinary play, fresh Save, advance 5-10 seconds, Load,
+then Resume and play for 30 seconds. Repeat Load/Resume once if normal. Supply
+the final post-Resume log and screenshot. Check actual event waiter counts and
+completion records; zero current waiters or still-blocked calls do not establish
+event completion coverage. The previous device log had a simple-event waiter
+at UID 146/thread 151, but that does not guarantee the next capture has one.
+
+## Live semaphore completion evidence (previous checkpoint v27e, format v27 unchanged)
+
+Device result 2026-10-17 15:11 (PCSG00219): user reports normal operation.
+One successful rebind covered 15 queues and six live waiters, with order,
+requirements and invocation ownership MATCH. After Resume, all six original
+blocked calls logged completion with result 0, replacements 1, timed false:
+UID 170/thread 171, UID 199/thread 200, and UID 134/threads 136, 137, 138, 135.
+Rebind finished at 15:11:47.148; completions occurred at 15:11:55.479-55.487.
+This directly establishes successful current-call completion after replacing
+live nodes, beyond the prior installation-only evidence. It does not establish
+saved-wait continuation, timed completion or successive rebinds on device;
+the supplied log contains only one rebind and each completion has count one.
+The preceding saved-queue diagnostic had six saved and six current waiters,
+one changed queue, and saved/rollback/ownership MATCH. Joint GPU passed and
+all joint domain rollbacks MATCH. RAM compared 311733256 bytes and staged
+15990996 bytes in 293 chunks; batch took 549 ms. Detailed log read 2026-10-17.
+Full saved-state restoration remains unsupported.
 
 Track committed live-node replacements in each shared SemaphoreWaitControl.
 Increment only after all replacement verification succeeds, while primitive
@@ -33,7 +96,8 @@ now undergo THREE successive replacements before completion and assert exactly
 one completion record, correct IDs/count/timeout flag and unchanged return code.
 Ordinary and failed-probe paths assert no completion records. Thread/kernel
 surroundings remain mocks. Full sync_primitives.cpp and savestate.cpp syntax
-checks passed. Android build and device test are pending.
+checks passed. Android runtime was subsequently checked by the device result
+above within its stated coverage.
 
 Device procedure: normal play, fresh Save, advance 5-10 seconds, Load diagnostic,
 Resume for 30 seconds, then repeat Load/Resume once. Send the full post-Resume

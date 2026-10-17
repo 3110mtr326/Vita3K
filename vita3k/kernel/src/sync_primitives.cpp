@@ -150,6 +150,18 @@ inline static void unregister_semaphore_wait(WaitingThreadQueuePtr &queue,
     }
 }
 
+// Timeout/abort cleanup must follow the live call across node replacement.
+inline static void unregister_simple_event_wait(WaitingThreadQueuePtr &queue,
+    const ThreadStatePtr &thread, const std::shared_ptr<SimpleEventWaitControl> &control) {
+    for (auto it = queue->begin(); it != queue->end(); ++it) {
+        const auto entry = *it;
+        if (entry.thread == thread && entry.simple_event_wait_control == control) {
+            queue->erase(it);
+            return;
+        }
+    }
+}
+
 // *****************
 // * Simple events *
 // *****************
@@ -218,6 +230,7 @@ SceInt32 simple_event_waitorpoll(KernelState &kernel, const char *export_name, S
 
         return SCE_KERNEL_OK;
     } else if (is_wait) {
+        const auto control = std::make_shared<SimpleEventWaitControl>();
         std::unique_lock<std::mutex> thread_lock(thread->mutex);
         thread->update_status(ThreadStatus::wait, ThreadStatus::run);
 
@@ -228,10 +241,15 @@ SceInt32 simple_event_waitorpoll(KernelState &kernel, const char *export_name, S
         data.pattern = wait_pattern;
         data.priority = thread->priority;
 
-        const auto data_it = event->waiting_threads->push(data);
+        data.was_canceled = nullptr;
+        data.simple_event_wait_control = control;
+        data.snapshot_timeout_present = timeout ? 1 : 0;
+        data.snapshot_timeout_us = timeout ? *timeout : 0;
+        event->waiting_threads->push(data);
         thread_lock.unlock();
 
-        const int err = handle_timeout(kernel, thread, thread_lock, event_lock, event->waiting_threads, data_it, export_name, timeout);
+        const int err = handle_timeout_with_unregister(kernel, thread, thread_lock, event_lock,
+            export_name, timeout, [&] { unregister_simple_event_wait(event->waiting_threads, thread, control); });
         if (err < 0) {
             // set it only if a timeout occurs
             // otherwise set in simple_event_setorpulse
@@ -239,6 +257,10 @@ SceInt32 simple_event_waitorpoll(KernelState &kernel, const char *export_name, S
                 *user_data = event->last_user_data;
             if (result_pattern)
                 *result_pattern = event->pattern;
+        }
+        if (control->snapshot_rebind_count) {
+            LOG_INFO("Savestate rebound simple event wait completed: uid {}, thread {}, replacements {}, timed {}, result {}; current invocation only, no saved continuation",
+                event_id, thread_id, control->snapshot_rebind_count, timeout != nullptr, err);
         }
         return err;
     } else {

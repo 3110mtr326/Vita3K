@@ -31,15 +31,22 @@ struct SemaphoreWaitControl {
     uint32_t snapshot_rebind_count = 0;
 };
 
+// Identity of one CURRENT simple-event call; protected by the event mutex.
+// No saved callback/output pointer or deadline is reconstructed from this.
+struct SimpleEventWaitControl {
+    uint32_t snapshot_rebind_count = 0;
+};
+
 struct WaitingThreadData {
     ThreadStatePtr thread;
     int32_t priority;
     bool *was_canceled;
 
-    // Semaphore diagnostic entry budget; never a remaining-time estimate.
+    // Diagnostic entry budget for owned waits; never a remaining-time estimate.
     uint32_t snapshot_timeout_present = 0;
     uint32_t snapshot_timeout_us = 0;
     std::shared_ptr<SemaphoreWaitControl> semaphore_wait_control;
+    std::shared_ptr<SimpleEventWaitControl> simple_event_wait_control;
 
     // additional fields for each primitive
     union {
