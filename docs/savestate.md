@@ -4,7 +4,71 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Live simple-event queue rebind (latest checkpoint v27f, format v27 unchanged)
+## Live condition-variable queue rebind (latest checkpoint v27g, format v27 unchanged)
+
+The prior device log had five lightweight condition-variable waiters. Both normal
+and lightweight condition waits now own a shared invocation identity. Timeout/
+abort cleanup finds thread + identity in the current queue, rather than erasing
+an iterator into retired storage. Allocate identity before releasing the associated
+mutex. Preserve existing skip-unlock, timeout/abort return and mutex-reacquire
+semantics; this change does not fix or redefine existing guest API behavior.
+
+After every saved-value rollback and successful current semaphore/simple-event
+rebind, prepare and atomically replace all CURRENT normal/lightweight condition
+queues as one transaction. Validate live thread/control identity, waiting status,
+queue order/priorities and entry timeout metadata. Reject missing associated
+mutexes and aliases across the two registries. Never modify associated mutexes,
+host deadlines, saved registrations or thread status. Keep originals until
+verification succeeds; on failure restore and verify all original queue objects.
+Persistent rollback failure forbids Resume. Earlier equivalent current rebinds
+remain installed if a later primitive refuses, with no saved state committed.
+
+Marker: CPU-condvar-rebind. `Savestate current condvar rebind` reports combined
+normal/lightweight queue and waiter counts. `Savestate rebound condvar wait ended`
+reports the condition-wait result and whether mutex reacquisition is pending.
+Only a successful condition wait proceeds to reacquisition; its actual return
+is logged separately as `Savestate rebound condvar call completed`. A condition
+wakeup alone therefore must not be reported as full call completion. Replacement
+counts are invocation-local, saturating, committed-only and never serialized.
+Full saved continuation, reconstructed deadlines and game rewind remain unsupported.
+
+Host checks: 44 production queue transaction cases span both registries, invalid
+ownership/associations, alias rejection, order/priority corruption, all-slot
+rollback, exceptions and persistent veto. 42 production condition wait/signal
+cases use real host threads and cover normal/lightweight FIFO/priority waits,
+three successive replacements, all/specific signal, timeout/abort, refusal and
+exception, skip-unlock, unlock/reacquire errors, and exact-invocation cleanup.
+Mutex unlock/lock operations in this harness are mocks: it verifies calls and
+return propagation, not real guest mutex contention. Existing semaphore/simple-
+event tests (131 cases), session callback ordering/refusal propagation and full
+sync_primitives.cpp/savestate.cpp syntax checks passed. Android build and device
+validation are pending.
+
+Device procedure: ordinary play, fresh Save, advance 5-10 seconds, Load, then
+Resume for 30 seconds. Repeat Load/Resume once if normal. Supply final post-
+Resume log and screenshot. Confirm condition-call completion separately from
+condition-wait completion. Some waits can legitimately remain blocked.
+
+## Live simple-event queue rebind (previous checkpoint v27f, format v27 unchanged)
+
+Device result 2026-10-17 17:51 (PCSG00219): user reports normal operation.
+Simple-event rebind covered four queues and two live waiters, with exact order,
+pattern, output bindings and invocation ownership MATCH. Both replaced calls
+subsequently completed: UID 157/thread 159 at 17:51:58.537, timed true,
+result -2147319803 (0x80028005, WAIT_TIMEOUT); UID 146/thread 151 at
+17:52:18.567, timed false, result 0. Each reported replacements 1.
+The timed return occurred immediately after rebind, before the later Resume
+completions, so this establishes cleanup after replacement but not preservation
+of paused guest-time deadlines. Existing timeout-code handling can also cover
+abort; the log does not independently distinguish that cause.
+Current semaphore rebind covered 15 queues and four live waiters. All four
+completed with result 0: UID 134/threads 136, 138, 137 and UID 199/thread 200.
+The preceding saved semaphore probe had six saved and four current waiters,
+two changed queues and saved/rollback/ownership MATCH. Joint GPU passed and
+all joint rollbacks MATCH. RAM compared 311733256 bytes and staged 16151516
+bytes in 296 chunks; batch took 490 ms. The supplied log contains one rebind
+per primitive, not successive device rebinds. Detailed log read 2026-10-17.
+Full saved continuation and game rewind remain unsupported.
 
 Simple-event waits now own a shared invocation identity, and timeout/abort
 cleanup scans for the exact thread + identity rather than retaining an iterator
@@ -42,7 +106,8 @@ are mocks; timer execution itself is not tested. Existing semaphore lifecycle
 29 cases and rebind 34 cases passed. Production session callback tests confirm
 event rebind follows all saved rollbacks and successful semaphore rebind, and
 propagates event refusal. Full sync_primitives.cpp and savestate.cpp syntax
-checks passed. Android build and device validation are pending.
+checks passed. Android runtime was subsequently checked by the device result
+above within its stated coverage.
 
 Device procedure: verify ordinary play, fresh Save, advance 5-10 seconds, Load,
 then Resume and play for 30 seconds. Repeat Load/Resume once if normal. Supply

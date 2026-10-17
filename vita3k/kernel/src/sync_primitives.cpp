@@ -162,6 +162,18 @@ inline static void unregister_simple_event_wait(WaitingThreadQueuePtr &queue,
     }
 }
 
+// A condition-variable invocation can outlive its original queue node.
+inline static void unregister_condvar_wait(WaitingThreadQueuePtr &queue,
+    const ThreadStatePtr &thread, const std::shared_ptr<CondvarWaitControl> &control) {
+    for (auto it = queue->begin(); it != queue->end(); ++it) {
+        const auto entry = *it;
+        if (entry.thread == thread && entry.condvar_wait_control == control) {
+            queue->erase(it);
+            return;
+        }
+    }
+}
+
 // *****************
 // * Simple events *
 // *****************
@@ -1313,6 +1325,7 @@ int condvar_wait(KernelState &kernel, MemState &mem, const char *export_name, Sc
 
     const ThreadStatePtr thread = kernel.get_thread(thread_id);
 
+    const auto control = std::make_shared<CondvarWaitControl>();
     std::unique_lock<std::mutex> condition_variable_lock(condvar->mutex);
 
     // After a savestate load, this call is being re-executed for a thread that
@@ -1328,18 +1341,35 @@ int condvar_wait(KernelState &kernel, MemState &mem, const char *export_name, Sc
     std::unique_lock<std::mutex> thread_lock(thread->mutex);
     thread->update_status(ThreadStatus::wait, ThreadStatus::run);
 
-    WaitingThreadData data;
+    WaitingThreadData data{};
     data.thread = thread;
     data.priority = thread->priority;
 
-    const auto data_it = condvar->waiting_threads->push(data);
+    data.condvar_wait_control = control;
+    data.snapshot_timeout_present = timeout ? 1 : 0;
+    data.snapshot_timeout_us = timeout ? *timeout : 0;
+    condvar->waiting_threads->push(data);
     thread_lock.unlock();
 
-    if (auto error = handle_timeout(kernel, thread, thread_lock, condition_variable_lock, condvar->waiting_threads, data_it, export_name, timeout))
-        return error;
+    const int wait_result = handle_timeout_with_unregister(kernel, thread, thread_lock, condition_variable_lock,
+        export_name, timeout, [&] { unregister_condvar_wait(condvar->waiting_threads, thread, control); });
+    // Once removed from the condition queue, this control can no longer be
+    // rebound. Copy its count while still holding the condition mutex.
+    const auto replacements = control->snapshot_rebind_count;
+    if (replacements) {
+        LOG_INFO("Savestate rebound condvar wait ended: uid {}, thread {}, replacements {}, timed {}, result {}; mutex reacquire pending {}",
+            condid, thread_id, replacements, timeout != nullptr, wait_result, wait_result == 0);
+    }
+    if (wait_result)
+        return wait_result; // Preserve existing timeout/abort return semantics.
 
     condition_variable_lock.unlock();
-    return mutex_lock_impl(kernel, mem, export_name, thread_id, 1, condvar->associated_mutex, weight, timeout, false);
+    const int result = mutex_lock_impl(kernel, mem, export_name, thread_id, 1, condvar->associated_mutex, weight, timeout, false);
+    if (replacements) {
+        LOG_INFO("Savestate rebound condvar call completed: uid {}, thread {}, replacements {}, mutex reacquire result {}; current invocation only, no saved continuation",
+            condid, thread_id, replacements, result);
+    }
+    return result;
 }
 
 int condvar_signal(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID condid, Condvar::SignalTarget signal_target, SyncWeight weight) {
