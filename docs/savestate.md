@@ -4,7 +4,60 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Live mutex queue rebind (latest checkpoint v27h, format v27 unchanged)
+## Live event-flag queue rebind (latest checkpoint v27i, format v27 unchanged)
+
+Event-flag waits now own a shared invocation/cancellation control instead of
+stack-local cancellation storage. Timeout/abort removes the exact thread and
+control from the current queue instead of retaining an iterator into old nodes.
+Preserve existing AND/OR conditions, clear modes, output bindings and final
+cancel/timeout return handling. Never serialize the shared control or output
+pointer, and do not reconstruct saved deadlines or host invocations.
+
+After all saved rollbacks and earlier current primitive rebinds, rebuild CURRENT
+event-flag queues with exact order, priorities, wait conditions, requested bits,
+output bindings, cancellation bindings and entry timeout metadata. Allocate and
+validate before swaps, restore original queue identities on verification failure,
+and veto Resume on rollback failure. Event bits are not modified by rebind.
+Earlier equivalent current rebinds can remain installed if this stage refuses.
+Marker: CPU-eventflag-rebind. Log `Savestate current event flag rebind` records
+queue/waiter counts; `Savestate rebound event flag wait completed` records actual
+post-rebind call return codes after cancellation handling, once per invocation.
+Zero event waiters do not establish completion/cancellation coverage on device.
+The previous mutex capture also had zero waiters; mutex device handoff coverage
+remains open and is not supplied by this checkpoint.
+
+Host checks: 40 production queue transaction cases cover owner/cancel validation,
+condition/bit/output binding corruption, order, rollback, exceptions and veto.
+34 production event-flag lifecycle cases use real host threads and cover AND/OR,
+both clear modes, FIFO/priority two-waiter ordering, three replacements before
+completion, cancel/output patterns, timeout/abort, null output, refusal/exception,
+poll/fast paths and exact-invocation cleanup. Kernel/thread surroundings remain
+mocks. Existing 309 semaphore/simple-event/condition/mutex cases, production
+session ordering/refusal checks and full sync_primitives.cpp/savestate.cpp syntax
+checks passed. Android build/device test are pending. Full game rewind remains
+unsupported; this checkpoint only retains equivalent CURRENT wait nodes.
+
+Device procedure: fresh Save, advance 5-10 seconds, Load and Resume for 30 seconds;
+repeat Load/Resume once if normal. Send the final post-Resume log and screenshot.
+Check waiter counts before interpreting completion coverage for each primitive.
+
+## Live mutex queue rebind (previous checkpoint v27h, format v27 unchanged)
+
+Device result 2026-10-18 15:33 (PCSG00219): user reports normal operation.
+Mutex rebind covered 96 queues with ZERO live waiters; verification MATCH,
+owners/counts unchanged. This establishes empty-queue replacement on device,
+not contended waiter replacement or ownership handoff. No rebound mutex
+completion record is expected for this capture. One rebind per primitive is
+present, so successive device rebinds remain unverified here.
+Other rebinds: 15 semaphore queues/three live waiters, four simple-event queues/
+one waiter, 42 condition queues/five waiters, all MATCH. Semaphore UID/thread
+170/171, 199/200 and 134/136 completed with result 0 at 15:33:43.219-43.227.
+The supplied log ends at 15:33:50.456 and contains no rebound simple-event or
+condition-call completion records; it does not establish their completion in
+this run. Missing completion alone does not demonstrate a failed wait.
+Joint GPU passed and all joint rollbacks MATCH. RAM compared 311733336 bytes
+and staged 15611636 bytes in 288 chunks; batch took 475 ms. Detailed log read
+2026-10-18. Full saved continuation and game rewind remain unsupported.
 
 Contended normal/lightweight mutex acquisition now owns a shared invocation
 identity. Timeout/abort removes the exact thread + identity from the current
@@ -41,8 +94,9 @@ mutex, mutex queue is rebound, then ownership is handed back and the full call
 completes. Kernel/thread/memory surroundings remain mocks; the lock/unlock
 functions in these four integrated cases are not mocks. Existing 217 condition,
 simple-event and semaphore cases and session ordering/refusal checks passed.
-Production sync_primitives.cpp/savestate.cpp syntax checks passed. Android build
-and device testing are pending. Full saved-state restoration remains unsupported.
+Production sync_primitives.cpp/savestate.cpp syntax checks passed. Android runtime
+was subsequently checked by the device result above within its stated coverage.
+Full saved-state restoration remains unsupported.
 
 Device procedure: ordinary play, fresh Save, advance 5-10 seconds, Load, Resume
 for 30 seconds; repeat Load/Resume once if normal. Send final post-Resume log
