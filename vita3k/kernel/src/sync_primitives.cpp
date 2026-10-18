@@ -185,6 +185,17 @@ inline static void unregister_mutex_wait(WaitingThreadQueuePtr &queue,
     }
 }
 
+inline static void unregister_eventflag_wait(WaitingThreadQueuePtr &queue,
+    const ThreadStatePtr &thread, const std::shared_ptr<EventFlagWaitControl> &control) {
+    for (auto it = queue->begin(); it != queue->end(); ++it) {
+        const auto entry = *it;
+        if (entry.thread == thread && entry.eventflag_wait_control == control) {
+            queue->erase(it);
+            return;
+        }
+    }
+}
+
 // *****************
 // * Simple events *
 // *****************
@@ -1581,31 +1592,38 @@ static int eventflag_waitorpoll(KernelState &kernel, const char *export_name, Sc
 
         return SCE_KERNEL_OK;
     } else if (dowait) {
+        const auto control = std::make_shared<EventFlagWaitControl>();
         std::unique_lock<std::mutex> thread_lock(thread->mutex);
         thread->update_status(ThreadStatus::wait, ThreadStatus::run);
 
-        WaitingThreadData data;
+        WaitingThreadData data{};
         data.thread = thread;
         data.wait = wait;
         data.flags = flags;
         data.outBits = outBits;
         data.priority = thread->priority;
 
-        bool was_canceled = false;
-        data.was_canceled = &was_canceled;
-
-        const auto data_it = event->waiting_threads->push(data);
+        data.eventflag_wait_control = control;
+        data.was_canceled = &control->canceled;
+        data.snapshot_timeout_present = timeout ? 1 : 0;
+        data.snapshot_timeout_us = timeout ? *timeout : 0;
+        event->waiting_threads->push(data);
         thread_lock.unlock();
 
-        int err = handle_timeout(kernel, thread, thread_lock, event_lock, event->waiting_threads, data_it, export_name, timeout);
+        int err = handle_timeout_with_unregister(kernel, thread, thread_lock, event_lock,
+            export_name, timeout, [&] { unregister_eventflag_wait(event->waiting_threads, thread, control); });
         if (err < 0 && outBits) {
             // set it only if a timeout occurs
             // otherwise set in eventflag_set
             *outBits = event->flags;
         }
-        if (was_canceled)
+        if (control->canceled)
             err = SCE_KERNEL_ERROR_WAIT_CANCEL;
 
+        if (control->snapshot_rebind_count) {
+            LOG_INFO("Savestate rebound event flag wait completed: uid {}, thread {}, replacements {}, timed {}, result {}; current invocation only, no saved continuation",
+                event_id, thread_id, control->snapshot_rebind_count, timeout != nullptr, err);
+        }
         return err;
     } else {
         return SCE_KERNEL_ERROR_EVF_COND;

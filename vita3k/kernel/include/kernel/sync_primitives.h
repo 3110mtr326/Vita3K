@@ -47,6 +47,12 @@ struct MutexWaitControl {
     uint32_t snapshot_rebind_count = 0;
 };
 
+// One live event-flag invocation; protected by the event-flag mutex.
+struct EventFlagWaitControl {
+    bool canceled = false;
+    uint32_t snapshot_rebind_count = 0;
+};
+
 struct WaitingThreadData {
     ThreadStatePtr thread;
     int32_t priority;
@@ -59,6 +65,7 @@ struct WaitingThreadData {
     std::shared_ptr<SimpleEventWaitControl> simple_event_wait_control;
     std::shared_ptr<CondvarWaitControl> condvar_wait_control;
     std::shared_ptr<MutexWaitControl> mutex_wait_control;
+    std::shared_ptr<EventFlagWaitControl> eventflag_wait_control;
 
     // additional fields for each primitive
     union {
