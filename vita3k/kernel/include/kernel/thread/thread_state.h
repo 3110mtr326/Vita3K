@@ -83,6 +83,8 @@ struct ThreadState {
     std::vector<CallbackPtr> callbacks;
     std::condition_variable status_cond;
     std::vector<std::shared_ptr<ThreadState>> waiting_threads;
+    // Current host wait diagnostic only; never serialized. Guarded by mutex.
+    uint32_t snapshot_thread_end_rebind_count = 0;
     uint32_t returned_value = 0;
 
     ThreadState() = delete;

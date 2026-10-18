@@ -856,6 +856,7 @@ static int wait_thread_end(KernelState &kernel, ThreadStatePtr &waiter, ThreadSt
             return 0;
         }
 
+        waiter->snapshot_thread_end_rebind_count = 0;
         waiter->update_status(ThreadStatus::wait);
         target->waiting_threads.push_back(waiter);
     }
@@ -868,8 +869,12 @@ static int wait_thread_end(KernelState &kernel, ThreadStatePtr &waiter, ThreadSt
         const std::unique_lock<std::mutex> thread_lock(target->mutex);
         auto &waiters = target->waiting_threads;
         waiters.erase(std::remove(waiters.begin(), waiters.end(), waiter), waiters.end());
+        if (waiter->snapshot_thread_end_rebind_count)
+            LOG_INFO("Savestate rebound thread-end wait aborted: target {}, thread {}, replacements {}; current invocation only", target->id, waiter->id, waiter->snapshot_thread_end_rebind_count);
         return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
     }
+    if (waiter->snapshot_thread_end_rebind_count)
+        LOG_INFO("Savestate rebound thread-end wait completed: target {}, thread {}, replacements {}, result 0; current invocation only, no saved continuation", target->id, waiter->id, waiter->snapshot_thread_end_rebind_count);
     return 0;
 }
 

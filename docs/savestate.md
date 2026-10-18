@@ -4,7 +4,40 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Live event-flag queue rebind (latest checkpoint v27i, format v27 unchanged)
+## Live thread-end queue rebind (latest checkpoint v27j, format v27 unchanged)
+
+Rebuild current thread-end waiter vectors only, after all saved-value rollbacks
+and earlier primitive rebinds. Validate target/waiter registry identities, order,
+waiting status, uniqueness, non-self waits, non-dormant targets and bounded size.
+Prepare all vectors before swaps; on verification failure restore original vector
+storage and contents. Persistent restore veto on failed rollback. All thread and
+kernel mutexes must remain held. Never change statuses or notify waiters here.
+Existing wait_thread_end cleanup and raise_waiting_threads access the current
+vector afresh; neither keeps an iterator across the blocked host invocation.
+A per-invocation diagnostic counter, reset at registration and guarded by the
+waiter mutex, logs completion/abort after retained current-vector replacement.
+This counter is not serialized. Existing timeout/output behavior is unchanged.
+Saved host continuations, saved deadlines and full rewind remain unsupported.
+
+Host validation: 18 production transaction/lifecycle cases (rollback, exceptions,
+invalid identities/status, duplicate/self waits, saturation, empty queues; real
+host waits with three replacements followed by actual production notification
+or abort cleanup, dormant target fast path). Kernel/thread surroundings mocked.
+Production session callback order/refusal test passed. Native syntax checks of
+savestate.cpp, SceThreadmgr.cpp and thread.cpp passed. Android/device pending.
+Marker CPU-thread-end-rebind; log Savestate current thread-end rebind and
+Savestate rebound thread-end wait completed/aborted. Zero waiters provide no
+blocked-wait completion coverage. No synthetic guest wait is injected.
+
+Previous v27i device result, 2026-10-18 21:50-21:51, PCSG00219: normal operation
+reported. Event flags ZERO queues/ZERO waiters; this does not validate event-flag
+wait replacement. Mutex 96 queues/ZERO waiters. Semaphore 15 queues/5 waiters,
+simple event 4/1, condition 42/5; all MATCH. All five semaphore calls, one simple
+event call, and five condition calls including mutex reacquire completed with
+result 0. All joint rollbacks MATCH, joint-live-gpu-roundtrip-passed. One rebind
+per primitive in supplied log. Full saved continuation remains unverified.
+
+## Live event-flag queue rebind (previous checkpoint v27i, format v27 unchanged)
 
 Event-flag waits now own a shared invocation/cancellation control instead of
 stack-local cancellation storage. Timeout/abort removes the exact thread and
