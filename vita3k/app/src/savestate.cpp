@@ -153,7 +153,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 27; // v27: semaphore wait requirements and queue position
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 28; // v28: read/write-lock and timer wait targets
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -475,6 +475,7 @@ struct ThreadRecord {
 // import identity alone do not reconstruct host wait stacks or timeout state.
 static std::string audit_saved_wait_targets(KernelState &kernel,const std::vector<ThreadRecord> &records) {
     size_t changed_targets=0,changed_imports=0;
+    size_t registered=0,unregistered=0,multiple=0,nonwaiting_registered=0;
     for (const auto &record:records) {
         const auto it=kernel.threads.find(record.id);
         if (it==kernel.threads.end() || !it->second) return "Wait audit thread missing";
@@ -482,6 +483,17 @@ static std::string audit_saved_wait_targets(KernelState &kernel,const std::vecto
         if (!current || !valid_snapshot_wait_targets(record.wait_targets)) return "Invalid or oversized wait registry audit";
         const uint32_t nid=it->second->status==ThreadStatus::wait
             ? it->second->active_import_nid.load(std::memory_order_acquire) : 0;
+        const auto coverage = app::classify_snapshot_wait_coverage(it->second->status==ThreadStatus::wait, *current);
+        switch (coverage) {
+        case app::SnapshotWaitCoverage::Registered: ++registered; break;
+        case app::SnapshotWaitCoverage::Unregistered:
+            ++unregistered;
+            LOG_INFO("Savestate unmapped current wait: thread {}, NID 0x{:08X}; host continuation not identified", record.id, nid);
+            break;
+        case app::SnapshotWaitCoverage::Multiple: ++multiple; break;
+        case app::SnapshotWaitCoverage::NonWaitingRegistered: ++nonwaiting_registered; break;
+        case app::SnapshotWaitCoverage::NotWaiting: break;
+        }
         changed_targets += *current!=record.wait_targets;
         changed_imports += nid!=record.wait_nid;
         if (record.wait_nid || nid || record.wait_targets.count || current->count) {
@@ -492,6 +504,8 @@ static std::string audit_saved_wait_targets(KernelState &kernel,const std::vecto
                 LOG_INFO("Savestate current wait target: thread {}, kind {}, UID {}",record.id,current->targets[i].kind,current->targets[i].uid);
         }
     }
+    LOG_INFO("Savestate current wait coverage: {} uniquely registered, {} unmapped, {} multiple targets, {} non-waiting with targets; 10 registry kinds inspected; observation only, saved continuation unverified.",
+        registered, unregistered, multiple, nonwaiting_registered);
     LOG_INFO("Savestate wait target summary: {} threads, {} changed target sets, {} changed import identities; registry membership only, host wait continuation unverified.",records.size(),changed_targets,changed_imports);
     return {};
 }
@@ -2273,7 +2287,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-rwlock-rebind/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-wait-coverage/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }

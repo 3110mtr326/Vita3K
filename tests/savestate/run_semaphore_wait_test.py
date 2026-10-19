@@ -34,7 +34,7 @@ struct Entry {
 struct Object { uint32_t attr = 0; std::unique_ptr<ThreadDataQueue<Entry>> waiting_threads; };
 struct KernelState {
     std::map<int, std::shared_ptr<Object>> semaphores, mutexes, lwmutexes,
-        eventflags, condvars, lwcondvars, simple_events;
+        eventflags, condvars, lwcondvars, simple_events, rwlocks, timers;
     std::map<int, ThreadStatePtr> threads;
 };
 struct ThreadRecord { int id; SnapshotWaitTargets wait_targets; SnapshotSemaphoreWait semaphore_wait; };

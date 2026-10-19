@@ -4,7 +4,41 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Live read/write-lock queue rebind (latest checkpoint v27k, format v27 unchanged)
+## Wait registry coverage (latest checkpoint v28, format v28)
+
+Saved/current wait target records now include read/write locks (kind 9) and
+timers (kind 10). Previously these queues were absent from the registry audit.
+The fixed 132-byte target record remains unchanged in size, but the valid kind
+range changes; bump format version to 28 to reject old captures explicitly.
+Create a fresh Save State. This does not change ordinary in-game save files.
+Registry validation retains bounds, positive UIDs, canonical ordering and null
+object checks. A registry entry does not establish a resumable host continuation.
+
+Load logs classify current thread observations as uniquely registered waits,
+unmapped waits, multiple targets, or non-waiting threads with targets. Unmapped
+waits log thread ID and active import NID. These are diagnostics, not automatic
+errors or authorization for retained restoration. No saved call is replayed.
+Timer queue rebuilding and saved timer deadline restoration are NOT implemented.
+Existing current-node rebinds continue after the joint rollback. Marker:
+CPU-wait-coverage. Summary: Savestate current wait coverage. Full rewind remains
+unsupported even when every current wait has a unique registered target.
+
+Tests: production 10-registry collector/audit and five coverage classifications;
+malformed kind/UID/order/count/padding and null registries; existing semaphore
+collector using actual FIFO/priority queues; production session callback test.
+Production Load header gate accepts v28, rejects v27/future versions before body,
+rejects bad magic and every header truncation. Native sync_primitives.cpp and
+savestate.cpp syntax checks passed. Android/device pending.
+
+Previous v27k device result 2026-10-19 23:24: user reports normal operation.
+Joint GPU passed; all rollbacks MATCH. RW locks 0 queues/0 waiters, event flags
+0/0, mutex 96/0, thread-end 23/0: no contended coverage for those paths. Semaphore
+15/2, simple event 4/2, condition 42/5 rebinds MATCH. One timed simple event
+UID157/thread159 returned WAIT_TIMEOUT immediately after rebind, before Resume;
+this code alone cannot distinguish timeout from abort. Supplied log ends at
+23:24:15.515 and does not establish post-Resume completions for other waiters.
+
+## Live read/write-lock queue rebind (previous checkpoint v27k, format v27 unchanged)
 
 Contended rwlock_lock now owns a shared host invocation control. Timeout/abort
 cleanup searches by thread plus control, instead of retaining an iterator into

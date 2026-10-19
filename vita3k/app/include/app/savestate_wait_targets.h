@@ -11,7 +11,8 @@ namespace app {
 // and deadlines are deliberately not serialized or reconstructed here.
 struct SnapshotWaitTarget {
     uint32_t kind = 0; // 1 sema, 2 mutex, 3 lwmutex, 4 eventflag,
-                       // 5 condvar, 6 lwcondvar, 7 simple event, 8 thread end
+                       // 5 condvar, 6 lwcondvar, 7 simple event, 8 thread end,
+                       // 9 read/write lock, 10 timer (format v28)
     int32_t uid = 0;
     bool operator==(const SnapshotWaitTarget &) const = default;
 };
@@ -26,7 +27,7 @@ inline bool valid_snapshot_wait_targets(const SnapshotWaitTargets &v) {
     for (size_t i=0;i<v.targets.size();++i) {
         const auto &t=v.targets[i];
         if (i>=v.count) {if (t.kind || t.uid) return false;continue;}
-        if (!t.kind || t.kind>8 || t.uid<=0) return false;
+        if (!t.kind || t.kind>10 || t.uid<=0) return false;
         if (i && (v.targets[i-1].kind>t.kind
             || (v.targets[i-1].kind==t.kind && v.targets[i-1].uid>=t.uid))) return false;
     }
@@ -58,10 +59,19 @@ std::optional<SnapshotWaitTargets> collect_snapshot_wait_targets(Kernel &kernel,
         if (std::find(target->waiting_threads.begin(),target->waiting_threads.end(),thread)!=target->waiting_threads.end())
             if (!add(8,uid)) return std::nullopt;
     }
+    if (!scan(kernel.rwlocks,9) || !scan(kernel.timers,10)) return std::nullopt;
     std::sort(result.targets.begin(),result.targets.begin()+result.count,[](const auto &a,const auto &b) {
         return a.kind<b.kind || (a.kind==b.kind && a.uid<b.uid);
     });
     if (!valid_snapshot_wait_targets(result)) return std::nullopt;
     return result;
+}
+// Classification of observations only. Even a unique registered target does
+// not establish that a saved host call/deadline can be resumed.
+enum class SnapshotWaitCoverage { NotWaiting, Registered, Unregistered, Multiple, NonWaitingRegistered };
+inline SnapshotWaitCoverage classify_snapshot_wait_coverage(bool waiting, const SnapshotWaitTargets &targets) {
+    if (!waiting) return targets.count ? SnapshotWaitCoverage::NonWaitingRegistered : SnapshotWaitCoverage::NotWaiting;
+    if (!targets.count) return SnapshotWaitCoverage::Unregistered;
+    return targets.count == 1 ? SnapshotWaitCoverage::Registered : SnapshotWaitCoverage::Multiple;
 }
 } // namespace app
