@@ -162,6 +162,17 @@ inline static void unregister_simple_event_wait(WaitingThreadQueuePtr &queue,
     }
 }
 
+inline static void unregister_rwlock_wait(WaitingThreadQueuePtr &queue,
+    const ThreadStatePtr &thread, const std::shared_ptr<RWLockWaitControl> &control) {
+    for (auto it = queue->begin(); it != queue->end(); ++it) {
+        const auto entry = *it;
+        if (entry.thread == thread && entry.rwlock_wait_control == control) {
+            queue->erase(it);
+            return;
+        }
+    }
+}
+
 // A condition-variable invocation can outlive its original queue node.
 inline static void unregister_condvar_wait(WaitingThreadQueuePtr &queue,
     const ThreadStatePtr &thread, const std::shared_ptr<CondvarWaitControl> &control) {
@@ -978,18 +989,27 @@ SceInt32 rwlock_lock(KernelState &kernel, MemState &mem, const char *export_name
     } else {
         // we need to wait
 
+        const auto control = std::make_shared<RWLockWaitControl>();
         std::unique_lock<std::mutex> thread_lock(thread->mutex);
         thread->update_status(ThreadStatus::wait, ThreadStatus::run);
 
-        WaitingThreadData data;
+        WaitingThreadData data{};
         data.thread = thread;
         data.is_write = is_write;
         data.priority = thread->priority;
 
-        const auto data_it = rwlock->waiting_threads->push(data);
+        data.rwlock_wait_control = control;
+        data.snapshot_timeout_present = timeout ? 1 : 0;
+        data.snapshot_timeout_us = timeout ? *timeout : 0;
+        rwlock->waiting_threads->push(data);
         thread_lock.unlock();
 
-        return handle_timeout(kernel, thread, thread_lock, rwlock_lock, rwlock->waiting_threads, data_it, export_name, timeout);
+        const auto result = handle_timeout_with_unregister(kernel, thread, thread_lock, rwlock_lock,
+            export_name, timeout, [&] { unregister_rwlock_wait(rwlock->waiting_threads, thread, control); });
+        if (control->snapshot_rebind_count)
+            LOG_INFO("Savestate rebound rwlock wait completed: uid {}, thread {}, replacements {}, write {}, timed {}, result {}; current invocation only, no saved continuation",
+                lock_id, thread_id, control->snapshot_rebind_count, is_write, timeout != nullptr, result);
+        return result;
     }
 }
 

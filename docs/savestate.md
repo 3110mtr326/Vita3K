@@ -4,7 +4,41 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Live thread-end queue rebind (latest checkpoint v27j, format v27 unchanged)
+## Live read/write-lock queue rebind (latest checkpoint v27k, format v27 unchanged)
+
+Contended rwlock_lock now owns a shared host invocation control. Timeout/abort
+cleanup searches by thread plus control, instead of retaining an iterator into
+old queue nodes. Allocate control before changing thread status. Fast acquisition,
+recursive rules, read/write grant policy and unlock ownership remain unchanged.
+Records entry timeout metadata; never reconstructs remaining host deadlines.
+
+After all saved-value rollbacks and earlier current queue rebinds, rebuild only
+CURRENT rwlock queues. Preserve FIFO/priority order, thread/control identity,
+read/write requirement and timeout metadata. Allocate before swapping; restore
+original queue identities on verification failure, veto Resume if rollback fails.
+Caller holds kernel, primitive and thread locks throughout. Owners, recursion
+counts and lock state are not changed. No saved waits are resumed or retained.
+Marker CPU-rwlock-rebind. Logs Savestate current rwlock rebind and
+Savestate rebound rwlock wait completed (including result, write and timed).
+Zero queues/waiters do not establish contended device coverage. Full game rewind
+and saved host continuation remain unsupported.
+
+Host checks: 40 production queue transaction cases; 20 actual rwlock_lock/unlock
+lifecycle cases using real host threads (FIFO/priority, read/write acquisition,
+three replacements, timed/untimed handoff, timeout, abort, refused rebind).
+Kernel/thread surroundings mocked. Existing event-flag 34, mutex 46 and thread-end
+18 cases passed. Production session callback ordering/refusal passed; native
+sync_primitives.cpp and savestate.cpp syntax checks passed. Android/device pending.
+
+Previous v27j device result, 2026-10-19 00:40, PCSG00219: normal operation reported.
+Thread-end rebind: 23 queues, ZERO waiters, MATCH (empty-vector coverage only).
+Mutex 96/0 and event flags 0/0 remain unverified for contended device operation.
+Semaphore 15/5, simple event 4/1, condition 42/5 all MATCH; all five semaphore,
+one simple-event and five condition calls completed successfully, including
+condition mutex reacquire. Joint GPU passed; all rollbacks MATCH. One rebind per
+primitive in supplied log; no repeated device rebind coverage in this capture.
+
+## Live thread-end queue rebind (previous checkpoint v27j, format v27 unchanged)
 
 Rebuild current thread-end waiter vectors only, after all saved-value rollbacks
 and earlier primitive rebinds. Validate target/waiter registry identities, order,
