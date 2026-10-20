@@ -100,6 +100,7 @@
 #include <app/savestate_cpu_probe.h>
 #include <app/savestate_wait_audit.h>
 #include <app/savestate_wait_targets.h>
+#include <app/savestate_delay_wait.h>
 #include <app/savestate_semaphore_wait.h>
 #include <app/savestate_semaphore_queue.h>
 #include <app/savestate_semaphore_rebind.h>
@@ -153,7 +154,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 28; // v28: read/write-lock and timer wait targets
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 29; // v29: delay invocation and remaining host duration
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -469,13 +470,14 @@ struct ThreadRecord {
     uint32_t wait_nid;
     SnapshotWaitTargets wait_targets;
     SnapshotSemaphoreWait semaphore_wait;
+    SnapshotDelayWait delay_wait;
 };
 
 // Read-only comparison before any temporary CPU/RAM mutation. Membership and
 // import identity alone do not reconstruct host wait stacks or timeout state.
 static std::string audit_saved_wait_targets(KernelState &kernel,const std::vector<ThreadRecord> &records) {
     size_t changed_targets=0,changed_imports=0;
-    size_t registered=0,unregistered=0,multiple=0,nonwaiting_registered=0;
+    size_t registered=0,unregistered=0,multiple=0,nonwaiting_registered=0,self_delays=0;
     for (const auto &record:records) {
         const auto it=kernel.threads.find(record.id);
         if (it==kernel.threads.end() || !it->second) return "Wait audit thread missing";
@@ -483,10 +485,24 @@ static std::string audit_saved_wait_targets(KernelState &kernel,const std::vecto
         if (!current || !valid_snapshot_wait_targets(record.wait_targets)) return "Invalid or oversized wait registry audit";
         const uint32_t nid=it->second->status==ThreadStatus::wait
             ? it->second->active_import_nid.load(std::memory_order_acquire) : 0;
+        const auto delay = capture_delay_wait(it->second->delay_wait);
+        if (!valid_snapshot_delay_wait(record.delay_wait) || !valid_snapshot_delay_wait(delay))
+            return "Invalid delay wait audit";
+        if (record.delay_wait.active || delay.active) {
+            LOG_INFO("Savestate delay audit: thread {}; saved active {}, requested {} us, remaining {} us; current active {}, requested {} us, remaining {} us; host durations only, no deadline restored",
+                record.id, record.delay_wait.active, record.delay_wait.requested_us, record.delay_wait.remaining_us,
+                delay.active, delay.requested_us, delay.remaining_us);
+            if (delay.active && it->second->delay_wait.observations != UINT32_MAX)
+                ++it->second->delay_wait.observations;
+        }
         const auto coverage = app::classify_snapshot_wait_coverage(it->second->status==ThreadStatus::wait, *current);
         switch (coverage) {
         case app::SnapshotWaitCoverage::Registered: ++registered; break;
         case app::SnapshotWaitCoverage::Unregistered:
+            if (delay.active) {
+                ++self_delays;
+                break;
+            }
             ++unregistered;
             LOG_INFO("Savestate unmapped current wait: thread {}, NID 0x{:08X}; host continuation not identified", record.id, nid);
             break;
@@ -504,8 +520,8 @@ static std::string audit_saved_wait_targets(KernelState &kernel,const std::vecto
                 LOG_INFO("Savestate current wait target: thread {}, kind {}, UID {}",record.id,current->targets[i].kind,current->targets[i].uid);
         }
     }
-    LOG_INFO("Savestate current wait coverage: {} uniquely registered, {} unmapped, {} multiple targets, {} non-waiting with targets; 10 registry kinds inspected; observation only, saved continuation unverified.",
-        registered, unregistered, multiple, nonwaiting_registered);
+    LOG_INFO("Savestate current wait coverage: {} uniquely registered, {} self delays, {} unmapped, {} multiple targets, {} non-waiting with targets; 10 registry kinds inspected; observation only, saved continuation unverified.",
+        registered, self_delays, unregistered, multiple, nonwaiting_registered);
     LOG_INFO("Savestate wait target summary: {} threads, {} changed target sets, {} changed import identities; registry membership only, host wait continuation unverified.",records.size(),changed_targets,changed_imports);
     return {};
 }
@@ -2065,6 +2081,11 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 return SaveStateResult::ErrorThreadNotSafe;
             }
             rec.semaphore_wait = *semaphore_wait;
+            rec.delay_wait = capture_delay_wait(thread->delay_wait);
+            if (!valid_snapshot_delay_wait(rec.delay_wait)) {
+                if (out_detail) *out_detail = "Invalid current delay wait";
+                return SaveStateResult::ErrorThreadNotSafe;
+            }
             thread_records.push_back(rec);
         }
 
@@ -2287,7 +2308,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-wait-coverage/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-delay-audit/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
@@ -2438,6 +2459,8 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             || (status != ThreadStatus::wait && status != ThreadStatus::suspend && status != ThreadStatus::dormant)
             || rec.resume_status > static_cast<uint8_t>(ThreadStatus::wait)
             || rec.in_condvar > 1
+            || !valid_snapshot_delay_wait(rec.delay_wait)
+            || (rec.delay_wait.active && status != ThreadStatus::wait)
             || !valid_snapshot_wait_targets(rec.wait_targets)
             || !valid_snapshot_semaphore_wait(rec.semaphore_wait, rec.wait_targets)
             || (status != ThreadStatus::wait && rec.wait_nid != 0)

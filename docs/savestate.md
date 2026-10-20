@@ -4,7 +4,48 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Wait registry coverage (latest checkpoint v28, format v28)
+## Delay invocation audit (latest checkpoint v29, format v29)
+
+delay_thread tracks active/requested duration and a steady-clock deadline under
+the thread mutex. The same deadline is used by wait_until; observations do not
+restart/extend the wait. Metadata clears on completion/early wake/exception.
+Callback variants use the existing post-callback delay helper; callbacks are
+not replayed and requested_us describes the helper's remaining delay argument.
+Existing zero-delay rejection and return behavior are unchanged.
+
+ThreadRecord adds a 16-byte SnapshotDelayWait: active/requested_us/remaining_us/
+reserved. Store bounded remaining duration only, never absolute host clock data.
+Expired-but-parked invocations remain active with zero remaining. Reject invalid
+flags/reserved/durations and active records outside wait status. Format v29
+rejects previous state files; create a fresh Save State. Ordinary game saves are
+unchanged. No saved deadline is applied, no wait is restarted and no rewind is
+enabled. Same-NID waits are not assumed to be the same saved host invocation.
+
+Load compares saved/current delay metadata and marks observed current calls.
+Their return log distinguishes deadline elapsed from early return (not its cause).
+Coverage lists self delays separately from queue-registered and unmapped waits.
+Marker CPU-delay-audit. Logs Savestate delay audit, Savestate current wait
+coverage and Savestate observed delay completed. A successful duration audit
+does not establish saved continuation correctness.
+
+Tests run the production delay helper with real host threads: expiry while mutex
+is held, early abort, unchanged deadline, metadata cleanup and zero rejection.
+Duration boundaries include zero remaining, clock-before-start clamp and UINT32_MAX;
+invalid active/reserved/duration records rejected. Production wait audit tests
+cover saved/current differences, observation saturation and invalid records.
+Production format gate rejects old/future/truncated headers; session callback
+tests and native savestate.cpp/SceThreadmgr.cpp/thread.cpp checks passed.
+Android build and device verification are pending.
+
+Previous v28 device result 2026-10-20 23:23, PCSG00219: normal operation reported.
+11 uniquely registered waits, one unmapped thread145/NID0x4B675D05, identified in
+the source NID table as sceKernelDelayThread. No multiple/nonwaiting registrations.
+All joint rollbacks MATCH; semaphore five, simple event one and condition five
+calls completed with result0 including condition mutex reacquire. Other rebinds
+had zero waiters (mutex96, thread-end23, event flags0, rwlocks0 queues). Supplied
+log runs through23:23:40; one replacement per invocation. Full rewind unsupported.
+
+## Wait registry coverage (previous checkpoint v28, format v28)
 
 Saved/current wait target records now include read/write locks (kind 9) and
 timers (kind 10). Previously these queues were absent from the registry audit.

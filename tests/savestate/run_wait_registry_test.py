@@ -6,6 +6,8 @@ s=Path(__file__).resolve().parents[2];src=(s/'vita3k/app/src/savestate.cpp').rea
 a=src.index('static std::string audit_saved_wait_targets(');b=src.index('// Called only with the snapshot guard',a)
 code=r'''
 #include <app/savestate_wait_targets.h>
+#include <app/savestate_delay_wait.h>
+using app::capture_delay_wait;
 #include <atomic>
 #include <cassert>
 #include <iostream>
@@ -16,12 +18,12 @@ template<class...T>void log_ignore(T&&...){}
 #define LOG_INFO(...) log_ignore(__VA_ARGS__)
 using app::collect_snapshot_wait_targets;
 enum class ThreadStatus{run,wait,suspend};
-struct Thread{int id;std::atomic<uint32_t> active_import_nid{0};ThreadStatus status=ThreadStatus::wait;std::vector<std::shared_ptr<Thread>> waiting_threads;};
+struct Thread{DelayWaitState delay_wait;int id;std::atomic<uint32_t> active_import_nid{0};ThreadStatus status=ThreadStatus::wait;std::vector<std::shared_ptr<Thread>> waiting_threads;};
 using ThreadPtr=std::shared_ptr<Thread>;
 struct Queue{std::vector<ThreadPtr> values;auto find(const ThreadPtr&t){return std::find(values.begin(),values.end(),t);}auto end(){return values.end();}};
 struct Obj{std::unique_ptr<Queue> waiting_threads;};
 struct KernelState{std::map<int,std::shared_ptr<Obj>> semaphores,mutexes,lwmutexes,eventflags,condvars,lwcondvars,simple_events,rwlocks,timers;std::map<int,ThreadPtr>threads;};
-struct ThreadRecord{int id=1;uint32_t wait_nid=0;app::SnapshotWaitTargets wait_targets{};};
+struct ThreadRecord{int id=1;uint32_t wait_nid=0;app::SnapshotWaitTargets wait_targets{};app::SnapshotDelayWait delay_wait{};};
 METHOD
 int main(){
  KernelState k;auto t=std::make_shared<Thread>();t->id=1;k.threads[1]=t;
@@ -49,6 +51,16 @@ int main(){
  t->status=ThreadStatus::wait;t->active_import_nid=0x1234;
  for(auto *m:{&k.semaphores,&k.mutexes,&k.lwmutexes,&k.eventflags,&k.condvars,&k.lwcondvars,&k.simple_events,&k.rwlocks,&k.timers})m->clear();
  target->waiting_threads.clear();assert(audit_saved_wait_targets(k,{saved}).empty());
+ t->delay_wait={true,100,0,std::chrono::steady_clock::now()+std::chrono::microseconds(100)};
+ saved.delay_wait={1,200,100,0};
+ assert(audit_saved_wait_targets(k,{saved}).empty());
+ assert(t->delay_wait.observations==1);
+ t->delay_wait.observations=UINT32_MAX;
+ assert(audit_saved_wait_targets(k,{saved}).empty());
+ assert(t->delay_wait.observations==UINT32_MAX);
+ auto bad_delay=saved;bad_delay.delay_wait.remaining_us=201;
+ assert(!audit_saved_wait_targets(k,{bad_delay}).empty());
+ t->delay_wait={};saved.delay_wait={};
  auto bad=*got;bad.count=17;assert(!app::valid_snapshot_wait_targets(bad));assert(!audit_saved_wait_targets(k,{{1,0,bad}}).empty());
  bad=*got;bad.targets[15]={1,1};assert(!app::valid_snapshot_wait_targets(bad));
  bad=*got;bad.targets[1]=bad.targets[0];assert(!app::valid_snapshot_wait_targets(bad));

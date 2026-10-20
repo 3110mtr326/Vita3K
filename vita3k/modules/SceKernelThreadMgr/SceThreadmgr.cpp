@@ -1080,11 +1080,21 @@ static int delay_thread(KernelState &kernel, SceUID thread_id, SceUInt delay_us)
 
     const ThreadStatePtr thread = kernel.get_thread(thread_id);
     std::unique_lock<std::mutex> lock(thread->mutex);
+    auto &delay = thread->delay_wait;
+    delay.active = true;
+    delay.requested_us = delay_us;
+    delay.observations = 0;
+    delay.deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(delay_us);
+    // Clear metadata on every exit, including an exception from the host wait.
+    struct ClearDelay { DelayWaitState &value; ~ClearDelay() { value = {}; } } clear{delay};
     thread->update_status(ThreadStatus::wait);
-    thread->status_cond.wait_for(lock, std::chrono::microseconds(delay_us),
+    thread->status_cond.wait_until(lock, delay.deadline,
         [&] { return thread->should_stop_waiting(); });
     if (thread->status != ThreadStatus::run)
         thread->update_status(ThreadStatus::run);
+    if (delay.observations)
+        LOG_INFO("Savestate observed delay completed: thread {}, requested {} us, observations {}, deadline elapsed {}; current invocation only, no saved delay restored",
+            thread_id, delay.requested_us, delay.observations, std::chrono::steady_clock::now() >= delay.deadline);
     return SCE_KERNEL_OK;
 }
 

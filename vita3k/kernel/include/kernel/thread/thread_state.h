@@ -20,6 +20,7 @@
 #include <cpu/state.h>
 #include <kernel/callback.h>
 #include <kernel/types.h>
+#include <kernel/thread/delay_wait.h>
 #include <mem/block.h>
 #include <mem/ptr.h>
 
@@ -85,6 +86,7 @@ struct ThreadState {
     std::vector<std::shared_ptr<ThreadState>> waiting_threads;
     // Current host wait diagnostic only; never serialized. Guarded by mutex.
     uint32_t snapshot_thread_end_rebind_count = 0;
+    DelayWaitState delay_wait;
     uint32_t returned_value = 0;
 
     ThreadState() = delete;
