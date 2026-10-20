@@ -20,10 +20,10 @@ enum class SaveStateResult{ErrorMismatch,Success};
 int main(){
  std::ostringstream out;out.write(SAVESTATE_MAGIC,8);write_pod(out,SAVESTATE_FORMAT_VERSION);write_string(out,"PCSG00219");write_pod(out,uint64_t{3});
  auto bytes=out.str();std::istringstream good(bytes);assert(check(good)==SaveStateResult::Success);
- for(uint32_t version:{0u,27u,28u,30u,0xffffffffu}){auto bad=bytes;bad.replace(8,4,reinterpret_cast<const char*>(&version),4);std::istringstream in(bad);assert(check(in)==SaveStateResult::ErrorMismatch);assert(in.tellg()==12);}
+ for(uint32_t version:{0u,28u,29u,31u,0xffffffffu}){auto bad=bytes;bad.replace(8,4,reinterpret_cast<const char*>(&version),4);std::istringstream in(bad);assert(check(in)==SaveStateResult::ErrorMismatch);assert(in.tellg()==12);}
  for(size_t n=0;n<bytes.size();++n){std::istringstream in(bytes.substr(0,n));assert(check(in)==SaveStateResult::ErrorMismatch);}
  auto bad=bytes;bad[0]='X';std::istringstream magic(bad);assert(check(magic)==SaveStateResult::ErrorMismatch);
- std::cout<<"PASS production format gate: v29 accepted, old/future versions rejected before body, all header truncations rejected\\n";
+ std::cout<<"PASS production format gate: v30 accepted, old/future versions rejected before body, all header truncations rejected\\n";
 }
 '''
 with tempfile.TemporaryDirectory() as d:

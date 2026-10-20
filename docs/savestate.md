@@ -4,7 +4,43 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Delay invocation audit (latest checkpoint v29, format v29)
+## Delay identity comparison (latest checkpoint v30, format v30)
+
+Each invocation of delay_thread now obtains a process-scoped identifier before
+blocking. A randomly generated 128-bit process-session token plus atomic 64-bit
+call sequence distinguishes repeated waits, different threads and process
+restarts. Sequence exhaustion or entropy initialization failure yields unknown
+identity without changing guest wait behavior. This is diagnostic identity, not
+a security boundary or permission to apply saved state.
+
+SnapshotDelayWait expands from 16 to 40 bytes, adding session_hi/session_lo/call.
+Version 30 rejects older snapshots before loading sections; create a fresh Save.
+Inactive records must have zero identity. Active records may be all-zero unknown,
+but partial identities are invalid. Comparison differentiates inactive, started
+after save, saved call ended, unknown, different session, different invocation,
+inconsistent request duration, and same invocation. Different remaining durations
+are allowed for the same invocation. No absolute deadline is serialized/applied.
+No callbacks or guest wait calls are replayed, and no game rewind is enabled.
+
+Marker CPU-delay-identity; log Savestate delay identity includes thread ID, saved
+and current call IDs and relation. A same-invocation result alone does not prove
+that restoring saved CPU/RAM/GPU together with this host stack is safe. Calls
+already ended cannot be revived by matching an import NID or requested duration.
+
+Host tests: 15 comparison cases, exact binary roundtrip, 4000 concurrent unique
+identifier allocations; existing actual delay expiry/abort/cleanup and duration
+validation; production registry audit, format gate and session callback tests.
+Native savestate.cpp and SceThreadmgr.cpp syntax checks passed. Android/device
+build and execution are pending.
+
+Previous v29 device result 2026-10-21 01:33, PCSG00219: normal operation reported.
+12 uniquely registered waits, ZERO self delays/unmapped/multiple/nonwaiting
+registrations. Thus active delay capture/completion remains unverified on device.
+All joint rollbacks MATCH. Six semaphore calls, one simple event and five condition
+calls (including mutex reacquire) completed successfully. Mutex/thread-end/event
+flag/rwlock paths had no live waiters. One replacement per invocation observed.
+
+## Delay invocation audit (previous checkpoint v29, format v29)
 
 delay_thread tracks active/requested duration and a steady-clock deadline under
 the thread mutex. The same deadline is used by wait_until; observations do not

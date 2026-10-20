@@ -26,7 +26,7 @@ int main(){
  using namespace app;using Clock=std::chrono::steady_clock;
  auto now=Clock::now();DelayWaitState v;assert(capture_delay_wait(v,now)==SnapshotDelayWait{});
  for(uint32_t request:{1u,100u,0xffffffffu}){
-  v={true,request,0,now+std::chrono::microseconds(request)};
+  v={{},true,request,0,now+std::chrono::microseconds(request)};
   assert(capture_delay_wait(v,now).remaining_us==request);
   assert(capture_delay_wait(v,v.deadline).remaining_us==0);
   assert(capture_delay_wait(v,v.deadline+std::chrono::microseconds(1)).remaining_us==0);

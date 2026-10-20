@@ -51,7 +51,7 @@ int main(){
  t->status=ThreadStatus::wait;t->active_import_nid=0x1234;
  for(auto *m:{&k.semaphores,&k.mutexes,&k.lwmutexes,&k.eventflags,&k.condvars,&k.lwcondvars,&k.simple_events,&k.rwlocks,&k.timers})m->clear();
  target->waiting_threads.clear();assert(audit_saved_wait_targets(k,{saved}).empty());
- t->delay_wait={true,100,0,std::chrono::steady_clock::now()+std::chrono::microseconds(100)};
+ t->delay_wait={{},true,100,0,std::chrono::steady_clock::now()+std::chrono::microseconds(100)};
  saved.delay_wait={1,200,100,0};
  assert(audit_saved_wait_targets(k,{saved}).empty());
  assert(t->delay_wait.observations==1);

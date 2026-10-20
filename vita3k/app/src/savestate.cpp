@@ -154,7 +154,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 29; // v29: delay invocation and remaining host duration
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 30; // v30: process-scoped delay invocation identity
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -489,6 +489,8 @@ static std::string audit_saved_wait_targets(KernelState &kernel,const std::vecto
         if (!valid_snapshot_delay_wait(record.delay_wait) || !valid_snapshot_delay_wait(delay))
             return "Invalid delay wait audit";
         if (record.delay_wait.active || delay.active) {
+            LOG_INFO("Savestate delay identity: thread {}, saved call {}, current call {}, relation {}; comparison only, no saved continuation restored",
+                record.id, record.delay_wait.invocation, delay.invocation, compare_delay_identity(record.delay_wait, delay));
             LOG_INFO("Savestate delay audit: thread {}; saved active {}, requested {} us, remaining {} us; current active {}, requested {} us, remaining {} us; host durations only, no deadline restored",
                 record.id, record.delay_wait.active, record.delay_wait.requested_us, record.delay_wait.remaining_us,
                 delay.active, delay.requested_us, delay.remaining_us);
@@ -2308,7 +2310,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-delay-audit/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-delay-identity/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }

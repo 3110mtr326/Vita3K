@@ -1081,6 +1081,7 @@ static int delay_thread(KernelState &kernel, SceUID thread_id, SceUInt delay_us)
     const ThreadStatePtr thread = kernel.get_thread(thread_id);
     std::unique_lock<std::mutex> lock(thread->mutex);
     auto &delay = thread->delay_wait;
+    delay.identity = next_delay_wait_identity();
     delay.active = true;
     delay.requested_us = delay_us;
     delay.observations = 0;
