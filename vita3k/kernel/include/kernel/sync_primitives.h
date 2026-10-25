@@ -19,6 +19,7 @@
 
 #include <kernel/thread/thread_data_queue.h>
 #include <kernel/types.h>
+#include <kernel/thread/wait_deadline.h>
 #include <util/byte_ring_buffer.h>
 
 struct KernelState;
@@ -26,6 +27,7 @@ struct KernelState;
 // One host semaphore wait invocation. Shared ownership keeps cancellation
 // storage alive when queue nodes are rebuilt; never serialized as a pointer.
 struct SemaphoreWaitControl {
+    WaitDeadline snapshot_deadline; // Protected by the semaphore mutex.
     // Immutable after publication; identifies this host invocation only.
     uint64_t session_hi = 0, session_lo = 0, invocation = 0;
     bool canceled = false; // Protected by the semaphore mutex.

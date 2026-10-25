@@ -13,6 +13,7 @@ cancel=src[src.index('int semaphore_cancel('):src.index('// ********************
 header=(root/'vita3k/kernel/include/kernel/sync_primitives.h').read_text()
 entry=header[header.index('struct SemaphoreWaitControl'):header.index('// NOTE: uid')]
 code=r'''
+#include <kernel/thread/wait_deadline.h>
 #include <kernel/thread/thread_data_queue.h>
 #include <kernel/thread/wait_invocation_identity.h>
 #include <cassert>
@@ -149,6 +150,55 @@ int main(){
    assert(ready);assert(semaphore_signal(k,"identity",1,1,1)==0);worker.join();assert(rc==0);
    app::SnapshotSemaphoreWait ended;assert(std::string(app::compare_semaphore_identity(first,targets,ended,{}))=="saved-call-ended");
   }++cases;
+ }
+
+ // Capture the production deadline, rebuild repeatedly, and hold the primitive
+ // lock past expiry as the snapshot guard can. Expired-but-queued is distinct
+ // from an untimed wait. A notification must not extend the original deadline.
+ for(bool priority:{false,true}){
+  KernelState k;auto sema=std::make_shared<Semaphore>();sema->attr=priority?SCE_KERNEL_ATTR_TH_PRIO:0;sema->waiting_threads=queue(priority);k.semaphores[1]=sema;
+  auto thread=std::make_shared<ThreadState>();k.threads[1]=thread;
+  app::SnapshotWaitTargets targets{};targets.count=1;targets.targets[0]={1,1};
+  uint32_t budget=150000;int rc=999;
+  std::thread worker([&]{rc=semaphore_wait(k,"deadline",1,1,1,&budget);});
+  bool ready=false;
+  for(int n=0;n<2000&&!ready;++n){
+   {std::unique_lock lock(sema->mutex);if(!sema->waiting_threads->empty()){
+    auto control=(*sema->waiting_threads->begin()).semaphore_wait_control;
+    assert(control->snapshot_deadline.known);
+    const auto end=control->snapshot_deadline.end;
+    auto saved=app::collect_snapshot_semaphore_wait(k,thread,targets);
+    assert(saved&&saved->deadline_known&&saved->remaining_us<=150000);
+    {std::lock_guard tl(thread->mutex);assert(app::rebind_current_semaphore_queues(k).error.empty());}
+    thread->status_cond.notify_all();
+    assert(control->snapshot_deadline.end==end);
+    std::this_thread::sleep_until(end+std::chrono::milliseconds(10));
+    auto expired=app::collect_snapshot_semaphore_wait(k,thread,targets);
+    assert(expired&&expired->deadline_known&&expired->remaining_us==0&&expired->timeout_present);
+    assert(std::string(app::compare_semaphore_identity(*saved,targets,*expired,targets))=="same-invocation");
+    ready=true;
+   }}if(!ready)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  assert(ready);worker.join();assert(rc==SCE_KERNEL_ERROR_WAIT_TIMEOUT&&budget==0&&sema->waiting_threads->empty());++cases;
+ }
+ // Clock boundaries and untrusted serialized data, without wall-clock sleeps.
+ {
+  WaitDeadline d;const auto now=std::chrono::steady_clock::time_point{};
+  assert(d.remaining_us(100,now)==0);d.known=true;
+  d.end=now+std::chrono::microseconds(100);
+  assert(d.remaining_us(100,now)==100&&d.remaining_us(50,now)==50);
+  assert(d.remaining_us(100,now+std::chrono::microseconds(40))==60);
+  assert(d.remaining_us(100,d.end)==0&&d.remaining_us(100,d.end+std::chrono::seconds(1))==0);
+  assert(d.remaining_us(100,d.end-std::chrono::nanoseconds(1))==0);
+  app::SnapshotWaitTargets t{};t.count=1;t.targets[0]={1,1};
+  app::SnapshotSemaphoreWait v{1,1,0,0,1,0,1,100};v.deadline_known=1;v.remaining_us=60;
+  assert(app::valid_snapshot_semaphore_wait(v,t));
+  auto bad=v;bad.remaining_us=101;assert(!app::valid_snapshot_semaphore_wait(bad,t));
+  bad=v;bad.deadline_known=2;assert(!app::valid_snapshot_semaphore_wait(bad,t));
+  bad=v;bad.deadline_known=0;assert(!app::valid_snapshot_semaphore_wait(bad,t));
+  bad=v;bad.timeout_present=0;bad.timeout_us=bad.remaining_us=0;assert(!app::valid_snapshot_semaphore_wait(bad,t));
+  bad=v;bad.remaining_us=0;assert(app::valid_snapshot_semaphore_wait(bad,t));
+  bad.deadline_known=0;assert(app::valid_snapshot_semaphore_wait(bad,t));++cases;
  }
  KernelState k;auto s=std::make_shared<Semaphore>();s->val=3;s->waiting_threads=queue(false);k.semaphores[1]=s;k.threads[1]=std::make_shared<ThreadState>();
  assert(semaphore_wait(k,"fast",1,1,1,nullptr)==0&&s->val==2&&s->waiting_threads->empty());++cases;

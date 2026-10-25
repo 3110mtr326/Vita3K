@@ -89,7 +89,7 @@ int main(){
 with tempfile.TemporaryDirectory() as d:
  tmp=Path(d);stub=tmp/'kernel/thread/thread_state.h';stub.parent.mkdir(parents=True)
  stub.write_text('#pragma once\n#include <memory>\nenum class ThreadStatus{run,wait};\nstruct ThreadState{ThreadStatus status=ThreadStatus::wait;};\nusing ThreadStatePtr=std::shared_ptr<ThreadState>;\n')
- (tmp/'kernel/sync_primitives.h').write_text('#pragma once\n#include <kernel/thread/thread_data_queue.h>\n#include <cstdint>\n#define SCE_KERNEL_ATTR_TH_PRIO 0x2000U\nusing SceSize=uint32_t;\n'+entry)
+ (tmp/'kernel/sync_primitives.h').write_text('#pragma once\n#include <kernel/thread/wait_deadline.h>\n#include <kernel/thread/thread_data_queue.h>\n#include <cstdint>\n#define SCE_KERNEL_ATTR_TH_PRIO 0x2000U\nusing SceSize=uint32_t;\n'+entry)
  f=tmp/'test.cpp';f.write_text(code);exe=tmp/'test.exe'
  subprocess.run([args.compiler,'-std=c++20','-Wall','-Wextra','-Werror','-I',str(tmp),
   '-I',str(root/'vita3k/kernel/include'),'-I',str(root/'vita3k/app/include'),str(f),'-o',str(exe)],check=True,timeout=60)

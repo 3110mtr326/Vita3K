@@ -12,6 +12,7 @@ source = (root / 'vita3k/app/src/savestate.cpp').read_text()
 a = source.index('static std::string audit_saved_semaphore_waits(')
 b = source.index('// Called only with the snapshot guard', a)
 code = r'''
+#include <kernel/thread/wait_deadline.h>
 #include <app/savestate_semaphore_wait.h>
 #include <kernel/thread/thread_data_queue.h>
 #include <cassert>
@@ -22,7 +23,7 @@ code = r'''
 using namespace app;
 template<class... T> void ignore(T&&...) {}
 #define LOG_INFO(...) ignore(__VA_ARGS__)
-struct Control {uint64_t session_hi=1,session_lo=2,invocation=3;};
+struct Control {WaitDeadline snapshot_deadline;uint64_t session_hi=1,session_lo=2,invocation=3;};
 struct Entry {
     ThreadStatePtr thread;
     int priority = 0, signal = 0;

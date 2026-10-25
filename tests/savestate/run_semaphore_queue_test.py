@@ -107,6 +107,8 @@ with tempfile.TemporaryDirectory() as d:
     production_header=(root/'vita3k/kernel/include/kernel/sync_primitives.h').read_text()
     production_entry=production_header[production_header.index('struct SemaphoreWaitControl'):production_header.index('// NOTE: uid')]
     (tmp/'kernel/sync_primitives.h').write_text('''#pragma once
+#include <kernel/thread/wait_deadline.h>
+#include <kernel/thread/wait_deadline.h>
 #include <kernel/thread/thread_data_queue.h>
 #include <cstdint>
 #define SCE_KERNEL_ATTR_TH_PRIO 0x2000U

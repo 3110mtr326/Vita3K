@@ -4,7 +4,51 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Semaphore invocation identity (latest checkpoint v32, format v32)
+## Semaphore timeout duration (latest checkpoint v33, format v33)
+
+Timed semaphore calls now publish the exact steady-clock deadline used by their
+host wait in the existing shared control. The helper uses wait_until for this
+path; other primitive waits retain wait_for. Zero-budget, signal, cancellation,
+abort and guest timeout writeback behavior are retained. Publication and reads
+are protected by the semaphore mutex. Live queue replacement preserves the same
+control and deadline; spurious notifications do not restart the budget.
+
+SnapshotSemaphoreWait adds deadline_known and remaining_us (64 bytes total).
+Only a bounded relative duration is serialized, never a host time point. Capture
+occurs when the collector runs under the snapshot guard, not at initial pause
+entry. Durations are floored to microseconds and clamped to the input budget.
+An expired-but-queued timed wait has known=1, remaining=0; an untimed wait has
+timed=0, known=0, remaining=0. Unknown timed deadlines are representable with
+known=0, remaining=0 and must not be interpreted as safe to replay.
+The validator rejects inconsistent flags and remaining durations above budget.
+Invocation comparison deliberately permits remaining time to decrease.
+
+The exact version gate is 33, rejecting v32 and other formats before sections.
+Marker CPU-semaphore-deadline. Saved/current remaining durations appear in
+Savestate semaphore deadline log lines. The existing saved-state probe still
+rolls everything back; saved deadlines are NOT applied to current host waits.
+Full graphics/audio restoration, saved wait reconstruction and game rewind
+remain unimplemented. This supplies required timeout data for future replay.
+
+Host validation: 34 production semaphore lifecycle cases, including FIFO/priority
+expiry while holding the snapshot lock, deadline preservation through rebind,
+spurious notification, and exact zero/unknown/bounded duration validation;
+22 identity comparisons and binary roundtrip, 4000 concurrent IDs, collector,
+42 saved queue transactions, 34 live queue transactions and format gate checks.
+Regression suites passed for simple-event, condition, mutex, event-flag, rwlock
+and timer owners and rebinds. Host lifecycle tests use real wait threads with
+mock kernel surroundings. Native syntax checks passed for sync_primitives.cpp
+and savestate.cpp. Android build and v33 device behavior remain unverified.
+
+v32 device evidence (2026-10-26 00:27, PCSG00219): user reported normal behavior.
+Four saved semaphore invocations differed from current calls; two current calls
+started after save. All joint rollbacks MATCH, 12 uniquely registered waits,
+all 6 semaphore, 1 simple-event and 5 condition waits completed with result 0
+(condition mutex reacquire also 0). No same-invocation sample or active delay/
+timer device coverage. Evidence details: work/v32_device_result_2026-10-26.txt
+in the development workspace, not included as a repository dependency.
+
+## Semaphore invocation identity (previous checkpoint v32, format v32)
 
 Blocked semaphore calls now record process-session and per-call identity in their
 existing shared SemaphoreWaitControl before publication. The generator is shared

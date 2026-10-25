@@ -16,14 +16,17 @@ struct SnapshotSemaphoreWait {
     uint32_t timeout_present = 0;
     uint32_t timeout_us = 0;
     uint64_t session_hi = 0, session_lo = 0, invocation = 0;
+    uint32_t deadline_known = 0, remaining_us = 0;
     bool operator==(const SnapshotSemaphoreWait &) const = default;
 };
-static_assert(sizeof(SnapshotSemaphoreWait) == 56);
+static_assert(sizeof(SnapshotSemaphoreWait) == 64);
 
 inline bool valid_snapshot_semaphore_wait(const SnapshotSemaphoreWait &v,
     const SnapshotWaitTargets &targets) {
     if (!valid_snapshot_wait_targets(targets)) return false;
     if (bool(v.session_hi || v.session_lo) != bool(v.invocation)) return false;
+    if (v.deadline_known > 1 || v.remaining_us > v.timeout_us
+        || (!v.deadline_known && v.remaining_us) || (!v.timeout_present && v.deadline_known)) return false;
     uint32_t count = 0;
     int32_t uid = 0;
     for (uint32_t i = 0; i < targets.count; ++i) {
@@ -65,6 +68,11 @@ std::optional<SnapshotSemaphoreWait> collect_snapshot_semaphore_wait(
                 result.session_hi = entry.semaphore_wait_control->session_hi;
                 result.session_lo = entry.semaphore_wait_control->session_lo;
                 result.invocation = entry.semaphore_wait_control->invocation;
+                const auto &deadline = entry.semaphore_wait_control->snapshot_deadline;
+                if (entry.snapshot_timeout_present && deadline.known) {
+                    result.deadline_known = 1;
+                    result.remaining_us = deadline.remaining_us(entry.snapshot_timeout_us);
+                }
             }
         }
         if (matches != 1 || position != queue.size()) return std::nullopt;

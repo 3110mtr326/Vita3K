@@ -12,6 +12,7 @@ event_code=src[src.index('SceInt32 rwlock_lock('):src.index('SceInt32 rwlock_del
 header=(root/'vita3k/kernel/include/kernel/sync_primitives.h').read_text()
 entry=header[header.index('struct SemaphoreWaitControl'):header.index('// NOTE: uid')]
 code=r'''
+#include <kernel/thread/wait_deadline.h>
 #include <kernel/thread/thread_data_queue.h>
 #include <cassert>
 #include <chrono>

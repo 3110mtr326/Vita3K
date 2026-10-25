@@ -84,7 +84,7 @@ inline static int find_condvar(CondvarPtr &condvar_out, CondvarPtrs **condvars_o
 template <class Unregister>
 inline static int handle_timeout_with_unregister(KernelState &kernel, const ThreadStatePtr &thread, std::unique_lock<std::mutex> &thread_lock,
     std::unique_lock<std::mutex> &primitive_lock, const char *export_name,
-    SceUInt *const timeout, Unregister unregister) {
+    SceUInt *const timeout, Unregister unregister, WaitDeadline *deadline = nullptr) {
     // A wait can also end because a savestate load asked this thread to abort
     // (thread->abort_wait). In that case the thread is still `wait` and still
     // queued, so it is handled exactly like a timeout: unregister and fail.
@@ -105,8 +105,16 @@ inline static int handle_timeout_with_unregister(KernelState &kernel, const Thre
     if (timeout) {
         bool status = false;
         auto start = std::chrono::steady_clock::now();
+        if (deadline) {
+            deadline->end = start + std::chrono::microseconds{ *timeout };
+            deadline->known = true;
+        }
         if (*timeout > 0) {
-            status = thread->status_cond.wait_for(primitive_lock, std::chrono::microseconds{ *timeout }, should_wake);
+            // Semaphore snapshots observe the exact deadline used by this wait.
+            // Replacing queue nodes never restarts or extends this deadline.
+            status = deadline
+                ? thread->status_cond.wait_until(primitive_lock, deadline->end, should_wake)
+                : thread->status_cond.wait_for(primitive_lock, std::chrono::microseconds{ *timeout }, should_wake);
         }
 
         if (!status || thread->status != ThreadStatus::run)
@@ -1242,7 +1250,7 @@ SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thr
         thread_lock.unlock();
 
         auto res = handle_timeout_with_unregister(kernel, thread, thread_lock, semaphore_lock,
-            export_name, pTimeout, [&] { unregister_semaphore_wait(semaphore->waiting_threads, thread, control); });
+            export_name, pTimeout, [&] { unregister_semaphore_wait(semaphore->waiting_threads, thread, control); }, &control->snapshot_deadline);
         if (control->canceled)
             res = SCE_KERNEL_ERROR_WAIT_CANCEL;
         // The semaphore mutex is still held. Report once per original blocked

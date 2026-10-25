@@ -155,7 +155,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 32; // v30: process-scoped delay invocation identity
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 33; // v30: process-scoped delay invocation identity
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -547,6 +547,9 @@ static std::string audit_saved_semaphore_waits(KernelState &kernel, const std::v
         timed_saved += saved.timeout_present;
         timed_current += current->timeout_present;
         if (saved.uid || current->uid) {
+            LOG_INFO("Savestate semaphore deadline: thread {}; saved timed {}, known {}, remaining {} us; current timed {}, known {}, remaining {} us; remaining duration captured, no saved deadline restored",
+                record.id, saved.timeout_present, saved.deadline_known, saved.remaining_us,
+                current->timeout_present, current->deadline_known, current->remaining_us);
             LOG_INFO("Savestate semaphore identity: thread {}, saved call {}, current call {}, relation {}; observation only, no saved continuation restored",
                 record.id, saved.invocation, current->invocation,
                 compare_semaphore_identity(saved, record.wait_targets, *current, *targets));
@@ -2314,7 +2317,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-semaphore-identity/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-semaphore-deadline/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
