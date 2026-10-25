@@ -4,7 +4,53 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Delay identity comparison (latest checkpoint v30, format v30)
+## Current timer queue rebind (latest checkpoint v31, format v30 unchanged)
+
+Timer waits now own a shared invocation control. Cleanup searches the current
+queue by thread plus control, instead of retaining an iterator into retired
+nodes or unconditionally popping the head. Entries are value-initialized and
+record output bindings, pattern and the input timeout budget. The existing
+unsupported guest timeout behavior is unchanged: the budget is still ignored.
+
+The previous wait predicate was true immediately for the head waiter, spinning
+while holding the timer mutex before its deadline. The new loop checks event
+readiness AND head ownership, then sleeps releasing the mutex. Notifications
+re-evaluate scheduling changes, without a predicate swallowing timer_set/start.
+Sleeps are bounded at 100ms to observe aborts on the separate thread condition.
+Thread status is accessed under the thread mutex in this loop. Expired uint64
+deadlines are not subtracted into enormous waits; stopped/sentinel deadlines
+sleep in bounded intervals. Repeating zero intervals are guarded against
+division by zero. Latched events do not advance a still-future deadline.
+
+After all saved-value probes roll back and earlier current queue replacements,
+replace CURRENT timer queues, retaining call controls, FIFO/priority order,
+patterns, output pointers and input budgets. Prepare all queues before swapping;
+verify and restore original queue objects on failure; persistent veto on failed
+rollback. Timer fields/deadlines and saved registrations are not restored. Caller
+holds kernel, timer and thread mutexes. Marker CPU-timer-rebind. Completion and
+cancellation logs use Savestate rebound timer wait. Zero live timer waiters do
+not establish device coverage of timer continuation.
+
+Validation: 40 production queue transaction cases; 23 production timer lifecycle
+cases with real host threads and mocked surrounding kernel, including repeated
+replacement, cancellation, abort, deadline expiry, no-spin/mutex availability,
+reschedule, pulse, repeat, two-waiter FIFO/priority/autoreset/broadcast, poll, stop,
+and zero interval. Existing simple-event 28 and rwlock 20 cases passed. Production
+session callback ordering/refusal (including timer refusal) passed. Native syntax
+checks of sync_primitives.cpp and savestate.cpp passed. Android build/device test
+pending. Snapshot disk format remains 30; fresh Save recommended for this test.
+
+v30 device evidence 2026-10-25, PCSG00219: user reports normal operation.
+All joint rollbacks MATCH. Eight uniquely registered waits, ZERO self delays,
+unmapped/multiple/nonwaiting registrations. No active delay identity observations.
+Four saved semaphore waiters were no longer waiting at load (135-138, UID134).
+Current semaphore 15 queues/2 waiters, simple event 4/1, condition 42/5; other
+rebound primitive waiters zero. Both semaphore completions returned 0 at
+21:44:36; no other rebound completions in the supplied log. Gameplay continued
+around 29-30fps through 21:45:00; log ends 21:45:01.971. Full saved wait continuation
+and game rewind remain unsupported; matching temporary values is not completion.
+
+## Delay identity comparison (previous checkpoint v30, format v30)
 
 Each invocation of delay_thread now obtains a process-scoped identifier before
 blocking. A randomly generated 128-bit process-session token plus atomic 64-bit

@@ -51,7 +51,7 @@ bool host_scope=false;
 template<class E,class F>std::string probe_saved_file_positions(E&,int,F f){host_scope=true;bool ok=f([]{return true;});host_scope=false;return ok?"":"files failed";}
 int ngs_mode=0;
 bool queue_active=false;
-int rwlock_rebind_calls=0;int thread_end_rebind_calls=0;
+int timer_rebind_calls=0;int rwlock_rebind_calls=0;int thread_end_rebind_calls=0;
 int rebind_calls=0,event_rebind_calls=0,condvar_rebind_calls=0,mutex_rebind_calls=0,eventflag_rebind_calls=0;
 struct RebindResult {std::string error;int queues=1,waiters=1;};
 RebindResult rebind_current_semaphore_queues(Kernel&){assert(!host_scope&&!queue_active);++rebind_calls;return {ngs_mode==21?"rebind refused":""};}
@@ -61,6 +61,7 @@ RebindResult rebind_current_mutex_queues(Kernel&){assert(!host_scope&&!queue_act
 RebindResult rebind_current_eventflag_queues(Kernel&){assert(!host_scope&&!queue_active&&mutex_rebind_calls==1);++eventflag_rebind_calls;return {ngs_mode==25?"event flag rebind refused":""};}
 RebindResult rebind_current_thread_end_queues(Kernel&){assert(!host_scope&&!queue_active&&eventflag_rebind_calls==1);++thread_end_rebind_calls;return {ngs_mode==26?"thread-end refused":""};}
 RebindResult rebind_current_rwlock_queues(Kernel&){assert(!host_scope&&!queue_active&&thread_end_rebind_calls==1);++rwlock_rebind_calls;return {ngs_mode==27?"rwlock refused":""};}
+RebindResult rebind_current_timer_queues(Kernel&){assert(!host_scope&&!queue_active&&rwlock_rebind_calls==1);++timer_rebind_calls;return {ngs_mode==28?"timer refused":""};}
 struct QueueResult {std::string error;int queues=1,saved_waiters=1,current_waiters=1,changed_queues=1;};
 template<class F>QueueResult probe_snapshot_semaphore_queues(Kernel&,const std::vector<Thread>&,F f){
  if(ngs_mode==19)return {"queue refused"};
@@ -71,7 +72,7 @@ struct NgsVoiceRecord{};struct NgsPcmRecord{};
 template<class E,class F>std::string snapshot_ngs_voices(E&,std::vector<NgsVoiceRecord>&,const std::vector<NgsVoiceRecord>*,F f,bool held,std::vector<NgsPcmRecord>*,const std::vector<NgsPcmRecord>*){assert(held&&queue_active);if(ngs_mode==16)return "NGS refused";bool ok=f();return ok&&ngs_mode!=17?"":"NGS failed";}
 std::string validate(int mode){
  ngs_mode=mode;
- rwlock_rebind_calls=0;thread_end_rebind_calls=0;rebind_calls=0;event_rebind_calls=0;condvar_rebind_calls=0;mutex_rebind_calls=0;eventflag_rebind_calls=0;
+ timer_rebind_calls=0;rwlock_rebind_calls=0;thread_end_rebind_calls=0;rebind_calls=0;event_rebind_calls=0;condvar_rebind_calls=0;mutex_rebind_calls=0;eventflag_rebind_calls=0;
  reject_semaphore=mode==18;
  std::vector<NgsVoiceRecord> saved_ngs_records;std::vector<NgsPcmRecord>saved_ngs_pcm;
  int saved_io_files=0;
@@ -102,7 +103,7 @@ int main(){
    std::istringstream in(bad);assert(parse(in,true)==SaveStateResult::ErrorMismatch);
  }
  std::istringstream huge("x");assert(!skip_savestate_bytes(huge,0xffffffffu));
- for(int mode=0;mode<28;++mode){assert(validate(mode).empty()==(mode==0));assert(!queue_active&&!host_scope);assert(rwlock_rebind_calls==((mode==0||mode==27)?1:0));assert(thread_end_rebind_calls==((mode==0||mode==26||mode==27)?1:0));assert(eventflag_rebind_calls==((mode==0||mode==25||mode==26||mode==27)?1:0));assert(mutex_rebind_calls==((mode==0||mode==24||mode==25||mode==26||mode==27)?1:0));assert(condvar_rebind_calls==((mode==0||mode==23||mode==24||mode==25||mode==26||mode==27)?1:0));assert(event_rebind_calls==((mode==0||mode==22||mode==23||mode==24||mode==25||mode==26||mode==27)?1:0));assert(rebind_calls==((mode==0||mode==21||mode==22||mode==23||mode==24||mode==25||mode==26||mode==27)?1:0));}
+ for(int mode=0;mode<29;++mode){assert(validate(mode).empty()==(mode==0));assert(!queue_active&&!host_scope);assert(timer_rebind_calls==((mode==0||mode==28)?1:0));assert(rwlock_rebind_calls==((mode==0||mode==27||mode==28)?1:0));assert(thread_end_rebind_calls==((mode==0||mode==26||mode==27||mode==28)?1:0));assert(eventflag_rebind_calls==((mode==0||mode==25||mode==26||mode==27||mode==28)?1:0));assert(mutex_rebind_calls==((mode==0||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(condvar_rebind_calls==((mode==0||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(event_rebind_calls==((mode==0||mode==22||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(rebind_calls==((mode==0||mode==21||mode==22||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));}
  std::cout<<"PASS: RAM indexing, 15 session mismatch, 2 NGS failure, semaphore audit refusal, 2 queue failure cases; saved queues enclose NGS/GPU; live rebind only after complete rollback, refusal propagated\n";
 }
 '''.replace('RAM\n',ram).replace(' CHECK\n',check)
@@ -110,3 +111,4 @@ with tempfile.TemporaryDirectory() as d:
  f=Path(d)/'test.cpp';f.write_text(code);exe=Path(d)/'test.exe'
  subprocess.run([args.compiler,'-std=c++23','-Wall','-Wextra','-Werror','-Wno-misleading-indentation','-I',str(s/'vita3k/app/include'),str(f),'-o',str(exe)],check=True)
  subprocess.run([str(exe)],check=True)
+

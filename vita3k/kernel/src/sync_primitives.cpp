@@ -162,6 +162,17 @@ inline static void unregister_simple_event_wait(WaitingThreadQueuePtr &queue,
     }
 }
 
+inline static void unregister_timer_wait(WaitingThreadQueuePtr &queue,
+    const ThreadStatePtr &thread, const std::shared_ptr<TimerWaitControl> &control) {
+    for (auto it = queue->begin(); it != queue->end(); ++it) {
+        const auto entry = *it;
+        if (entry.thread == thread && entry.timer_wait_control == control) {
+            queue->erase(it);
+            return;
+        }
+    }
+}
+
 inline static void unregister_rwlock_wait(WaitingThreadQueuePtr &queue,
     const ThreadStatePtr &thread, const std::shared_ptr<RWLockWaitControl> &control) {
     for (auto it = queue->begin(); it != queue->end(); ++it) {
@@ -529,7 +540,7 @@ SceInt32 timer_waitorpoll(KernelState &kernel, const char *export_name, SceUID t
 
     uint64_t current_time = get_current_time();
     auto set_next_event = [&]() {
-        if (timer->is_repeat) {
+        if (timer->is_repeat && timer->event_interval != 0) {
             // the event repeats every timer->event_interval, go to the next one after current_time
             timer->next_event += ((current_time - timer->next_event - 1) / timer->event_interval + 1) * timer->event_interval;
         } else {
@@ -553,41 +564,76 @@ SceInt32 timer_waitorpoll(KernelState &kernel, const char *export_name, SceUID t
 
         return SCE_KERNEL_OK;
     } else if (is_wait) {
-        thread->update_status(ThreadStatus::wait, ThreadStatus::run);
-
-        WaitingThreadData data;
+        const auto control = std::make_shared<TimerWaitControl>();
+        WaitingThreadData data{};
         data.thread = thread;
         data.result_pattern = result_pattern;
         data.user_data = user_data;
+        data.pattern = bit_pattern;
         data.priority = thread->priority;
+        data.timer_wait_control = control;
+        data.snapshot_timeout_present = timeout ? 1 : 0;
+        data.snapshot_timeout_us = timeout ? *timeout : 0;
+        timer->waiting_threads->push(data);
+        {
+            const std::lock_guard thread_lock(thread->mutex);
+            thread->update_status(ThreadStatus::wait, ThreadStatus::run);
+        }
 
-        const auto data_it = timer->waiting_threads->push(data);
-
-        bool got_event = false;
-        while (!got_event) {
-            uint64_t wait_time = timer->next_event - current_time;
-            // wait before we got an event and we are the first thread in the waiting list
-            timer->condvar.wait_for(lock, std::chrono::microseconds(wait_time), [&] {
-                return thread->status == ThreadStatus::run
-                    || (*timer->waiting_threads->begin()).thread->id == thread_id;
-            });
-            if (thread->status == ThreadStatus::run) {
-                timer->waiting_threads->erase(data_it);
+        for (;;) {
+            bool should_stop;
+            {
+                const std::lock_guard thread_lock(thread->mutex);
+                should_stop = thread->should_stop_waiting();
+            }
+            if (should_stop) {
+                unregister_timer_wait(timer->waiting_threads, thread, control);
+                {
+                    const std::lock_guard thread_lock(thread->mutex);
+                    if (thread->status == ThreadStatus::wait)
+                        thread->update_status(ThreadStatus::run, ThreadStatus::wait);
+                }
                 timer->condvar.notify_all();
+                if (control->snapshot_rebind_count)
+                    LOG_INFO("Savestate rebound timer wait canceled: uid {}, thread {}, replacements {}; current invocation only",
+                        event_id, thread_id, control->snapshot_rebind_count);
                 return SCE_KERNEL_ERROR_WAIT_CANCEL;
             }
             current_time = get_current_time();
-            got_event = timer->event_set || current_time > timer->next_event;
+            // Look up the current head on every wake: snapshot replacement
+            // retires old nodes, but retains this call's control object.
+            const bool at_head = !timer->waiting_threads->empty()
+                && (*timer->waiting_threads->begin()).thread == thread
+                && (*timer->waiting_threads->begin()).timer_wait_control == control;
+            if (at_head && (timer->event_set || current_time > timer->next_event))
+                break;
+            // Do not use head membership as a wake predicate: it is already
+            // true for the first waiter and would spin while holding the mutex.
+            // Notifications must also re-evaluate timer_set/start changes.
+            // Bound sleeping to observe aborts delivered through status_cond.
+            uint64_t wait_us = 100000;
+            if (at_head && timer->next_event > current_time)
+                wait_us = std::min(wait_us, timer->next_event - current_time);
+            else if (at_head && timer->next_event == current_time)
+                wait_us = 1;
+            timer->condvar.wait_for(lock, std::chrono::microseconds(wait_us));
         }
 
-        timer->waiting_threads->pop();
-        thread->update_status(ThreadStatus::run, ThreadStatus::wait);
+        unregister_timer_wait(timer->waiting_threads, thread, control);
+        {
+            const std::lock_guard thread_lock(thread->mutex);
+            thread->update_status(ThreadStatus::run, ThreadStatus::wait);
+        }
 
         timer->event_set = !timer->is_pulse && !(timer->attr & SCE_KERNEL_EVENT_ATTR_AUTO_RESET);
-        set_next_event();
+        if (current_time > timer->next_event)
+            set_next_event();
         // notify the other waiting threads
         timer->condvar.notify_all();
 
+        if (control->snapshot_rebind_count)
+            LOG_INFO("Savestate rebound timer wait completed: uid {}, thread {}, replacements {}; current invocation only, no saved continuation",
+                event_id, thread_id, control->snapshot_rebind_count);
         return SCE_KERNEL_OK;
     } else {
         return SCE_KERNEL_ERROR_EVENT_COND;

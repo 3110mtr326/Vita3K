@@ -110,6 +110,7 @@
 #include <app/savestate_eventflag_rebind.h>
 #include <app/savestate_thread_end_rebind.h>
 #include <app/savestate_rwlock_rebind.h>
+#include <app/savestate_timer_rebind.h>
 #include <app/savestate_value_probe.h>
 #include <app/savestate_ram_audit.h>
 #include <app/savestate_ram_probe.h>
@@ -2310,7 +2311,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-delay-identity/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-timer-rebind/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
@@ -2590,6 +2591,10 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             if (!rwlocks_rebound.error.empty()) return rwlocks_rebound.error;
             LOG_INFO("Savestate current rwlock rebind: {} queues, {} live waiters; order/read-write requirements/invocation ownership MATCH; current nodes retained; owners and lock state unchanged; no saved waits committed.",
                 rwlocks_rebound.queues, rwlocks_rebound.waiters);
+            const auto timers_rebound = rebind_current_timer_queues(kernel);
+            if (!timers_rebound.error.empty()) return timers_rebound.error;
+            LOG_INFO("Savestate current timer rebind: {} queues, {} live waiters; order/output bindings/invocation ownership MATCH; current nodes retained, timer deadlines unchanged; no saved waits committed.",
+                timers_rebound.queues, timers_rebound.waiters);
             return {};
         }); // Unconditional return: no retained RAM changes, wait aborts or replay.
     }
