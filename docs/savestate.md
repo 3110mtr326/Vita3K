@@ -4,7 +4,51 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Semaphore timeout duration (latest checkpoint v33, format v33)
+## Semaphore re-entry CPU preparation (latest checkpoint v34, format v33)
+
+The new prepare_semaphore_entry helper constructs an inert CPU candidate from
+saved semaphore arguments and CPU registers. It supports the public/private
+plain-wait NIDs (SceLibKernel forwarding and SceThreadmgr share r0/r1/r2 ABI).
+It rejects CB variants to avoid executing callbacks twice, unsupported imports,
+multiple wait targets, argument mismatches, nonpositive counts, malformed PC,
+SP/LR and timeout addresses, unknown/expired timed durations, and inaccessible
+or mismatched current import stubs. Stub words must be ARM svc0, mov pc,lr and
+the matching NID. PC alone is rewound by four bytes in a copy; all other CPU
+registers, floating-point bits and flags are retained. No host address is stored.
+
+Timed candidates carry the guest timeout address and saved remaining duration,
+but are deferred: no guest pointer write or timed CPU application is implemented.
+Expired waits require a separate completion decision, not a fresh full budget.
+Candidate address/alignment checks do not establish executable/writable mappings
+or saved-memory consistency. The reader observes CURRENT paused stub memory.
+
+Under KernelSnapshotGuard, untimed candidates are temporarily installed through
+the existing CPU transaction helper, read back and rolled back before proceeding
+to the existing joint probe. No instruction executes, no native wait is unwound,
+no queue is modified by this new probe. A rollback failure persistently blocks
+Resume. Empty/all-deferred candidate sets skip CPU application and report skipped
+rather than MATCH. Candidate rejection does not disable existing diagnostics.
+
+Marker CPU-semaphore-entry. Log Savestate semaphore entry gives each reason;
+Savestate semaphore entry probe reports candidate/deferred counts and rollback.
+The schema remains v33; the checkpoint number is v34. Fresh Save State is
+recommended for testing. Full saved continuation and rewind remain unsupported.
+
+Validation: 37 host cases exercise the production planner and extracted live
+probe with mocked CPU/memory adapters: ABI/NID and malformed input, CB refusal,
+timed deferral, full candidate preservation, normal application and exact rollback,
+partial writer failure, rollback failure and persistent veto, running targets,
+inaccessible stubs and empty sets. Existing semaphore collector and format gate
+pass. Native sync_primitives.cpp and savestate.cpp syntax checks pass. Android
+build and device validation pending; no claim of executed saved wait replay.
+
+v33 device evidence (2026-10-26 02:14): user reported normal operation; all joint
+rollbacks MATCH; 11 current waits completed successfully (5 semaphores, 1 simple
+event, 5 condition calls including mutex reacquisition). Six saved/five current
+semaphore waits were all untimed. The timed duration path remains device-unverified.
+Five different invocations, one saved-call-ended; no same-invocation sample.
+
+## Semaphore timeout duration (previous checkpoint v33, format v33)
 
 Timed semaphore calls now publish the exact steady-clock deadline used by their
 host wait in the existing shared control. The helper uses wait_until for this

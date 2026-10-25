@@ -102,6 +102,7 @@
 #include <app/savestate_wait_targets.h>
 #include <app/savestate_delay_wait.h>
 #include <app/savestate_semaphore_wait.h>
+#include <app/savestate_semaphore_entry.h>
 #include <app/savestate_semaphore_queue.h>
 #include <app/savestate_semaphore_rebind.h>
 #include <app/savestate_simple_event_rebind.h>
@@ -622,6 +623,47 @@ static std::string probe_saved_cpu_contexts(KernelState &kernel,const std::vecto
     }
     LOG_INFO("Savestate CPU probe: saved registers MATCH; rollback MATCH; {} threads; no guest instructions executed.",targets.size());
     LOG_INFO("Savestate thread metadata probe: {} threads, {} changed fields; saved start ticks/vblank waits/return values MATCH; rollback MATCH; no thread status, wait queues or host clock changed.",targets.size(),changed_metadata);
+    return {};
+}
+
+// Guard owns all kernel/primitive/thread locks. Only CPU candidates are applied;
+// no guest instructions, queue changes or timeout-pointer writes occur here.
+static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &mem,
+    const std::vector<ThreadRecord> &records) {
+    if (kernel.snapshot_restore_failed) return "Previous rollback failed; restart the app";
+    std::vector<SnapshotCpuTarget<CPUState>> targets;
+    size_t deferred = 0;
+    for (const auto &record : records) {
+        if (!record.semaphore_wait.uid) continue;
+        const auto found = kernel.threads.find(record.id);
+        if (found == kernel.threads.end() || !found->second || !found->second->cpu
+            || found->second->status == ThreadStatus::run)
+            return "Semaphore entry target missing or running";
+        const auto candidate = prepare_semaphore_entry(record.semaphore_wait, record.wait_targets,
+            record.wait_nid, record.ctx, [&](uint32_t address) -> std::optional<uint32_t> {
+                const Ptr<uint32_t> ptr(address);
+                if (!ptr.valid(mem)) return std::nullopt;
+                return *ptr.get(mem);
+            });
+        LOG_INFO("Savestate semaphore entry: thread {}, NID 0x{:08X}, result {}; candidate preparation only, no saved call executed",
+            record.id, record.wait_nid, candidate.reason);
+        if (!candidate.plan || candidate.plan->timeout_address) { ++deferred; continue; }
+        targets.push_back({found->second->cpu.get(), {candidate.plan->context, record.tpidruro}});
+    }
+    if (targets.empty()) {
+        LOG_INFO("Savestate semaphore entry probe: 0 untimed candidates, {} deferred; CPU probe skipped; no saved continuation", deferred);
+        return {};
+    }
+    const auto result = probe_snapshot_cpu_values<CPUState>(targets,
+        [](CPUState &cpu) { return SnapshotCpuValues{save_context(cpu), read_tpidruro(cpu)}; },
+        [](CPUState &cpu, const SnapshotCpuValues &v) { load_context(cpu, v.context); write_tpidruro(cpu, v.tpidruro); });
+    if (result == SnapshotCpuProbe::RollbackFailed) {
+        kernel.snapshot_restore_failed = true;
+        return "Semaphore entry CPU rollback failed; restart without Resume";
+    }
+    if (result != SnapshotCpuProbe::Passed) return "Semaphore entry CPU verification refused";
+    LOG_INFO("Savestate semaphore entry probe: {} untimed candidates, {} deferred; entry registers MATCH; rollback MATCH; no instructions executed, no timeout writeback or saved continuation",
+        targets.size(), deferred);
     return {};
 }
 
@@ -2317,7 +2359,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-semaphore-deadline/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-semaphore-entry/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
@@ -2497,6 +2539,8 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 return wait_error;
             if (const auto sema_error = audit_saved_semaphore_waits(kernel, thread_records); !sema_error.empty())
                 return sema_error;
+            if (const auto entry_error = probe_saved_semaphore_entries(kernel, mem, thread_records); !entry_error.empty())
+                return entry_error;
             auto mismatch = compare_object_sets(saved_object_sets, collect_kernel_object_sets(kernel, true));
             if (!mismatch.empty()) return mismatch;
             if (!records_match_object_set(sema_records, "semaphores", saved_object_sets)
