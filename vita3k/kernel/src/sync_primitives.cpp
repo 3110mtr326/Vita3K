@@ -18,6 +18,7 @@
 #include <cpu/functions.h>
 #include <kernel/state.h>
 #include <kernel/sync_primitives.h>
+#include <kernel/thread/wait_invocation_identity.h>
 
 #include <kernel/types.h>
 #include <util/lock_and_find.h>
@@ -1220,6 +1221,10 @@ SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thr
 
     if (semaphore->val < needCount) {
         const auto control = std::make_shared<SemaphoreWaitControl>();
+        const auto identity = next_wait_invocation_identity();
+        control->session_hi = identity.session_hi;
+        control->session_lo = identity.session_lo;
+        control->invocation = identity.invocation;
         std::unique_lock<std::mutex> thread_lock(thread->mutex);
         thread->update_status(ThreadStatus::wait, ThreadStatus::run);
 

@@ -22,10 +22,12 @@ code = r'''
 using namespace app;
 template<class... T> void ignore(T&&...) {}
 #define LOG_INFO(...) ignore(__VA_ARGS__)
+struct Control {uint64_t session_hi=1,session_lo=2,invocation=3;};
 struct Entry {
     ThreadStatePtr thread;
     int priority = 0, signal = 0;
     uint32_t snapshot_timeout_present = 0, snapshot_timeout_us = 0;
+    std::shared_ptr<Control> semaphore_wait_control=std::make_shared<Control>();
     bool operator>(const Entry &v) const { return priority > v.priority; }
     bool operator<(const Entry &v) const { return priority < v.priority; }
     bool operator==(const Entry &v) const { return thread == v.thread; }
@@ -55,6 +57,7 @@ int main() {
         assert(saved && saved->uid == 133 && saved->signal == 2 && saved->priority == 20);
         assert(saved->position == (priority ? 0u : 1u) && saved->queue_size == 2);
         assert(saved->timeout_present == 1 && saved->timeout_us == 50000);
+        assert(saved->session_hi==1 && saved->session_lo==2 && saved->invocation==3);
         ThreadRecord rec{1, targets, *saved};
         assert(audit_saved_semaphore_waits(k, {rec}).empty());
         auto retained = o->waiting_threads->find(t);

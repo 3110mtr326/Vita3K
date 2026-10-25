@@ -14,6 +14,7 @@ header=(root/'vita3k/kernel/include/kernel/sync_primitives.h').read_text()
 entry=header[header.index('struct SemaphoreWaitControl'):header.index('// NOTE: uid')]
 code=r'''
 #include <kernel/thread/thread_data_queue.h>
+#include <kernel/thread/wait_invocation_identity.h>
 #include <cassert>
 #include <chrono>
 #include <iostream>
@@ -130,6 +131,24 @@ int main(){
   assert(handle_timeout(k,t,thread_lock,primitive,q,it,"legacy",&zero)==SCE_KERNEL_ERROR_WAIT_TIMEOUT);
   assert(q->empty());
   cases+=2;
+ }
+
+ for(bool priority:{false,true}){
+  KernelState k;auto sema=std::make_shared<Semaphore>();sema->attr=priority?SCE_KERNEL_ATTR_TH_PRIO:0;sema->waiting_threads=queue(priority);k.semaphores[1]=sema;
+  auto thread=std::make_shared<ThreadState>();k.threads[1]=thread;app::SnapshotWaitTargets targets{};targets.count=1;targets.targets[0]={1,1};app::SnapshotSemaphoreWait first;
+  for(int call=0;call<2;++call){
+   int rc=999;std::thread worker([&]{rc=semaphore_wait(k,"identity",1,1,1,nullptr);});bool ready=false;
+   for(int n=0;n<2000&&!ready;++n){
+    {std::lock_guard lock(sema->mutex);if(!sema->waiting_threads->empty()){
+     auto record=app::collect_snapshot_semaphore_wait(k,thread,targets);assert(record&&record->invocation);
+     if(!call)first=*record;else assert(std::string(app::compare_semaphore_identity(first,targets,*record,targets))=="different-invocation");
+     std::lock_guard tl(thread->mutex);assert(app::rebind_current_semaphore_queues(k).error.empty());
+     auto after=app::collect_snapshot_semaphore_wait(k,thread,targets);assert(after&&*after==*record);ready=true;
+    }}if(!ready)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+   }
+   assert(ready);assert(semaphore_signal(k,"identity",1,1,1)==0);worker.join();assert(rc==0);
+   app::SnapshotSemaphoreWait ended;assert(std::string(app::compare_semaphore_identity(first,targets,ended,{}))=="saved-call-ended");
+  }++cases;
  }
  KernelState k;auto s=std::make_shared<Semaphore>();s->val=3;s->waiting_threads=queue(false);k.semaphores[1]=s;k.threads[1]=std::make_shared<ThreadState>();
  assert(semaphore_wait(k,"fast",1,1,1,nullptr)==0&&s->val==2&&s->waiting_threads->empty());++cases;

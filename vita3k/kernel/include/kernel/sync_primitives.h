@@ -26,6 +26,8 @@ struct KernelState;
 // One host semaphore wait invocation. Shared ownership keeps cancellation
 // storage alive when queue nodes are rebuilt; never serialized as a pointer.
 struct SemaphoreWaitControl {
+    // Immutable after publication; identifies this host invocation only.
+    uint64_t session_hi = 0, session_lo = 0, invocation = 0;
     bool canceled = false; // Protected by the semaphore mutex.
     // Diagnostic only, protected by the same mutex; never serialized.
     uint32_t snapshot_rebind_count = 0;

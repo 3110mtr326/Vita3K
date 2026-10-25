@@ -4,7 +4,51 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Current timer queue rebind (latest checkpoint v31, format v30 unchanged)
+## Semaphore invocation identity (latest checkpoint v32, format v32)
+
+Blocked semaphore calls now record process-session and per-call identity in their
+existing shared SemaphoreWaitControl before publication. The generator is shared
+with delay waits: a random 128-bit process-session token plus a monotonic atomic
+64-bit sequence. Unknown identity is used on entropy failure or exhaustion;
+ordinary guest wait behavior is unchanged. This is diagnostic identity, not a
+security boundary or restore authorization. No pointer is persisted.
+
+SnapshotSemaphoreWait grows from 32 to 56 bytes (session_hi/session_lo/invocation).
+The exact format gate is bumped to 32; v30 and all other versions are rejected
+before loading sections. Inactive records remain all-zero; partial identities
+are invalid; active all-zero unknown identity remains representable.
+
+Savestate semaphore identity logs the thread, saved/current call IDs and relation:
+inactive, started-after-save, saved-call-ended, unknown-identity,
+different-process-session, different-invocation, inconsistent-identity or
+same-invocation. Call identity equality permits changes to queue position/size
+and scheduling priority; it does not permit changes to object UID, requirements,
+attributes or input timeout budget. The input budget is NOT remaining time.
+Identity equality alone cannot establish saved host-stack/CPU/RAM consistency.
+Existing reversible saved queue probes still install diagnostic nodes without
+live controls, then restore original nodes; no saved invocation is replayed.
+Current-node replacement retains the existing control and identity.
+Marker CPU-semaphore-identity. Full game rewind remains unsupported.
+
+Checks passed: 22 comparison cases, binary roundtrip, 4000 concurrent identifier
+allocations; production collector/audit with FIFO/priority queues; 31 production
+semaphore lifecycle cases (including consecutive same-thread/same-argument waits
+distinguished, identity retained across replacement); 42 saved-queue transactions,
+34 current-rebind transactions, existing delay identity 15 cases/4000 allocations,
+23 timer lifecycle cases, format gate old/future/truncation rejection. Kernel
+surroundings mocked for host lifecycle tests. Native syntax checks passed for
+sync_primitives.cpp, savestate.cpp and SceThreadmgr.cpp. Android build/device
+pending. Create a fresh Save State with v32; ordinary in-game saves are unchanged.
+
+v31 device evidence 2026-10-25 23:01-23:02, PCSG00219: user reports normal gameplay.
+All joint rollbacks MATCH. 12 uniquely registered waits; no self delays, unmapped,
+multiple or nonwaiting registrations. Timer 0 queues/0 live waiters: empty-map
+coverage only, no active timer device validation. Semaphore15/6, simple event4/1,
+condition42/5: all 12 calls completed with result0, including condition mutex
+reacquisition. Other rebinds had zero waiters. Frame-rate ~28-30fps after Resume;
+log ends23:02:21.683; only one Load/rebind observed in the capture.
+
+## Current timer queue rebind (previous checkpoint v31, format v30 unchanged)
 
 Timer waits now own a shared invocation control. Cleanup searches the current
 queue by thread plus control, instead of retaining an iterator into retired

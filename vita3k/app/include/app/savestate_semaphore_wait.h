@@ -15,13 +15,15 @@ struct SnapshotSemaphoreWait {
     uint32_t attr = 0;
     uint32_t timeout_present = 0;
     uint32_t timeout_us = 0;
+    uint64_t session_hi = 0, session_lo = 0, invocation = 0;
     bool operator==(const SnapshotSemaphoreWait &) const = default;
 };
-static_assert(sizeof(SnapshotSemaphoreWait) == 32);
+static_assert(sizeof(SnapshotSemaphoreWait) == 56);
 
 inline bool valid_snapshot_semaphore_wait(const SnapshotSemaphoreWait &v,
     const SnapshotWaitTargets &targets) {
     if (!valid_snapshot_wait_targets(targets)) return false;
+    if (bool(v.session_hi || v.session_lo) != bool(v.invocation)) return false;
     uint32_t count = 0;
     int32_t uid = 0;
     for (uint32_t i = 0; i < targets.count; ++i) {
@@ -59,10 +61,36 @@ std::optional<SnapshotSemaphoreWait> collect_snapshot_semaphore_wait(
             result = {target.uid, entry.signal, entry.priority, position,
                 static_cast<uint32_t>(queue.size()), found->second->attr,
                 entry.snapshot_timeout_present, entry.snapshot_timeout_us};
+            if (entry.semaphore_wait_control) {
+                result.session_hi = entry.semaphore_wait_control->session_hi;
+                result.session_lo = entry.semaphore_wait_control->session_lo;
+                result.invocation = entry.semaphore_wait_control->invocation;
+            }
         }
         if (matches != 1 || position != queue.size()) return std::nullopt;
     }
     if (!valid_snapshot_semaphore_wait(result, targets)) return std::nullopt;
     return result;
+}
+// Observes call identity only. Same-call identity is necessary but insufficient
+// for restoring saved CPU/RAM, deadlines and host continuation together.
+inline const char *compare_semaphore_identity(const SnapshotSemaphoreWait &saved,
+    const SnapshotWaitTargets &saved_targets, const SnapshotSemaphoreWait &current,
+    const SnapshotWaitTargets &current_targets) {
+    if (!valid_snapshot_semaphore_wait(saved, saved_targets)
+        || !valid_snapshot_semaphore_wait(current, current_targets)) return "invalid";
+    if (!saved.uid && !current.uid) return "inactive";
+    if (!saved.uid) return "started-after-save";
+    if (!current.uid) return "saved-call-ended";
+    if (!saved.invocation || !current.invocation) return "unknown-identity";
+    if (saved.session_hi != current.session_hi || saved.session_lo != current.session_lo)
+        return "different-process-session";
+    if (saved.invocation != current.invocation) return "different-invocation";
+    // Queue position/size and scheduling priority may legitimately change;
+    // call arguments and object identity must not change for the same call.
+    if (saved.uid != current.uid || saved.signal != current.signal
+        || saved.attr != current.attr || saved.timeout_present != current.timeout_present
+        || saved.timeout_us != current.timeout_us) return "inconsistent-identity";
+    return "same-invocation";
 }
 } // namespace app
