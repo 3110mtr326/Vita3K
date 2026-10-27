@@ -108,6 +108,7 @@
 #include <app/savestate_semaphore_priority.h>
 #include <app/savestate_semaphore_queue.h>
 #include <app/savestate_semaphore_rebind.h>
+#include <app/savestate_semaphore_registration.h>
 #include <app/savestate_simple_event_rebind.h>
 #include <app/savestate_condvar_rebind.h>
 #include <app/savestate_mutex_rebind.h>
@@ -2391,7 +2392,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-semaphore-priority/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-semaphore-registration/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
@@ -2571,6 +2572,9 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 return wait_error;
             if (const auto sema_error = audit_saved_semaphore_waits(kernel, thread_records); !sema_error.empty())
                 return sema_error;
+            const auto registrations = audit_current_semaphore_registrations(kernel);
+            if (!registrations.error.empty()) return registrations.error;
+            LOG_INFO("Savestate semaphore registration receipts: {} live waiters MATCH before saved probes; current queue membership and invocation ownership checked; no saved dispatch", registrations.waiters);
             auto mismatch = compare_object_sets(saved_object_sets, collect_kernel_object_sets(kernel, true));
             if (!mismatch.empty()) return mismatch;
             if (!records_match_object_set(sema_records, "semaphores", saved_object_sets)
@@ -2649,8 +2653,12 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             LOG_INFO("Savestate joint probe: files/RAM/CPU-entry/sync/semaphore-queues/NGS/context/GPU diagnostic values coexisted; all rollbacks MATCH; no guest instructions, wait replay or game rewind.");
             // All saved host values have rolled back. Retain only equivalent
             // CURRENT queue nodes with the same live invocation ownership.
-            const auto rebound = rebind_current_semaphore_queues(kernel);
+            const auto rebound = rebind_current_semaphore_queues(kernel, [&] {
+                const auto after = audit_current_semaphore_registrations(kernel);
+                return after.error.empty() && after.waiters == registrations.waiters;
+            });
             if (!rebound.error.empty()) return rebound.error;
+            LOG_INFO("Savestate semaphore registration receipts: {} live waiters MATCH after rebind; receipts preserved through node replacement; no saved continuation", rebound.waiters);
             LOG_INFO("Savestate current semaphore rebind: {} queues, {} live waiters; order/requirements/invocation ownership MATCH; new current nodes retained for Resume, old nodes retired; no saved waits or game rewind committed.",
                 rebound.queues, rebound.waiters);
             const auto events_rebound = rebind_current_simple_event_queues(kernel);

@@ -4,7 +4,65 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Semaphore registration priority transaction (latest checkpoint v37, format v33)
+## Live semaphore registration receipts (latest checkpoint v38, format v33)
+
+The normal production semaphore_wait now records an immutable receipt only after
+queue push succeeds, while still holding semaphore/thread locks. It contains
+object/thread IDs, requested count, registration priority, object attributes and
+timeout metadata. The receipt lives in the existing per-invocation control;
+existing session/invocation identity and cancellation ownership remain unchanged.
+It is historical, not a live flag: a completed/removed wait may retain a receipt
+while an observer owns its control. No receipt is serialized into the save file.
+Uncontended calls do not create a queued registration or receipt.
+
+audit_current_semaphore_registrations requires continuous kernel/primitive/thread
+exclusion. It enumerates CURRENT queues and checks unique thread/object/control
+ownership, waiting status, nonzero call identity, cancellation pointer ownership,
+and every receipt field against the actual queue entry. A receipt alone or a
+waiting thread alone cannot satisfy this audit. Live thread priority need not
+equal the recorded entry priority because it may change after registration.
+Invalid queues/receipts refuse with no mutation; an empty queue reports0 waiters.
+
+The diagnostic audits receipts before applying saved domains. After all saved
+values have rolled back, current-queue rebind verifies receipts inside its
+existing rollback-capable callback. Receipt refusal or changed waiter count
+rejects that replacement; the original current queues are restored. The new
+registration audit is never run against the inert saved queues, which have no
+live invocation controls. No guest saved wait is dispatched, no host call is
+retired/recreated, and no registration polling/barrier or full rewind is enabled.
+This provides a checked acceptance record for future barrier work, not that
+barrier itself. Timed saved wait replay and saved scheduler restoration remain open.
+
+Validation: 59 production semaphore lifecycle cases using real host waits with
+mock kernel/thread surroundings. Receipt creation is observed while blocked,
+including timed waits; repeated current-node replacement preserves receipts.
+Eleven corruption cases refuse, and audit refusal inside rebind restores the
+original queue. FIFO/priority multi-waiter runs audit every admission; retained
+receipts after completion do not count as live registrations. Separate29 audit
+cases cover metadata, ownership, missing/null/aliased objects/threads, bounds,
+unknown identities, nonwaiting threads, persistent veto, and retired receipts.
+Existing34 live rebind tests,22 identity relations plus4000 concurrent allocations,
+and34 extracted orchestration modes pass. Orchestration includes pre-audit refusal,
+post-rebind audit refusal and changed waiter count. Native sync_primitives.cpp
+and savestate.cpp syntax checks pass. Android compilation/device test pending.
+
+Marker CPU-semaphore-registration; schema remains33. Logs report Savestate
+semaphore registration receipts: N live waiters MATCH before saved probes and
+after rebind. These N are current waits, not the number of saved CPU candidates.
+Existing order/priority/entry/GPU diagnostics remain. Create a fresh Save State.
+
+v37 device evidence: user normal. Log2026-10-27 16:23:45 shows5 candidates,
+priority/entry/queue/nested/rollback MATCH, joint GPU and all domain rollbacks
+MATCH. Saved uid134 had four equal-priority189 waiters in order136,135,138,137;
+uid199 had thread200 priority188. All current priorities equaled registration
+priorities, so changing to a different priority remains host-test-only coverage.
+Six current semaphores and condition65/thread8 completed0 after resume; ~30fps.
+Timed simple-event157/thread159 returned WAIT_TIMEOUT, not a semaphore deadline
+test. Five other conditions and one simple event completed during shutdown.
+One Load, ~13 seconds until shutdown; no long/repeated-resume evidence in log.
+Screenshot filename16:24:12 differs from log checkpoint16:23:45.
+
+## Semaphore registration priority transaction (previous checkpoint v37, format v33)
 
 The production semaphore wait takes queue priority from ThreadState::priority.
 The v36 order plan alone does not reproduce that input when a live thread has a

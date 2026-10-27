@@ -60,7 +60,9 @@ template<class F>std::string probe_saved_semaphore_entries(Kernel&,Mem&,const st
 int timer_rebind_calls=0;int rwlock_rebind_calls=0;int thread_end_rebind_calls=0;
 int rebind_calls=0,event_rebind_calls=0,condvar_rebind_calls=0,mutex_rebind_calls=0,eventflag_rebind_calls=0;
 struct RebindResult {std::string error;int queues=1,waiters=1;};
-RebindResult rebind_current_semaphore_queues(Kernel&){assert(!host_scope&&!queue_active);++rebind_calls;return {ngs_mode==21?"rebind refused":""};}
+struct RegistrationResult {std::string error;int waiters=1;};
+RegistrationResult audit_current_semaphore_registrations(Kernel&){assert(!host_scope&&!queue_active);return {(ngs_mode==31||(ngs_mode==32&&rebind_calls))?"registration refused":"",(ngs_mode==33&&rebind_calls)?2:1};}
+RebindResult rebind_current_semaphore_queues(Kernel&,const std::function<bool()> &verify){assert(!host_scope&&!queue_active);++rebind_calls;return {(ngs_mode==21||!verify())?"rebind refused":""};}
 RebindResult rebind_current_simple_event_queues(Kernel&){assert(!host_scope&&!queue_active&&rebind_calls==1);++event_rebind_calls;return {ngs_mode==22?"event rebind refused":""};}
 RebindResult rebind_current_condvar_queues(Kernel&){assert(!host_scope&&!queue_active&&event_rebind_calls==1);++condvar_rebind_calls;return {ngs_mode==23?"condvar rebind refused":""};}
 RebindResult rebind_current_mutex_queues(Kernel&){assert(!host_scope&&!queue_active&&condvar_rebind_calls==1);++mutex_rebind_calls;return {ngs_mode==24?"mutex rebind refused":""};}
@@ -109,7 +111,7 @@ int main(){
    std::istringstream in(bad);assert(parse(in,true)==SaveStateResult::ErrorMismatch);
  }
  std::istringstream huge("x");assert(!skip_savestate_bytes(huge,0xffffffffu));
- for(int mode=0;mode<31;++mode){assert(validate(mode).empty()==(mode==0));assert(!queue_active&&!entry_active&&!host_scope);assert(timer_rebind_calls==((mode==0||mode==28)?1:0));assert(rwlock_rebind_calls==((mode==0||mode==27||mode==28)?1:0));assert(thread_end_rebind_calls==((mode==0||mode==26||mode==27||mode==28)?1:0));assert(eventflag_rebind_calls==((mode==0||mode==25||mode==26||mode==27||mode==28)?1:0));assert(mutex_rebind_calls==((mode==0||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(condvar_rebind_calls==((mode==0||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(event_rebind_calls==((mode==0||mode==22||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(rebind_calls==((mode==0||mode==21||mode==22||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));}
+ for(int mode=0;mode<34;++mode){assert(validate(mode).empty()==(mode==0));assert(!queue_active&&!entry_active&&!host_scope);assert(timer_rebind_calls==((mode==0||mode==28)?1:0));assert(rwlock_rebind_calls==((mode==0||mode==27||mode==28)?1:0));assert(thread_end_rebind_calls==((mode==0||mode==26||mode==27||mode==28)?1:0));assert(eventflag_rebind_calls==((mode==0||mode==25||mode==26||mode==27||mode==28)?1:0));assert(mutex_rebind_calls==((mode==0||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(condvar_rebind_calls==((mode==0||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(event_rebind_calls==((mode==0||mode==22||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(rebind_calls==((mode==32||mode==33||mode==0||mode==21||mode==22||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));}
  std::cout<<"PASS: RAM indexing, 15 session mismatch, 2 NGS failure, semaphore audit refusal, 2 queue failure cases; saved queues and entry CPU enclose NGS/GPU; 2 entry failure cases; live rebind only after complete rollback, refusal propagated\n";
 }
 '''.replace('RAM\n',ram).replace(' CHECK\n',check)

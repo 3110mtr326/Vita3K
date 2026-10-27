@@ -1247,6 +1247,8 @@ SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thr
         data.was_canceled = &control->canceled;
 
         semaphore->waiting_threads->push(data);
+        control->registration = {semaId, thread_id, data.signal, data.priority,
+            semaphore->attr, data.snapshot_timeout_present, data.snapshot_timeout_us, true};
         thread_lock.unlock();
 
         auto res = handle_timeout_with_unregister(kernel, thread, thread_lock, semaphore_lock,

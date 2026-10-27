@@ -33,6 +33,7 @@ struct KernelState {
 };
 #include <app/savestate_semaphore_rebind.h>
 #include <app/savestate_semaphore_order.h>
+#include <app/savestate_semaphore_registration.h>
 struct Record {int id;uint8_t status=static_cast<uint8_t>(ThreadStatus::wait);app::SnapshotWaitTargets wait_targets{};app::SnapshotSemaphoreWait semaphore_wait{};};
 template<class M>auto lock_and_find(int id,M &m,std::mutex &mutex){std::lock_guard lock(mutex);return m.count(id)?m.at(id):typename M::mapped_type{};}
 constexpr bool LOG_SYNC_PRIMITIVES=false;
@@ -71,6 +72,41 @@ int main(){
      if(!sema->waiting_threads->empty()){
       auto e=*sema->waiting_threads->begin();assert(e.semaphore_wait_control);
       assert(e.was_canceled==&e.semaphore_wait_control->canceled);weak=e.semaphore_wait_control;
+      {
+       std::lock_guard kl(k.mutex),tl(thread->mutex);
+       auto audit=app::audit_current_semaphore_registrations(k);assert(audit.error.empty()&&audit.waiters==1);
+       const auto receipt=e.semaphore_wait_control->registration;
+       assert(receipt.complete&&receipt.uid==1&&receipt.thread_id==1&&receipt.signal==1&&receipt.priority==thread->priority);
+       if(!priority&&mode==0){
+        for(int fault=0;fault<11;++fault){
+         auto &v=e.semaphore_wait_control->registration;
+         if(fault==0)v.complete=false;
+         if(fault==1)v.uid++;
+         if(fault==2)v.thread_id++;
+         if(fault==3)v.signal++;
+         if(fault==4)v.priority++;
+         if(fault==5)v.attr++;
+         if(fault==6)v.timeout_present=1;
+         if(fault==7)v.timeout_us=1;
+         if(fault==8)e.semaphore_wait_control->canceled=true;
+         const auto invocation=e.semaphore_wait_control->invocation;
+         if(fault==9)e.semaphore_wait_control->invocation=0;
+         if(fault==10)thread->status=ThreadStatus::run;
+         auto bad=app::audit_current_semaphore_registrations(k);assert(!bad.error.empty()&&bad.waiters==0);
+         v=receipt;e.semaphore_wait_control->canceled=false;e.semaphore_wait_control->invocation=invocation;thread->status=ThreadStatus::wait;
+         assert(app::audit_current_semaphore_registrations(k).error.empty());++cases;
+        }
+        auto *original=sema->waiting_threads.get();
+        auto rejected=app::rebind_current_semaphore_queues(k,[&]{
+         e.semaphore_wait_control->registration.complete=false;
+         const bool ok=app::audit_current_semaphore_registrations(k).error.empty();
+         e.semaphore_wait_control->registration=receipt;return ok;
+        });
+        assert(!rejected.error.empty()&&!k.snapshot_restore_failed&&sema->waiting_threads.get()==original);
+        assert(e.semaphore_wait_control->snapshot_rebind_count==0);++cases;
+       }
+      }
+
         if(mode>=5&&mode<=8){
          std::lock_guard kernel_lock(k.mutex),thread_lock(thread->mutex);
          auto *before=sema->waiting_threads.get();
@@ -81,6 +117,7 @@ int main(){
          assert(app::rebind_current_semaphore_queues(k).error.empty());
          assert(app::rebind_current_semaphore_queues(k).error.empty());
          assert(e.semaphore_wait_control->snapshot_rebind_count==3);
+         assert(app::audit_current_semaphore_registrations(k).error.empty());
         }
         if(mode>=9){
          std::lock_guard kernel_lock(k.mutex),thread_lock(thread->mutex);
@@ -218,6 +255,7 @@ int main(){
   }
   const auto plan=app::prepare_semaphore_order(records);assert(plan.error.empty()&&plan.steps.size()==3);
   assert(plan.steps[0].thread_id==3&&plan.steps[1].thread_id==1&&plan.steps[2].thread_id==2);
+  std::vector<std::shared_ptr<SemaphoreWaitControl>> receipts;
   std::vector<std::thread> workers;std::array<int,3> result{999,999,999};
   for(size_t i=0;i<plan.steps.size();++i){
    const auto step=plan.steps[i];const int count=records[step.record_index].semaphore_wait.signal;
@@ -228,6 +266,12 @@ int main(){
      if(sema->waiting_threads->size()==i+1){size_t j=0;for(auto it=sema->waiting_threads->begin();it!=sema->waiting_threads->end();++it,++j)assert((*it).thread==k.threads.at(plan.steps[j].thread_id));admitted=true;}}
     if(!admitted)std::this_thread::sleep_for(std::chrono::milliseconds(1));
    }assert(admitted);
+   {std::lock_guard sl(sema->mutex),kl(k.mutex);
+    auto audit=app::audit_current_semaphore_registrations(k);assert(audit.error.empty()&&audit.waiters==i+1);
+    for(auto it=sema->waiting_threads->begin();it!=sema->waiting_threads->end();++it)
+     if((*it).thread==k.threads[step.thread_id])receipts.push_back((*it).semaphore_wait_control);
+   }
+
   }
   // One token cannot bypass the head's two-token requirement.
   assert(semaphore_signal(k,"ordered",1,1,1)==0);
@@ -236,7 +280,10 @@ int main(){
    assert(semaphore_signal(k,"ordered",1,1,1)==0);workers[i].join();assert(result[i]==0);
    std::lock_guard lock(sema->mutex);assert(sema->waiting_threads->size()==2-i);
   }
-  assert(sema->val==0);++cases;
+  assert(sema->val==0);
+  assert(receipts.size()==3);for(auto &c:receipts)assert(c->registration.complete);
+  {std::lock_guard sl(sema->mutex),kl(k.mutex);auto audit=app::audit_current_semaphore_registrations(k);assert(audit.error.empty()&&audit.waiters==0);}
+  ++cases;
  }
  {
   std::vector<Record> valid;

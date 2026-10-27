@@ -27,6 +27,14 @@ struct KernelState;
 // One host semaphore wait invocation. Shared ownership keeps cancellation
 // storage alive when queue nodes are rebuilt; never serialized as a pointer.
 struct SemaphoreWaitControl {
+    // Written only after queue insertion succeeds, under semaphore/thread locks.
+    // Historical receipt, not a live flag: a popped/retired call retains it.
+    // Consumers must also prove membership in the current queue and ownership.
+    struct Registration {
+        int32_t uid = 0, thread_id = 0, signal = 0, priority = 0;
+        uint32_t attr = 0, timeout_present = 0, timeout_us = 0;
+        bool complete = false;
+    } registration;
     WaitDeadline snapshot_deadline; // Protected by the semaphore mutex.
     // Immutable after publication; identifies this host invocation only.
     uint64_t session_hi = 0, session_lo = 0, invocation = 0;
