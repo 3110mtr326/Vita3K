@@ -12,10 +12,13 @@ wait_signal=src[src.index('struct SemaphoreWaitReturnReceipt'):src.index('int se
 cancel=src[src.index('int semaphore_cancel('):src.index('// **********************',src.index('int semaphore_cancel('))]
 header=(root/'vita3k/kernel/include/kernel/sync_primitives.h').read_text()
 entry=header[header.index('struct SemaphoreWaitControl'):header.index('// NOTE: uid')]
-code=r'''
+thread_source=(root/'vita3k/kernel/src/thread.cpp').read_text()
+assert 'SemaphoreImportScope semaphore_import(&kernel, id, nid);\n                kernel.call_import(*cpu, nid, id);\n                clear_exclusive(*cpu);\n                semaphore_import.finish(read_reg(*cpu, 0));' in thread_source
+code=r''' 
 #include <kernel/thread/wait_deadline.h>
 #include <kernel/thread/thread_data_queue.h>
 #include <kernel/thread/wait_invocation_identity.h>
+#include <kernel/thread/semaphore_import_scope.h>
 #include <cassert>
 #include <array>
 #include <chrono>
@@ -43,6 +46,11 @@ struct Completion {int uid,thread;uint32_t replacements;bool timed;int result;bo
 std::vector<Completion> completions;
 void completion_log(const char *,int uid,int thread,uint32_t replacements,bool timed,int result,bool terminal,uint64_t invocation,bool returned){
  completions.push_back({uid,thread,replacements,timed,result,terminal,invocation,returned});
+}
+struct ImportCompletion {int uid,thread;uint64_t invocation;uint32_t nid,bits;bool acknowledged;};
+std::vector<ImportCompletion> import_completions;
+void completion_log(const char *,int uid,int thread,uint64_t invocation,uint32_t nid,uint32_t bits,bool acknowledged){
+ import_completions.push_back({uid,thread,invocation,nid,bits,acknowledged});
 }
 #define LOG_INFO(...) completion_log(__VA_ARGS__)
 #define RET_ERROR(x) (x)
@@ -392,6 +400,66 @@ int main(){
   assert(semaphore_wait_body(k,"immediate",1,1,1,nullptr,receipt)==0&&sema->val==0);
   assert(!receipt.control&&!receipt.semaphore);++cases;
  }
+
+ // Real production body/wrapper + stack-scoped import completion. The mock CPU
+ // result is supplied explicitly; native thread.cpp integration is checked below.
+ for(bool priority:{false,true})for(int mode=0;mode<14;++mode){
+  KernelState k;auto sema=std::make_shared<Semaphore>();sema->waiting_threads=queue(priority);sema->attr=priority?SCE_KERNEL_ATTR_TH_PRIO:0;k.semaphores[1]=sema;
+  auto thread=std::make_shared<ThreadState>();k.threads[1]=thread;
+  std::shared_ptr<SemaphoreWaitControl> held;app::SemaphoreRegistrationEntry expected;
+  import_completions.clear();completions.clear();int rc=999;bool ack=false;uint32_t budget=200000;
+  const uint32_t nid=priority?0x45389B6B:0x0C7B834B;
+  std::thread worker([&]{
+   try {
+    SemaphoreImportScope scope(mode==6?nullptr:&k,mode==7?2:1,mode==8?0x174692B4:nid);
+    if(mode==9||mode==10){
+     SemaphoreImportScope nested(&k,1,mode==9?0xF8E06784:nid);
+     rc=semaphore_wait(k,"import",1,1,1,nullptr);
+     ack=nested.finish(static_cast<uint32_t>(rc));
+     assert(ack==(mode==10));
+     assert(!scope.finish(static_cast<uint32_t>(rc))); // parent is masked
+    } else {
+     rc=semaphore_wait(k,"import",1,1,1,mode==2?&budget:nullptr);
+     if(mode==4)throw 42; // unwinding must not acknowledge
+     if(mode==5){assert(!held->import_returned);return;} // no explicit finish
+     if(mode==11)assert(!SemaphoreImportScope::retain(&k,1,sema,held));
+     if(mode==12){SemaphoreImportScope nested(&k,1,0);assert(!scope.finish(0));}
+     if(mode==13){std::lock_guard lock(k.mutex);k.semaphores[1]=std::make_shared<Semaphore>();}
+     ack=scope.finish(mode==3?7:static_cast<uint32_t>(rc));
+     assert(!scope.finish(static_cast<uint32_t>(rc))); // no retries/duplicates
+    }
+   }catch(int value){assert(mode==4&&value==42);}
+  });
+  const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+  while(!held){
+   {std::lock_guard sl(sema->mutex),kl(k.mutex),tl(thread->mutex);
+    if(!sema->waiting_threads->empty()){
+     held=(*sema->waiting_threads->begin()).semaphore_wait_control;
+     // Enable the same diagnostics emitted for a rebound current invocation.
+     held->snapshot_rebind_count=1;
+     auto audit=app::audit_current_semaphore_registrations(k);assert(audit.error.empty());expected=audit.entries.front();
+    }}
+   assert(std::chrono::steady_clock::now()<limit);std::this_thread::yield();
+  }
+  // A scope on the test's OTHER host thread cannot take the worker's receipt.
+  {SemaphoreImportScope other(&k,1,nid);assert(!other.finish(0));}
+  if(mode==1)assert(semaphore_cancel(k,"cancel",1,1,0,nullptr)==0);
+  else if(mode!=2)assert(semaphore_signal(k,"signal",1,1,1)==0);
+  worker.join();
+  assert(rc==(mode==1?SCE_KERNEL_ERROR_WAIT_CANCEL:mode==2?SCE_KERNEL_ERROR_WAIT_TIMEOUT:0));
+  const bool success=mode<=2||mode==10||mode==12||mode==13;
+  assert(ack==success&&held->body_returned&&held->import_returned==success);
+  if(success)assert(held->import_result==static_cast<uint32_t>(rc));
+  if(success||mode==3||mode==11){assert(import_completions.size()==1&&import_completions[0].acknowledged==success);}
+  else assert(import_completions.empty());
+  {
+   std::lock_guard sl(sema->mutex),kl(k.mutex),tl(thread->mutex);
+   app::SemaphoreRegistrationAudit empty;
+   assert(app::observe_semaphore_terminal(*held,expected,empty).status==(success?app::SemaphoreTerminalStatus::ImportReturned:app::SemaphoreTerminalStatus::BodyReturned));
+  }
+  std::weak_ptr<SemaphoreWaitControl> weak=held;held.reset();assert(weak.expired());++cases;
+ }
+
  std::cout<<"PASS: "<<cases<<" production semaphore lifecycle cases; real host wait/signal/cancel/timeout/abort, rebuilt nodes, ownership lifetime, invocation isolation and legacy cleanup\n";
 }
 '''.replace('ENTRY',entry).replace('HELPERS',helpers).replace('WAIT_SIGNAL',wait_signal).replace('CANCEL\n',cancel)

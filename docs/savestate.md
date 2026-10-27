@@ -4,7 +4,57 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Semaphore wait body return acknowledgement (latest checkpoint v41, format v33)
+## Semaphore import return acknowledgement (latest checkpoint v42, format v33)
+
+A host-thread-local stack scope now surrounds each synchronous kernel.call_import
+in ThreadState::run. The semaphore wrapper retains its original owning object and
+invocation control in the current scope after successful body-return acknowledgement.
+Only ordinary semaphore wait NIDs0x0C7B834B/0x45389B6B are accepted. Kernel identity
+and guest thread ID must match; callbacks/unsupported nested imports mask the parent
+scope. More than one queued call in a scope poisons it instead of guessing ownership.
+No unqueued immediate success or failed lookup is promoted to a queued receipt.
+
+After normal call_import return and clear_exclusive, finish checks the actual CPU
+r0 bits against the finalized body result while holding the original semaphore
+mutex. It requires registration and invocation identity, body/terminal agreement,
+absence from the original queue, and no earlier import acknowledgement. On success,
+import_result is written before import_returned. These are mutex-protected fields,
+not atomic signals. Wrong-result or ambiguous receipts cannot be retried. Exception
+unwinding and scope destruction never acknowledge completion. Each scope releases
+its retained objects on exit; there is no global history/polling monitor.
+
+The observer adds ImportReturned and rejects contradictory imported/body/result
+combinations. Current registration audits also reject imported controls in queues.
+The earlier body-return log still correctly says import return not acknowledged at
+that earlier point. A separate later log says:
+Savestate semaphore import return: ... result bits 0, acknowledged true
+Nonzero result bits may represent normal timeout/cancellation errors.
+
+This proves only normal return through the CURRENT HLE import dispatcher and the
+matching guest return register. It does not authorize saved waits, prove guest
+instruction resumption, restore every pending callback, or retire the entire host
+run loop. Saved continuation and full graphics/audio restoration remain disabled.
+The marker is CPU-semaphore-import-return. Format remains33; use a fresh Save.
+
+Validation:97 production semaphore lifecycle cases, including28 added FIFO/priority
+scope cases using real host waits. Coverage includes success/cancel/timeout, wrong
+CPU result, no finish, exception unwinding, kernel/thread mismatch, unsupported CB,
+nested masking/restoration, duplicate receipt, UID replacement and host-thread-local
+isolation. Tests retain controls to verify observer state and release all references
+to verify lifetime. The test CPU result is supplied explicitly; actual CPU integration
+requires the device run.75 registration/observer cases,34 rebind cases and existing
+orchestration tests pass. Native syntax checks for sync_primitives.cpp, thread.cpp,
+and savestate.cpp pass. Android compilation and device testing remain pending.
+
+v41 device evidence: user reports normal. One Load23:48:11 on2026-10-27,6 CURRENT
+registration receipts match before/after rebind;6 SAVED untimed candidates,0 deferred.
+All joint diagnostics/rollbacks match. At23:48:17 all6 current waits finish result0,
+terminal receipt true, wait body returned true: uid170/thread171,199/200 and uid134
+threads136,137,138,135. About33 seconds of gameplay follow before shutdown23:48:50,
+mostly29.5-30fps with one26.54fps sample. No repeated Load or timed/cancelled completion
+coverage established. This verifies the body-return checkpoint, not import return.
+
+## Semaphore wait body return acknowledgement (previous checkpoint v41, format v33)
 
 The public semaphore_wait now calls a separate wait body. After that body returns
 normally and its lock guards unwind, the wrapper locks the retained original

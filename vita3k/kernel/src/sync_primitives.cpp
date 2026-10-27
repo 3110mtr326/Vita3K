@@ -19,6 +19,7 @@
 #include <kernel/state.h>
 #include <kernel/sync_primitives.h>
 #include <kernel/thread/wait_invocation_identity.h>
+#include <kernel/thread/semaphore_import_scope.h>
 
 #include <kernel/types.h>
 #include <util/lock_and_find.h>
@@ -1297,6 +1298,8 @@ SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thr
         // Retain the original object even if its UID was removed/reused meanwhile.
         const std::lock_guard lock(receipt.semaphore->mutex);
         const bool returned = acknowledge_semaphore_body_return(receipt, result);
+        if (returned)
+            SemaphoreImportScope::retain(&kernel, thread_id, receipt.semaphore, receipt.control);
         const auto &control = *receipt.control;
         if (control.snapshot_rebind_count) {
             LOG_INFO("Savestate rebound semaphore wait completed: uid {}, thread {}, replacements {}, timed {}, result {}; terminal receipt {}, invocation {}, wait body returned {}; current invocation only, import return not acknowledged, no saved continuation",
@@ -1305,6 +1308,32 @@ SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thr
         }
     }
     return result;
+}
+
+bool SemaphoreImportScope::finish(uint32_t cpu_result) {
+    if (current != this || finished) return false;
+    finished = true;
+    if (!semaphore || !control) return false;
+    const std::lock_guard lock(semaphore->mutex);
+    const auto &r = control->registration;
+    bool valid = !poisoned && r.complete && r.thread_id == thread && r.uid == semaphore->uid
+        && control->terminal_ready && control->body_returned && !control->import_returned
+        && control->terminal_result == control->body_return_result
+        && static_cast<uint32_t>(control->body_return_result) == cpu_result
+        && control->invocation && (control->session_hi || control->session_lo)
+        && semaphore->waiting_threads;
+    if (valid) {
+        for (auto it = semaphore->waiting_threads->begin(); it != semaphore->waiting_threads->end(); ++it)
+            if ((*it).semaphore_wait_control == control) valid = false;
+    }
+    if (valid) {
+        control->import_result = cpu_result;
+        control->import_returned = true;
+    }
+    if (control->snapshot_rebind_count)
+        LOG_INFO("Savestate semaphore import return: uid {}, thread {}, invocation {}, nid {}, result bits {}, acknowledged {}; current invocation only, no saved continuation",
+            r.uid, thread, control->invocation, nid, cpu_result, valid);
+    return valid;
 }
 
 int semaphore_signal(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID semaid, int signal) {

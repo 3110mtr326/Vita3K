@@ -17,6 +17,7 @@
 
 #include <cpu/functions.h>
 #include <kernel/thread/thread_state.h>
+#include <kernel/thread/semaphore_import_scope.h>
 
 #include <kernel/state.h>
 #include <mem/ptr.h>
@@ -283,8 +284,10 @@ void ThreadState::run_loop() {
                     uint32_t previous;
                     ~ImportDiagnosticScope() { active.store(previous, std::memory_order_release); }
                 } import_scope{ active_import_nid, active_import_nid.exchange(nid, std::memory_order_acq_rel) };
+                SemaphoreImportScope semaphore_import(&kernel, id, nid);
                 kernel.call_import(*cpu, nid, id);
                 clear_exclusive(*cpu);
+                semaphore_import.finish(read_reg(*cpu, 0));
             }
 
             // handle pending abort (exception handler from page fault)
