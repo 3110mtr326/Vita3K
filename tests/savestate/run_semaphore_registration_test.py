@@ -93,9 +93,9 @@ int main(){int cases=0;
    }
    assert(app::same_semaphore_registrations(result,result));
 
-   for(int fault=0;fault<14;++fault){
+   for(int fault=0;fault<18;++fault){
     auto now=result;auto wanted=expected;const auto original=c->registration;
-    c->terminal_ready=false;c->terminal_result=0;
+    c->terminal_ready=false;c->terminal_result=0;c->body_returned=false;c->body_return_result=0;
     auto status=app::SemaphoreTerminalStatus::Registered;
     if(fault>=1&&fault<=3){now.entries.clear();now.waiters=0;status=app::SemaphoreTerminalStatus::AbsentUnresolved;}
     if(fault==2||fault==3){c->terminal_ready=true;c->terminal_result=fault==3?-1:0;status=app::SemaphoreTerminalStatus::Terminal;}
@@ -109,11 +109,18 @@ int main(){int cases=0;
     if(fault==11){now.entries.front().invocation++;now.entries.front().control=&other;c->terminal_ready=true;c->terminal_result=-2;status=app::SemaphoreTerminalStatus::Terminal;}
     if(fault==12){c->registration.uid++;status=app::SemaphoreTerminalStatus::Invalid;}
     if(fault==13){now.waiters++;status=app::SemaphoreTerminalStatus::Invalid;}
+
+    if(fault>=14){
+     now.entries.clear();now.waiters=0;c->body_returned=true;
+     if(fault==14)status=app::SemaphoreTerminalStatus::Invalid;
+     if(fault==15){c->terminal_ready=true;c->body_return_result=-1;status=app::SemaphoreTerminalStatus::Invalid;}
+     if(fault==16||fault==17){c->terminal_ready=true;c->terminal_result=c->body_return_result=fault==17?-2:0;status=app::SemaphoreTerminalStatus::BodyReturned;}
+    }
     auto observation=app::observe_semaphore_terminal(*c,wanted,now);
     assert(observation.status==status);
-    assert(observation.result.has_value()==(status==app::SemaphoreTerminalStatus::Terminal));
+    assert(observation.result.has_value()==(status==app::SemaphoreTerminalStatus::Terminal||status==app::SemaphoreTerminalStatus::BodyReturned));
     if(observation.result)assert(*observation.result==c->terminal_result);
-    c->registration=original;c->terminal_ready=false;c->terminal_result=0;++cases;
+    c->registration=original;c->terminal_ready=false;c->terminal_result=0;c->body_returned=false;c->body_return_result=0;++cases;
    }
    auto t2=std::make_shared<Thread>();k.threads[2]=t2;
    auto c2=std::make_shared<SemaphoreWaitControl>(*c);c2->registration.thread_id=2;

@@ -1208,7 +1208,13 @@ SceUID semaphore_find(KernelState &kernel, const char *export_name, const char *
     return RET_ERROR(SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_NAME);
 }
 
-SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID semaId, SceInt32 needCount, SceUInt32 *pTimeout) {
+struct SemaphoreWaitReturnReceipt {
+    SemaphorePtr semaphore;
+    std::shared_ptr<SemaphoreWaitControl> control;
+};
+
+static SceInt32 semaphore_wait_body(KernelState &kernel, const char *export_name, SceUID thread_id,
+    SceUID semaId, SceInt32 needCount, SceUInt32 *pTimeout, SemaphoreWaitReturnReceipt &receipt) {
     assert(semaId >= 0);
 
     // TODO Don't lock twice.
@@ -1229,6 +1235,7 @@ SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thr
 
     if (semaphore->val < needCount) {
         const auto control = std::make_shared<SemaphoreWaitControl>();
+        receipt = {semaphore, control};
         const auto identity = next_wait_invocation_identity();
         control->session_hi = identity.session_hi;
         control->session_lo = identity.session_lo;
@@ -1257,19 +1264,47 @@ SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thr
             res = SCE_KERNEL_ERROR_WAIT_CANCEL;
         control->terminal_result = res;
         control->terminal_ready = true;
-        // The semaphore mutex is still held. Report once per original blocked
-        // call, only if it survived a committed live-node replacement. This is
-        // current host-wait completion, not evidence of saved-state rewind.
-        if (control->snapshot_rebind_count) {
-            LOG_INFO("Savestate rebound semaphore wait completed: uid {}, thread {}, replacements {}, timed {}, result {}; terminal receipt {}, invocation {}; current invocation only, host return not acknowledged, no saved continuation",
-                semaId, thread_id, control->snapshot_rebind_count, pTimeout != nullptr, res, control->terminal_ready, control->invocation);
-        }
         return res;
     } else {
         semaphore->val -= needCount;
     }
 
     return SCE_KERNEL_OK;
+}
+
+// Called only by the wait body's caller, under the retained semaphore mutex.
+// No status bit or queue absence alone is treated as evidence of host return.
+static bool acknowledge_semaphore_body_return(const SemaphoreWaitReturnReceipt &receipt, SceInt32 result) {
+    if (!receipt.semaphore || !receipt.control || !receipt.semaphore->waiting_threads)
+        return false;
+    auto &control = *receipt.control;
+    if (!control.registration.complete || !control.terminal_ready
+        || control.terminal_result != result || control.body_returned)
+        return false;
+    for (auto it = receipt.semaphore->waiting_threads->begin(); it != receipt.semaphore->waiting_threads->end(); ++it)
+        if ((*it).semaphore_wait_control == receipt.control) return false;
+    control.body_return_result = result;
+    control.body_returned = true;
+    return true;
+}
+
+SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID semaId, SceInt32 needCount, SceUInt32 *pTimeout) {
+    SemaphoreWaitReturnReceipt receipt;
+    // A normal return unwinds the body's thread/semaphore lock guards first.
+    // If the body throws, no return acknowledgement is published.
+    const auto result = semaphore_wait_body(kernel, export_name, thread_id, semaId, needCount, pTimeout, receipt);
+    if (receipt.semaphore && receipt.control) {
+        // Retain the original object even if its UID was removed/reused meanwhile.
+        const std::lock_guard lock(receipt.semaphore->mutex);
+        const bool returned = acknowledge_semaphore_body_return(receipt, result);
+        const auto &control = *receipt.control;
+        if (control.snapshot_rebind_count) {
+            LOG_INFO("Savestate rebound semaphore wait completed: uid {}, thread {}, replacements {}, timed {}, result {}; terminal receipt {}, invocation {}, wait body returned {}; current invocation only, import return not acknowledged, no saved continuation",
+                semaId, thread_id, control.snapshot_rebind_count, pTimeout != nullptr, result,
+                control.terminal_ready, control.invocation, returned);
+        }
+    }
+    return result;
 }
 
 int semaphore_signal(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID semaid, int signal) {

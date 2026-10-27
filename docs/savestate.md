@@ -4,7 +4,45 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Semaphore terminal result receipts (latest checkpoint v40, format v33)
+## Semaphore wait body return acknowledgement (latest checkpoint v41, format v33)
+
+The public semaphore_wait now calls a separate wait body. After that body returns
+normally and its lock guards unwind, the wrapper locks the retained original
+semaphore and acknowledges the returned result on the retained invocation control.
+The acknowledgement requires a complete registration, matching terminal result,
+no previous acknowledgement, and absence of that control from the original queue.
+Object retention prevents UID reuse from redirecting the acknowledgement. An
+exception bypasses it; immediate-success and unknown-object calls have no receipt.
+Return codes and timeout policy are unchanged. Readers still require the owning
+locks: these fields are not atomic notifications and are not serialized.
+
+The observer adds BodyReturned and rejects contradictory or mismatched return
+receipts. This proves only that the inner wait body returned. The public wrapper,
+guest import, callbacks, CPU return handling and full host stack retirement have
+NOT been acknowledged. It is not a replay barrier. Saved waits and full rewind
+remain disabled. No polling monitor or retained global registry is added.
+
+Validation: 69 production semaphore lifecycle cases, 70 registration/observer
+cases, 34 current queue rebind cases and the existing orchestration suite pass.
+New tests cover FIFO/priority signal, cancel and timeout body returns, lock release,
+the terminal-to-body-return boundary, premature/wrong/duplicate acknowledgement,
+original-object retention across UID replacement, and unqueued immediate paths.
+Native syntax checks for sync_primitives.cpp and savestate.cpp pass. Android build
+and device testing remain pending.
+
+Device marker: CPU-semaphore-return. After Resume, rebound semaphore completion
+logs should include terminal receipt true and wait body returned true. The log
+explicitly says import return not acknowledged. Format remains33; use a fresh Save.
+
+v40 device evidence: user reports normal. One Load at22:46:56-57 on2026-10-27;
+2 current registrations match before/after rebind, 6 saved untimed candidates,
+0 deferred, joint diagnostics and rollback match. Two current semaphore waits
+finish with result0 and terminal receipt true at22:47:05. Gameplay continues
+above one minute near30fps before shutdown22:48:20. No timed/cancelled completion
+or repeated Load is established by this run. Terminal receipts alone do not prove
+body return. Screenshot filename differs from the log checkpoint time.
+
+## Semaphore terminal result receipts (previous checkpoint v40, format v33)
 
 After the normal blocked semaphore_wait finishes cleanup and resolves cancellation,
 it now records its final result in the existing invocation control, under the

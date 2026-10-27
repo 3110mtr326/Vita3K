@@ -39,6 +39,10 @@ struct SemaphoreWaitControl {
     // Does not prove the C++ call returned or its host stack was retired.
     bool terminal_ready = false;
     int32_t terminal_result = 0;
+    // Published by the caller AFTER the wait body returned and released locks.
+    // The public wrapper and guest import have not necessarily returned yet.
+    bool body_returned = false;
+    int32_t body_return_result = 0;
     WaitDeadline snapshot_deadline; // Protected by the semaphore mutex.
     // Immutable after publication; identifies this host invocation only.
     uint64_t session_hi = 0, session_lo = 0, invocation = 0;

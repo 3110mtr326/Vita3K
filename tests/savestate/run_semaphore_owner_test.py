@@ -8,7 +8,7 @@ p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);args=p.pa
 root=Path(__file__).resolve().parents[2]
 src=(root/'vita3k/kernel/src/sync_primitives.cpp').read_text()
 helpers=src[src.index('template <class Unregister>'):src.index('// *****************',src.index('template <class Unregister>'))]
-wait_signal=src[src.index('SceInt32 semaphore_wait('):src.index('int semaphore_delete(')]
+wait_signal=src[src.index('struct SemaphoreWaitReturnReceipt'):src.index('int semaphore_delete(')]
 cancel=src[src.index('int semaphore_cancel('):src.index('// **********************',src.index('int semaphore_cancel('))]
 header=(root/'vita3k/kernel/include/kernel/sync_primitives.h').read_text()
 entry=header[header.index('struct SemaphoreWaitControl'):header.index('// NOTE: uid')]
@@ -39,10 +39,10 @@ struct Record {int id;uint8_t status=static_cast<uint8_t>(ThreadStatus::wait);ap
 template<class M>auto lock_and_find(int id,M &m,std::mutex &mutex){std::lock_guard lock(mutex);return m.count(id)?m.at(id):typename M::mapped_type{};}
 constexpr bool LOG_SYNC_PRIMITIVES=false;
 #define LOG_DEBUG(...) ((void)0)
-struct Completion {int uid,thread;uint32_t replacements;bool timed;int result;bool terminal;uint64_t invocation;};
+struct Completion {int uid,thread;uint32_t replacements;bool timed;int result;bool terminal;uint64_t invocation;bool returned;};
 std::vector<Completion> completions;
-void completion_log(const char *,int uid,int thread,uint32_t replacements,bool timed,int result,bool terminal,uint64_t invocation){
- completions.push_back({uid,thread,replacements,timed,result,terminal,invocation});
+void completion_log(const char *,int uid,int thread,uint32_t replacements,bool timed,int result,bool terminal,uint64_t invocation,bool returned){
+ completions.push_back({uid,thread,replacements,timed,result,terminal,invocation,returned});
 }
 #define LOG_INFO(...) completion_log(__VA_ARGS__)
 #define RET_ERROR(x) (x)
@@ -158,14 +158,14 @@ int main(){
    std::lock_guard sl(sema->mutex),kl(k.mutex),tl(thread->mutex);
    const auto now=app::audit_current_semaphore_registrations(k);
    const auto terminal=app::observe_semaphore_terminal(*retained,expected,now);
-   assert(terminal.status==app::SemaphoreTerminalStatus::Terminal&&terminal.result&&*terminal.result==rc);
+   assert(terminal.status==app::SemaphoreTerminalStatus::BodyReturned&&terminal.result&&*terminal.result==rc);
   }
   retained.reset();assert(weak.expired());
   const bool rebound=(mode>=5&&mode<=9);
   assert(completions.size()==(rebound?1U:0U));
   if(rebound){
    const auto &c=completions.front();
-   assert(c.uid==1&&c.thread==1&&c.result==rc&&c.terminal&&c.invocation!=0);
+   assert(c.uid==1&&c.thread==1&&c.result==rc&&c.terminal&&c.invocation!=0&&c.returned);
    assert(c.replacements==(mode==9?1U:3U)&&c.timed==(mode==8));
   }
   if(mode==2||mode==3||mode==8)assert(budget==0);
@@ -333,7 +333,7 @@ int main(){
      if(!sema->waiting_threads->empty()){
       auto now=app::audit_current_semaphore_registrations(k);assert(now.error.empty()&&now.waiters==1);
       if(call==0){first=now;first_control=(*sema->waiting_threads->begin()).semaphore_wait_control;}
-      else{assert(!app::same_semaphore_registrations(first,now));assert(app::match_semaphore_registration(now,first.entries.front())==app::SemaphoreRegistrationMatch::DifferentInvocation);assert(app::observe_semaphore_terminal(*first_control,first.entries.front(),now).status==app::SemaphoreTerminalStatus::Terminal);}
+      else{assert(!app::same_semaphore_registrations(first,now));assert(app::match_semaphore_registration(now,first.entries.front())==app::SemaphoreRegistrationMatch::DifferentInvocation);assert(app::observe_semaphore_terminal(*first_control,first.entries.front(),now).status==app::SemaphoreTerminalStatus::BodyReturned);}
       admitted=true;
      }}
     if(!admitted)std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -346,6 +346,51 @@ int main(){
    }
   }
   assert(first_control->registration.complete);++cases;
+ }
+
+ // Invoke the body directly to prove Terminal and BodyReturned are distinct.
+ for(bool priority:{false,true})for(int mode=0;mode<3;++mode){
+  KernelState k;auto sema=std::make_shared<Semaphore>();sema->attr=priority?SCE_KERNEL_ATTR_TH_PRIO:0;sema->waiting_threads=queue(priority);k.semaphores[1]=sema;
+  auto thread=std::make_shared<ThreadState>();k.threads[1]=thread;
+  SemaphoreWaitReturnReceipt receipt;int rc=999;uint32_t timeout=200000;
+  std::thread worker([&]{rc=semaphore_wait_body(k,"return boundary",1,1,1,mode==2?&timeout:nullptr,receipt);});
+  app::SemaphoreRegistrationEntry expected{};bool admitted=false;
+  for(int n=0;n<2000&&!admitted;++n){
+   {std::lock_guard sl(sema->mutex),kl(k.mutex),tl(thread->mutex);
+    if(!sema->waiting_threads->empty()){
+     const auto now=app::audit_current_semaphore_registrations(k);assert(now.error.empty()&&now.waiters==1);
+     expected=now.entries.front();
+     auto control=(*sema->waiting_threads->begin()).semaphore_wait_control;
+     assert(!acknowledge_semaphore_body_return({sema,control},0)); // still blocked
+     admitted=true;
+    }}
+   if(!admitted)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }assert(admitted);
+  if(mode==0)assert(semaphore_signal(k,"return boundary",1,1,1)==0);
+  if(mode==1){uint32_t count=0;assert(semaphore_cancel(k,"return boundary",1,1,0,&count)==0);}
+  worker.join();
+  assert(rc==(mode==0?SCE_KERNEL_OK:mode==1?SCE_KERNEL_ERROR_WAIT_CANCEL:SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+  assert(sema->mutex.try_lock());sema->mutex.unlock();
+  assert(thread->mutex.try_lock());thread->mutex.unlock();
+  std::lock_guard sl(sema->mutex),kl(k.mutex),tl(thread->mutex);
+  const auto now=app::audit_current_semaphore_registrations(k);assert(now.error.empty());
+  assert(app::observe_semaphore_terminal(*receipt.control,expected,now).status==app::SemaphoreTerminalStatus::Terminal);
+  assert(!acknowledge_semaphore_body_return(receipt,rc+7));
+  assert(!receipt.control->body_returned);
+  // The exact original object is retained; a reused UID cannot redirect the ack.
+  k.semaphores[1]=std::make_shared<Semaphore>();k.semaphores[1]->waiting_threads=queue(priority);
+  assert(acknowledge_semaphore_body_return(receipt,rc));
+  assert(receipt.control->body_returned&&receipt.control->body_return_result==rc);
+  assert(app::observe_semaphore_terminal(*receipt.control,expected,now).status==app::SemaphoreTerminalStatus::BodyReturned);
+  assert(!acknowledge_semaphore_body_return(receipt,rc));++cases;
+ }
+ {
+  KernelState k;SemaphoreWaitReturnReceipt receipt;
+  assert(semaphore_wait_body(k,"missing",1,1,1,nullptr,receipt)==SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID);
+  assert(!receipt.control&&!receipt.semaphore&&!acknowledge_semaphore_body_return(receipt,0));++cases;
+  auto sema=std::make_shared<Semaphore>();sema->val=1;sema->waiting_threads=queue(false);k.semaphores[1]=sema;k.threads[1]=std::make_shared<ThreadState>();
+  assert(semaphore_wait_body(k,"immediate",1,1,1,nullptr,receipt)==0&&sema->val==0);
+  assert(!receipt.control&&!receipt.semaphore);++cases;
  }
  std::cout<<"PASS: "<<cases<<" production semaphore lifecycle cases; real host wait/signal/cancel/timeout/abort, rebuilt nodes, ownership lifetime, invocation isolation and legacy cleanup\n";
 }

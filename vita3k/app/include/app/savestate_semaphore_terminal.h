@@ -5,7 +5,7 @@
 #include <optional>
 
 namespace app {
-enum class SemaphoreTerminalStatus { Registered, AbsentUnresolved, Terminal, Changed, Invalid };
+enum class SemaphoreTerminalStatus { Registered, AbsentUnresolved, Terminal, BodyReturned, Changed, Invalid };
 struct SemaphoreTerminalObservation {
     SemaphoreTerminalStatus status;
     std::optional<int32_t> result;
@@ -19,6 +19,8 @@ SemaphoreTerminalObservation observe_semaphore_terminal(const Control &control,
     const SemaphoreRegistrationEntry &expected, const SemaphoreRegistrationAudit &current) {
     const auto invalid = SemaphoreTerminalObservation{SemaphoreTerminalStatus::Invalid, {}};
     const auto &r = control.registration;
+    if (control.body_returned && (!control.terminal_ready || control.body_return_result != control.terminal_result))
+        return invalid;
     if (expected.control != &control || !r.complete
         || control.session_hi != expected.session_hi || control.session_lo != expected.session_lo
         || control.invocation != expected.invocation || r.uid != expected.uid
@@ -38,7 +40,7 @@ SemaphoreTerminalObservation observe_semaphore_terminal(const Control &control,
     if (match == SemaphoreRegistrationMatch::Mismatch)
         return {SemaphoreTerminalStatus::Changed, {}};
     if (control.terminal_ready)
-        return {SemaphoreTerminalStatus::Terminal, control.terminal_result};
+        return {control.body_returned ? SemaphoreTerminalStatus::BodyReturned : SemaphoreTerminalStatus::Terminal, control.terminal_result};
     return {SemaphoreTerminalStatus::AbsentUnresolved, {}};
 }
 } // namespace app
