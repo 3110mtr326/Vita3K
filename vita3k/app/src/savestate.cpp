@@ -104,6 +104,7 @@
 #include <app/savestate_semaphore_wait.h>
 #include <app/savestate_semaphore_entry.h>
 #include <app/savestate_semaphore_entry_queue.h>
+#include <app/savestate_semaphore_order.h>
 #include <app/savestate_semaphore_queue.h>
 #include <app/savestate_semaphore_rebind.h>
 #include <app/savestate_simple_event_rebind.h>
@@ -634,9 +635,13 @@ static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &
     if (kernel.snapshot_restore_failed) return "Previous rollback failed; restart the app";
     std::vector<SnapshotCpuTarget<CPUState>> targets;
     std::vector<const ThreadRecord *> bindings;
+    const auto order = prepare_semaphore_order(records);
+    if (!order.error.empty()) return order.error;
     size_t deferred = 0;
-    for (const auto &record : records) {
-        if (!record.semaphore_wait.uid) continue;
+    for (const auto &step : order.steps) {
+        const auto &record = records[step.record_index];
+        LOG_INFO("Savestate semaphore registration order: uid {}, position {}/{}, thread {}, priority {}; preparation only, no wait dispatch",
+            step.uid, step.position, step.queue_size, step.thread_id, step.priority);
         const auto found = kernel.threads.find(record.id);
         if (found == kernel.threads.end() || !found->second || !found->second->cpu
             || found->second->status == ThreadStatus::run)
@@ -674,7 +679,7 @@ static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &
         return "Semaphore entry CPU rollback failed; restart without Resume";
     }
     if (result != SnapshotCpuProbe::Passed) return "Semaphore entry CPU verification refused";
-    LOG_INFO("Savestate semaphore entry probe: {} untimed candidates, {} deferred; entry registers/temporary queue bindings MATCH; nested checkpoint MATCH; rollback MATCH; no instructions executed, no timeout writeback or saved continuation",
+    LOG_INFO("Savestate semaphore entry probe: {} untimed candidates, {} deferred; saved registration order/entry registers/temporary queue bindings MATCH; nested checkpoint MATCH; rollback MATCH; no instructions executed, no timeout writeback or saved continuation",
         targets.size(), deferred);
     return {};
 }
@@ -2371,7 +2376,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-semaphore-joint-entry/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-semaphore-order/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }

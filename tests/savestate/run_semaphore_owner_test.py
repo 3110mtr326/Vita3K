@@ -17,6 +17,7 @@ code=r'''
 #include <kernel/thread/thread_data_queue.h>
 #include <kernel/thread/wait_invocation_identity.h>
 #include <cassert>
+#include <array>
 #include <chrono>
 #include <iostream>
 #include <map>
@@ -31,6 +32,7 @@ struct KernelState {
  ThreadStatePtr get_thread(int id){std::lock_guard lock(mutex);return threads.at(id);}
 };
 #include <app/savestate_semaphore_rebind.h>
+#include <app/savestate_semaphore_order.h>
 struct Record {int id;uint8_t status=static_cast<uint8_t>(ThreadStatus::wait);app::SnapshotWaitTargets wait_targets{};app::SnapshotSemaphoreWait semaphore_wait{};};
 template<class M>auto lock_and_find(int id,M &m,std::mutex &mutex){std::lock_guard lock(mutex);return m.count(id)?m.at(id):typename M::mapped_type{};}
 constexpr bool LOG_SYNC_PRIMITIVES=false;
@@ -199,6 +201,61 @@ int main(){
   bad=v;bad.timeout_present=0;bad.timeout_us=bad.remaining_us=0;assert(!app::valid_snapshot_semaphore_wait(bad,t));
   bad=v;bad.remaining_us=0;assert(app::valid_snapshot_semaphore_wait(bad,t));
   bad.deadline_known=0;assert(app::valid_snapshot_semaphore_wait(bad,t));++cases;
+ }
+
+ // Register fresh production waits in planned order, waiting for each admission
+ // before starting the next. Input record order and thread IDs intentionally
+ // differ from saved queue order. Kernel/CPU surroundings are mocked.
+ for(bool priority:{false,true}){
+  KernelState k;auto sema=std::make_shared<Semaphore>();sema->attr=priority?SCE_KERNEL_ATTR_TH_PRIO:0;sema->waiting_threads=queue(priority);k.semaphores[1]=sema;
+  std::vector<Record> records;
+  for(int id:{2,3,1}){
+   auto thread=std::make_shared<ThreadState>();k.threads[id]=thread;
+   const uint32_t pos=id==3?0:id==1?1:2;
+   thread->priority=priority?(pos==0?10:20):(300-int(pos)*100);
+   Record r{id};r.wait_targets.count=1;r.wait_targets.targets[0]={1,1};
+   r.semaphore_wait={1,pos==0?2:1,thread->priority,pos,3,sema->attr,0,0};records.push_back(r);
+  }
+  const auto plan=app::prepare_semaphore_order(records);assert(plan.error.empty()&&plan.steps.size()==3);
+  assert(plan.steps[0].thread_id==3&&plan.steps[1].thread_id==1&&plan.steps[2].thread_id==2);
+  std::vector<std::thread> workers;std::array<int,3> result{999,999,999};
+  for(size_t i=0;i<plan.steps.size();++i){
+   const auto step=plan.steps[i];const int count=records[step.record_index].semaphore_wait.signal;
+   workers.emplace_back([&,i,step,count]{result[i]=semaphore_wait(k,"ordered",step.thread_id,step.uid,count,nullptr);});
+   bool admitted=false;
+   for(int attempt=0;attempt<2000&&!admitted;++attempt){
+    {std::lock_guard lock(sema->mutex);
+     if(sema->waiting_threads->size()==i+1){size_t j=0;for(auto it=sema->waiting_threads->begin();it!=sema->waiting_threads->end();++it,++j)assert((*it).thread==k.threads.at(plan.steps[j].thread_id));admitted=true;}}
+    if(!admitted)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+   }assert(admitted);
+  }
+  // One token cannot bypass the head's two-token requirement.
+  assert(semaphore_signal(k,"ordered",1,1,1)==0);
+  {std::lock_guard lock(sema->mutex);assert(sema->waiting_threads->size()==3);}
+  for(size_t i=0;i<3;++i){
+   assert(semaphore_signal(k,"ordered",1,1,1)==0);workers[i].join();assert(result[i]==0);
+   std::lock_guard lock(sema->mutex);assert(sema->waiting_threads->size()==2-i);
+  }
+  assert(sema->val==0);++cases;
+ }
+ {
+  std::vector<Record> valid;
+  for(int i=0;i<2;++i){Record r{i+1};r.wait_targets.count=1;r.wait_targets.targets[0]={1,7};r.semaphore_wait={7,1,100+i,uint32_t(i),2,SCE_KERNEL_ATTR_TH_PRIO,0,0};valid.push_back(r);}
+  assert(app::prepare_semaphore_order(valid).error.empty());++cases;
+  for(int mode=0;mode<8;++mode){auto bad=valid;
+   if(mode==0)bad.pop_back();
+   if(mode==1)bad[1].semaphore_wait.position=0;
+   if(mode==2)bad[1].id=1;
+   if(mode==3)bad[1].semaphore_wait.queue_size=3;
+   if(mode==4)bad[1].semaphore_wait.attr=0;
+   if(mode==5)bad[1].semaphore_wait.priority=50;
+   if(mode==6)bad[1].wait_targets.targets[0].uid=8;
+   if(mode==7)bad.resize(4097);
+   auto plan=app::prepare_semaphore_order(bad);assert(!plan.error.empty()&&plan.steps.empty());++cases;
+  }
+  assert(app::prepare_semaphore_order(std::vector<Record>{}).error.empty());++cases;
+  auto multiple=valid;Record other{9};other.wait_targets.count=1;other.wait_targets.targets[0]={1,3};other.semaphore_wait={3,1,100,0,1,0,0,0};multiple.push_back(other);
+  auto plan=app::prepare_semaphore_order(multiple);assert(plan.error.empty()&&plan.steps.front().uid==3&&plan.steps.back().uid==7);++cases;
  }
  KernelState k;auto s=std::make_shared<Semaphore>();s->val=3;s->waiting_threads=queue(false);k.semaphores[1]=s;k.threads[1]=std::make_shared<ThreadState>();
  assert(semaphore_wait(k,"fast",1,1,1,nullptr)==0&&s->val==2&&s->waiting_threads->empty());++cases;

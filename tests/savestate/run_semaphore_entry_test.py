@@ -6,6 +6,7 @@ r=Path(__file__).resolve().parents[2]
 code=r'''
 #include <app/savestate_semaphore_entry.h>
 #include <app/savestate_semaphore_entry_queue.h>
+#include <app/savestate_semaphore_order.h>
 #include <functional>
 #include <app/savestate_cpu_probe.h>
 #include <cassert>
@@ -103,7 +104,7 @@ extra=r'''
   if(mode==1){rec.semaphore_wait.timeout_present=rec.semaphore_wait.deadline_known=1;rec.semaphore_wait.timeout_us=100;rec.semaphore_wait.remaining_us=40;rec.ctx.cpu_registers[2]=0x2000;}
   if(mode==2)mem.words.clear();
   if(mode==3)thread->status=ThreadStatus::run;
-  if(mode==5)rec.semaphore_wait={};
+  if(mode==5){rec.semaphore_wait={};rec.wait_targets={};}
   integration_writes=0;fail_rollback=mode==4;
   if(mode==6)object->waiting_threads->front().signal++;
   int nested=0;

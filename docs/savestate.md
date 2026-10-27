@@ -4,7 +4,51 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Joint semaphore entry and saved queue probe (latest checkpoint v35, format v33)
+## Saved semaphore registration order (latest checkpoint v36, format v33)
+
+prepare_semaphore_order constructs a complete, deterministic order from saved
+queue positions, independently of thread-record order or numerical thread IDs.
+Within each semaphore it follows saved positions and checks queue completeness,
+unique positions and thread IDs, consistent size/attributes and priority order.
+Equal-priority ties retain saved positions. Separate semaphores are sorted by UID
+for deterministic preparation only; this does not establish cross-object causality.
+Malformed input clears the entire plan before any CPU change. Input is capped
+at4096 records. Priority ordering follows the existing production queue behavior.
+
+The joint entry probe now builds and validates this plan, visits saved records
+in planned order and emits uid/position/size/thread/priority log lines. Existing
+ABI checks still defer timed/CB/unsupported entries. Planned order is not a
+dispatch authorization: retiring current host calls, restoring priorities and
+establishing registration barriers remain necessary before real guest replay.
+CPU candidates remain diagnostic and are rolled back through the v35 joint
+transaction; no saved wait is executed on the device.
+
+Host validation: 47 production semaphore lifecycle cases. New tests launch
+fresh production semaphore_wait calls sequentially in planned order, awaiting
+each queue registration before launching the next. FIFO and priority cases use
+shuffled records/IDs and priority ties; queue order is checked after each admission.
+Signalling one token cannot bypass a head needing two; subsequent signals wake
+the planned waiter in order. These are real host waits with mocked kernel/thread
+surroundings, not guest JIT execution or restored host continuations. Invalid
+plans, missing/duplicate positions, attributes, priorities, multiple groups and
+size limits are also checked. 53 entry/probe tests and the extracted orchestration
+test pass. Native sync_primitives.cpp and savestate.cpp syntax checks pass.
+Android compilation and v36 device behavior remain pending.
+
+Marker CPU-semaphore-order; schema remains33. Savestate semaphore registration
+order reports each planned step (zero-based position). Successful entry probe
+reports saved registration order/entry registers/temporary queue bindings MATCH,
+nested checkpoint MATCH and rollback MATCH. Timed writeback and rewind remain
+unimplemented. Create a fresh Save State for this checkpoint's device test.
+
+v35 device evidence, log2026-10-27 13:54: four untimed candidates (136,137,171,200),
+zero deferred; entry/temporary queue/nested/rollback all MATCH. All joint rollbacks
+and preflight MATCH. Twelve current waits completed0 (6 semaphores, 1 simple event,
+5 conditions including mutex reacquire). Post-Resume ~30fps; one Load in log,
+ending13:54:24.928. No timed semaphore coverage or saved instructions executed.
+User reports normal operation; screenshot timestamp13:52 predates this log.
+
+## Joint semaphore entry and saved queue probe (previous checkpoint v35, format v33)
 
 The untimed semaphore entry CPU probe now runs INSIDE the temporary saved queue
 transaction, after file positions, RAM, original saved CPU and sync values have
