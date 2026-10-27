@@ -58,6 +58,49 @@ int main(){int cases=0;
   const bool valid=mode<2||mode==28;
   assert(result.error.empty()==valid);assert(result.waiters==(mode<2?1u:0u));
   assert(t->priority==777);++cases;
+  assert(result.entries.size()==result.waiters);
+  if(mode==0){
+   const auto expected=result.entries.front();
+   assert(app::match_semaphore_registration(result,expected)==app::SemaphoreRegistrationMatch::Matched);
+   for(int fault=0;fault<20;++fault){
+    auto changed=result;auto &v=changed.entries.front();auto wanted=expected;
+    auto kind=app::SemaphoreRegistrationMatch::Mismatch;
+    if(fault==0){changed.error="refused";kind=app::SemaphoreRegistrationMatch::Invalid;}
+    if(fault==1){changed.waiters++;kind=app::SemaphoreRegistrationMatch::Invalid;}
+    if(fault==2){changed.entries.clear();changed.waiters=0;kind=app::SemaphoreRegistrationMatch::Absent;}
+    if(fault==3){v.invocation++;kind=app::SemaphoreRegistrationMatch::DifferentInvocation;}
+    if(fault==4){v.session_hi++;kind=app::SemaphoreRegistrationMatch::DifferentInvocation;}
+    if(fault==5){v.session_lo++;kind=app::SemaphoreRegistrationMatch::DifferentInvocation;}
+    if(fault==6)v.uid++;
+    if(fault==7)v.signal++;
+    if(fault==8)v.priority++;
+    if(fault==9)v.attr++;
+    if(fault==10)v.position++;
+    if(fault==11)v.timeout_present++;
+    if(fault==12)v.timeout_us++;
+    if(fault==13)v.object=&other;
+    if(fault==14)v.thread=&other;
+    if(fault==15)v.control=&other;
+    if(fault==16){changed.entries.push_back(expected);changed.waiters++;kind=app::SemaphoreRegistrationMatch::Invalid;}
+    if(fault==17){wanted.invocation=0;kind=app::SemaphoreRegistrationMatch::Invalid;}
+    if(fault==18){wanted.control=nullptr;kind=app::SemaphoreRegistrationMatch::Invalid;}
+    if(fault==19){v.thread_id++;kind=app::SemaphoreRegistrationMatch::Absent;}
+    assert(app::match_semaphore_registration(changed,wanted)==kind);
+    if(fault!=17&&fault!=18)assert(!app::same_semaphore_registrations(result,changed));
+    ++cases;
+   }
+   assert(app::same_semaphore_registrations(result,result));
+   auto t2=std::make_shared<Thread>();k.threads[2]=t2;
+   auto c2=std::make_shared<SemaphoreWaitControl>(*c);c2->registration.thread_id=2;
+   o->waiting_threads->push_back({t2,2,100,0,0,c2,&c2->canceled});
+   auto duplicate=app::audit_current_semaphore_registrations(k);
+   assert(!duplicate.error.empty()&&duplicate.entries.empty()&&duplicate.waiters==0);++cases;
+   c2->invocation=2;
+   auto two=app::audit_current_semaphore_registrations(k);
+   assert(two.error.empty()&&two.entries.size()==2);
+   assert(two.entries[0].position==0&&two.entries[1].position==1);++cases;
+  }
+
  }
  std::cout<<"PASS "<<cases<<" live semaphore registration audit cases\n";
 }

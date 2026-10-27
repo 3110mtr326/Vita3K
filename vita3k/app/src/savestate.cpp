@@ -2392,7 +2392,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-semaphore-registration/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-semaphore-checkpoint/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
@@ -2655,10 +2655,10 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             // CURRENT queue nodes with the same live invocation ownership.
             const auto rebound = rebind_current_semaphore_queues(kernel, [&] {
                 const auto after = audit_current_semaphore_registrations(kernel);
-                return after.error.empty() && after.waiters == registrations.waiters;
+                return same_semaphore_registrations(registrations, after);
             });
             if (!rebound.error.empty()) return rebound.error;
-            LOG_INFO("Savestate semaphore registration receipts: {} live waiters MATCH after rebind; receipts preserved through node replacement; no saved continuation", rebound.waiters);
+            LOG_INFO("Savestate semaphore registration receipts: {} live waiters MATCH after rebind; exact invocation IDs/order/conditions/ownership MATCH through node replacement; no saved continuation", rebound.waiters);
             LOG_INFO("Savestate current semaphore rebind: {} queues, {} live waiters; order/requirements/invocation ownership MATCH; new current nodes retained for Resume, old nodes retired; no saved waits or game rewind committed.",
                 rebound.queues, rebound.waiters);
             const auto events_rebound = rebind_current_simple_event_queues(kernel);

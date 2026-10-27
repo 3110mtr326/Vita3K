@@ -94,7 +94,7 @@ int main(){
          if(fault==10)thread->status=ThreadStatus::run;
          auto bad=app::audit_current_semaphore_registrations(k);assert(!bad.error.empty()&&bad.waiters==0);
          v=receipt;e.semaphore_wait_control->canceled=false;e.semaphore_wait_control->invocation=invocation;thread->status=ThreadStatus::wait;
-         assert(app::audit_current_semaphore_registrations(k).error.empty());++cases;
+         assert(app::same_semaphore_registrations(audit,app::audit_current_semaphore_registrations(k)));++cases;
         }
         auto *original=sema->waiting_threads.get();
         auto rejected=app::rebind_current_semaphore_queues(k,[&]{
@@ -109,6 +109,7 @@ int main(){
 
         if(mode>=5&&mode<=8){
          std::lock_guard kernel_lock(k.mutex),thread_lock(thread->mutex);
+         const auto audit_before_rebind=app::audit_current_semaphore_registrations(k);
          auto *before=sema->waiting_threads.get();
          auto rebound=app::rebind_current_semaphore_queues(k);
          assert(rebound.error.empty()&&rebound.waiters==1&&rebound.queues==1);
@@ -117,7 +118,7 @@ int main(){
          assert(app::rebind_current_semaphore_queues(k).error.empty());
          assert(app::rebind_current_semaphore_queues(k).error.empty());
          assert(e.semaphore_wait_control->snapshot_rebind_count==3);
-         assert(app::audit_current_semaphore_registrations(k).error.empty());
+         assert(app::same_semaphore_registrations(audit_before_rebind,app::audit_current_semaphore_registrations(k)));
         }
         if(mode>=9){
          std::lock_guard kernel_lock(k.mutex),thread_lock(thread->mutex);
@@ -306,6 +307,35 @@ int main(){
  }
  KernelState k;auto s=std::make_shared<Semaphore>();s->val=3;s->waiting_threads=queue(false);k.semaphores[1]=s;k.threads[1]=std::make_shared<ThreadState>();
  assert(semaphore_wait(k,"fast",1,1,1,nullptr)==0&&s->val==2&&s->waiting_threads->empty());++cases;
+
+ for(bool priority:{false,true}){
+  KernelState k;auto sema=std::make_shared<Semaphore>();sema->attr=priority?SCE_KERNEL_ATTR_TH_PRIO:0;sema->waiting_threads=queue(priority);k.semaphores[1]=sema;
+  auto thread=std::make_shared<ThreadState>();k.threads[1]=thread;
+  app::SemaphoreRegistrationAudit first;
+  std::shared_ptr<SemaphoreWaitControl> first_control;
+  for(int call=0;call<2;++call){
+   thread->status=ThreadStatus::run;int result=999;
+   std::thread worker([&]{result=semaphore_wait(k,"new invocation",1,1,1,nullptr);});
+   bool admitted=false;
+   for(int attempt=0;attempt<2000&&!admitted;++attempt){
+    {std::lock_guard sl(sema->mutex),kl(k.mutex),tl(thread->mutex);
+     if(!sema->waiting_threads->empty()){
+      auto now=app::audit_current_semaphore_registrations(k);assert(now.error.empty()&&now.waiters==1);
+      if(call==0){first=now;first_control=(*sema->waiting_threads->begin()).semaphore_wait_control;}
+      else{assert(!app::same_semaphore_registrations(first,now));assert(app::match_semaphore_registration(now,first.entries.front())==app::SemaphoreRegistrationMatch::DifferentInvocation);}
+      admitted=true;
+     }}
+    if(!admitted)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+   }assert(admitted);
+   assert(semaphore_signal(k,"new invocation",1,1,1)==0);worker.join();assert(result==0);
+   {std::lock_guard sl(sema->mutex),kl(k.mutex),tl(thread->mutex);
+    auto now=app::audit_current_semaphore_registrations(k);
+    assert(now.error.empty()&&now.waiters==0);
+    assert(app::match_semaphore_registration(now,first.entries.front())==app::SemaphoreRegistrationMatch::Absent);
+   }
+  }
+  assert(first_control->registration.complete);++cases;
+ }
  std::cout<<"PASS: "<<cases<<" production semaphore lifecycle cases; real host wait/signal/cancel/timeout/abort, rebuilt nodes, ownership lifetime, invocation isolation and legacy cleanup\n";
 }
 '''.replace('ENTRY',entry).replace('HELPERS',helpers).replace('WAIT_SIGNAL',wait_signal).replace('CANCEL\n',cancel)

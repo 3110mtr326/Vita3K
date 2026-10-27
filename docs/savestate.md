@@ -4,7 +4,58 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Live semaphore registration receipts (latest checkpoint v38, format v33)
+## Exact live semaphore registration checkpoints (latest checkpoint v39, format v33)
+
+v38 validated each live receipt and compared waiter counts across current-node
+replacement. v39 also captures an ordered, process-local value snapshot of each
+registration: object/thread IDs, count, entry priority, attributes, queue position,
+timeout metadata, session/invocation token, and object/thread/control identities.
+Node addresses are deliberately excluded because node replacement is allowed.
+The entire snapshot must match in the rebind verification callback; equal counts
+alone no longer satisfy the checkpoint. On mismatch the existing rebind
+transaction restores its original queues. No saved continuation is dispatched.
+
+The audit additionally rejects duplicate session/invocation tokens even if the
+controls have distinct addresses. Failure clears entries and counts, preventing
+partial observations from being accepted. Entries contain opaque non-owning
+identities only: never serialized or dereferenced by the value comparator.
+Captures require all kernel/primitive/thread locks. Production captures and
+compares under continuous exclusion. Observations across unlocks cannot establish
+uninterrupted liveness or authorize retirement/replay.
+
+A value-only per-registration matcher distinguishes Matched, Absent,
+DifferentInvocation, Mismatch and Invalid. In particular, a later call by the
+same thread is not mistaken for the prior call, and a completed call may retain
+its receipt without appearing in the live queue. Absent does not mean pending:
+the call may have already finished. This matcher is host-tested foundation code;
+the device path uses the whole-snapshot comparison. No asynchronous registration
+barrier, guest replay, host-wait retirement or complete rewind is enabled.
+
+Validation: 61 production semaphore lifecycle cases, including real successive
+wait calls on the same host thread identity with FIFO and priority queues. A
+held receipt from the first call matches neither absence after completion nor
+the next invocation. Existing repeated node replacement preserves exact snapshots.
+51 registration audit/matcher cases cover every snapshot field, duplicate call
+tokens, absent/changed invocations, malformed observations and ownership errors.
+35 extracted orchestration modes include same-count checkpoint mismatch refusal.
+Native sync_primitives.cpp and savestate.cpp syntax checks pass. Android/device
+compilation and behavior remain pending. Marker CPU-semaphore-checkpoint.
+
+After rebind, registration receipt logs now say exact invocation IDs/order/
+conditions/ownership MATCH. Existing entry/priority/GPU diagnostics remain.
+Save schema stays33. Use a fresh Save State for this checkpoint's device test.
+
+v38 device evidence, supplied2026-10-27 log: two successful Loads,18:29:00 and
+18:32:24. Current receipt counts4 and3 MATCH before/after rebind. Each had2 untimed
+saved CPU candidates,0 deferred, priority/order/entry/temporary queue/nested/
+rollback MATCH; all joint rollbacks, GPU and preflight passed. Four and three
+current semaphore calls completed0 after respective resumes. First resume ran
+for minutes near30fps; second ran about6 seconds before shutdown. Saved candidate
+sets differ, so identical-snapshot repeat loading is not established. All current
+and registration priorities equal; no timed semaphore or guest replay coverage.
+User normal; screenshot filename18:33:02 differs from checkpoint times.
+
+## Live semaphore registration receipts (previous checkpoint v38, format v33)
 
 The normal production semaphore_wait now records an immutable receipt only after
 queue push succeeds, while still holding semaphore/thread locks. It contains
