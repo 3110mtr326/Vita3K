@@ -4,7 +4,55 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Saved semaphore registration order (latest checkpoint v36, format v33)
+## Semaphore registration priority transaction (latest checkpoint v37, format v33)
+
+The production semaphore wait takes queue priority from ThreadState::priority.
+The v36 order plan alone does not reproduce that input when a live thread has a
+different priority. v37 temporarily applies each eligible candidate's saved QUEUE
+priority to its thread before applying entry CPU registers. The NGS/context/GPU
+checkpoint observes both together. CPU registers are rolled back first, then
+all thread priorities, before the outer saved queues and other domains roll back.
+Existing live queue-entry priorities and container ordering are never edited.
+Continuous kernel/primitive/thread exclusion is required for the entire scope.
+
+The new bounded priority transaction validates non-null, distinct integer targets
+and backs up all values before any writes. A nested refusal, exception, partial
+CPU apply failure, or priority mutation causes refusal and restoration of all
+priorities. Rollback failure propagates the persistent restart-without-Resume
+veto. Empty candidate lists still skip this probe and run the other diagnostics.
+Timed and callback entries remain deferred. No saved instructions execute.
+
+This is registration-priority preparation, NOT restoration of saved scheduler
+state. The saved queue priority may differ from the thread priority at save time
+if the guest changed it after entering the wait. The latter is not captured by
+this format. A future replay must handle that distinction, current host-wait
+retirement, registration barriers, and all other state domains before committing.
+No scheduler priority is retained after this diagnostic; full rewind is disabled.
+
+Host validation: 11 priority-transaction cases including null/duplicate/empty/
+oversize targets, exact4096 target boundary, nested rejection/exception/mutation,
+integer extremes, repeat and nested scopes. 59 entry/probe cases include two
+waiters with reversed record order and differing live priorities, nested failure,
+partial second CPU write, and aliased CPU rejection; all priorities and CPU state
+are restored. Existing extracted session orchestration test and native syntax
+checks for sync_primitives.cpp and savestate.cpp pass. Android/device pending.
+
+Marker CPU-semaphore-priority. New log: Savestate semaphore registration priority
+(current and registration values), followed by Savestate semaphore priority probe:
+registration priorities MATCH; nested checkpoint MATCH; rollback MATCH.
+Format stays33; create a fresh Save State with this build for the device test.
+
+v36 device result: user reports normal operation. Log2026-10-27 15:00:52 shows
+three untimed candidates, zero deferred, order/CPU/temporary queues/nested/rollback
+MATCH; joint GPU passed, all domain rollbacks and preflight MATCH. Each saved
+queue had only one waiter, so multi-waiter saved ordering remains untested on the
+device. Six current semaphore calls completed0 after resume and ~30fps returned.
+Five condition calls and one simple event completed during shutdown, not ordinary
+gameplay. No timed semaphore or saved continuation coverage. One Load and less
+than30s to shutdown in supplied log; screenshot filename15:01:27 differs from
+log checkpoint15:00:52. Do not infer repeated Load or a long resume from this log.
+
+## Saved semaphore registration order (previous checkpoint v36, format v33)
 
 prepare_semaphore_order constructs a complete, deterministic order from saved
 queue positions, independently of thread-record order or numerical thread IDs.

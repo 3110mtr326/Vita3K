@@ -105,6 +105,7 @@
 #include <app/savestate_semaphore_entry.h>
 #include <app/savestate_semaphore_entry_queue.h>
 #include <app/savestate_semaphore_order.h>
+#include <app/savestate_semaphore_priority.h>
 #include <app/savestate_semaphore_queue.h>
 #include <app/savestate_semaphore_rebind.h>
 #include <app/savestate_simple_event_rebind.h>
@@ -628,13 +629,14 @@ static std::string probe_saved_cpu_contexts(KernelState &kernel,const std::vecto
     return {};
 }
 
-// Guard owns all kernel/primitive/thread locks. Only CPU candidates are applied;
+// Guard owns all kernel/primitive/thread locks. CPU and registration priorities are applied;
 // no guest instructions, queue changes or timeout-pointer writes occur here.
 static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &mem,
     const std::vector<ThreadRecord> &records, const std::function<bool()> &during = {}) {
     if (kernel.snapshot_restore_failed) return "Previous rollback failed; restart the app";
     std::vector<SnapshotCpuTarget<CPUState>> targets;
     std::vector<const ThreadRecord *> bindings;
+    std::vector<SemaphorePriorityTarget> priorities;
     const auto order = prepare_semaphore_order(records);
     if (!order.error.empty()) return order.error;
     size_t deferred = 0;
@@ -658,13 +660,18 @@ static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &
         if (!snapshot_semaphore_entry_queue_matches(kernel, record))
             return "Semaphore entry does not match temporary saved queue";
         bindings.push_back(&record);
+        priorities.push_back({&found->second->priority, step.priority});
+        LOG_INFO("Savestate semaphore registration priority: thread {}, current {}, registration {}; temporary only, saved scheduler priority unknown",
+            record.id, found->second->priority, step.priority);
         targets.push_back({found->second->cpu.get(), {candidate.plan->context, record.tpidruro}});
     }
     if (targets.empty()) {
         LOG_INFO("Savestate semaphore entry probe: 0 untimed candidates, {} deferred; CPU probe skipped; no saved continuation", deferred);
         return (!during || during()) ? std::string{} : "Nested checkpoint refused without entry candidates";
     }
-    const auto result = probe_snapshot_cpu_values<CPUState>(targets,
+    auto result = SnapshotCpuProbe::InvalidTargets;
+    const auto priority_result = probe_semaphore_priorities(priorities, [&] {
+        result = probe_snapshot_cpu_values<CPUState>(targets,
         [](CPUState &cpu) { return SnapshotCpuValues{save_context(cpu), read_tpidruro(cpu)}; },
         [](CPUState &cpu, const SnapshotCpuValues &v) { load_context(cpu, v.context); write_tpidruro(cpu, v.tpidruro); }, [&] {
             for (const auto *record : bindings)
@@ -674,11 +681,19 @@ static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &
                 if (!snapshot_semaphore_entry_queue_matches(kernel, *record)) return false;
             return true;
         });
+        return result == SnapshotCpuProbe::Passed;
+    });
+    if (priority_result == SemaphorePriorityProbe::RollbackFailed) {
+        kernel.snapshot_restore_failed = true;
+        return "Semaphore registration priority rollback failed; restart without Resume";
+    }
     if (result == SnapshotCpuProbe::RollbackFailed) {
         kernel.snapshot_restore_failed = true;
         return "Semaphore entry CPU rollback failed; restart without Resume";
     }
     if (result != SnapshotCpuProbe::Passed) return "Semaphore entry CPU verification refused";
+    if (priority_result != SemaphorePriorityProbe::Passed) return "Semaphore registration priority verification refused";
+    LOG_INFO("Savestate semaphore priority probe: {} registration priorities MATCH; nested checkpoint MATCH; rollback MATCH; no scheduler state committed", priorities.size());
     LOG_INFO("Savestate semaphore entry probe: {} untimed candidates, {} deferred; saved registration order/entry registers/temporary queue bindings MATCH; nested checkpoint MATCH; rollback MATCH; no instructions executed, no timeout writeback or saved continuation",
         targets.size(), deferred);
     return {};
@@ -2376,7 +2391,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-semaphore-order/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-semaphore-priority/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }

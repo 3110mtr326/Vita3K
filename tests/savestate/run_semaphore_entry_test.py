@@ -7,6 +7,7 @@ code=r'''
 #include <app/savestate_semaphore_entry.h>
 #include <app/savestate_semaphore_entry_queue.h>
 #include <app/savestate_semaphore_order.h>
+#include <app/savestate_semaphore_priority.h>
 #include <functional>
 #include <app/savestate_cpu_probe.h>
 #include <cassert>
@@ -76,17 +77,17 @@ integration=r'''
 #include <memory>
 using CPUState=SnapshotCpuValues;
 enum class ThreadStatus {run,wait,suspend};
-struct Thread {std::shared_ptr<CPUState> cpu;ThreadStatus status=ThreadStatus::wait;};
+struct Thread {int priority=777;std::shared_ptr<CPUState> cpu;ThreadStatus status=ThreadStatus::wait;};
 struct Entry {std::shared_ptr<Thread> thread;int signal=2,priority=100;uint32_t snapshot_timeout_present=0,snapshot_timeout_us=0;void *semaphore_wait_control=nullptr;bool *was_canceled=nullptr;};
 struct Object {uint32_t attr=0;std::shared_ptr<std::vector<Entry>> waiting_threads=std::make_shared<std::vector<Entry>>();};
 struct KernelState {bool snapshot_restore_failed=false;std::map<int,std::shared_ptr<Thread>> threads;std::map<int,std::shared_ptr<Object>> semaphores;};
 struct MemState {std::map<uint32_t,uint32_t> words;};
 template<class T> struct Ptr {uint32_t a;explicit Ptr(uint32_t v):a(v){}bool valid(MemState &m)const{return m.words.count(a);}T *get(MemState &m)const{return &m.words.at(a);}};
 struct ThreadRecord {int id;SnapshotSemaphoreWait semaphore_wait;SnapshotWaitTargets wait_targets;uint32_t wait_nid;CPUContext ctx;uint32_t tpidruro;};
-int integration_writes=0;bool fail_rollback=false;
+int integration_writes=0,throw_write_at=-1;bool fail_rollback=false;
 CPUContext save_context(CPUState &c){return c.context;}
 uint32_t read_tpidruro(CPUState &c){return c.tpidruro;}
-void load_context(CPUState &c,const CPUContext &v){c.context=v;++integration_writes;if(fail_rollback&&integration_writes==2)c.context.cpu_registers[0]++;}
+void load_context(CPUState &c,const CPUContext &v){c.context=v;++integration_writes;if(integration_writes==throw_write_at)throw std::runtime_error("partial CPU write");if(fail_rollback&&integration_writes==2)c.context.cpu_registers[0]++;}
 void write_tpidruro(CPUState &c,uint32_t v){c.tpidruro=v;}
 template<class...T>void ignore(T&&...){}
 #define LOG_INFO(...) ignore(__VA_ARGS__)
@@ -94,7 +95,7 @@ template<class...T>void ignore(T&&...){}
 code=code.replace('int main(){',integration+'int main(){')
 at=' std::cout<<"PASS "'
 extra=r'''
- for(int mode=0;mode<10;++mode){
+ for(int mode=0;mode<11;++mode){
   KernelState kernel;MemState mem{words};auto thread=std::make_shared<Thread>();
   thread->cpu=std::make_shared<CPUState>();thread->cpu->context=base;thread->cpu->context.cpu_registers[0]=999;thread->cpu->tpidruro=99;
   const auto before=*thread->cpu;kernel.threads[1]=thread;
@@ -111,6 +112,8 @@ extra=r'''
   auto error=probe_saved_semaphore_entries(kernel,mem,{rec},[&]{
     ++nested;
     if(mode==0||mode>=7)assert(thread->cpu->context.cpu_registers[15]==0x1000);
+    assert(thread->priority==((mode==0||mode==4||mode>=7)?100:777));
+    if(mode==10)thread->priority=999;
     if(mode==7)return false;
     if(mode==8)throw std::runtime_error("nested failure");
     if(mode==9)object->waiting_threads->front().signal++;
@@ -120,6 +123,7 @@ extra=r'''
   assert(error.empty()==(mode<3||mode==5));
   assert(kernel.snapshot_restore_failed==(mode==4));
   assert(integration_writes==((mode==0||mode==4||mode>=7)?2:0));
+  assert(thread->priority==777);
   if(mode!=4)assert(same_snapshot_cpu_values(*thread->cpu,before));
   if(mode==4){auto writes=integration_writes;assert(!probe_saved_semaphore_entries(kernel,mem,{rec}).empty());assert(writes==integration_writes);}
   ++cases;
@@ -145,6 +149,43 @@ extra+=r'''
   assert(snapshot_semaphore_entry_queue_matches(kernel,rec)==(mode==0));++cases;
  }
 '''
+
+extra+=r"""
+ // Multiple saved waiters with different live priorities; reversed input IDs.
+ for(int mode=0;mode<5;++mode){
+  KernelState kernel;MemState mem{words};std::vector<ThreadRecord> records;
+  std::vector<SnapshotCpuValues> originals;auto object=std::make_shared<Object>();kernel.semaphores[7]=object;
+  for(int id:{2,1}){
+   auto t=std::make_shared<Thread>();t->priority=700+id;t->cpu=std::make_shared<CPUState>();
+   t->cpu->context=base;t->cpu->context.cpu_registers[0]=900+id;t->cpu->tpidruro=90+id;
+   originals.push_back(*t->cpu);kernel.threads[id]=t;
+   SnapshotWaitTargets targets{};targets.count=1;targets.targets[0]={1,7};
+   auto w=basewait;w.queue_size=2;w.position=2-id;w.priority=100+(2-id);
+   records.push_back({id,w,targets,0x0C7B834B,base,uint32_t(40+id)});
+   Entry e{t};e.priority=w.priority;object->waiting_threads->push_back(e);
+  }
+  std::reverse(records.begin(),records.end());
+  integration_writes=0;fail_rollback=false;throw_write_at=mode==3?2:-1;
+  if(mode==4)kernel.threads[1]->cpu=kernel.threads[2]->cpu; // reject aliased CPUs before writes
+  int nested=0;
+  auto error=probe_saved_semaphore_entries(kernel,mem,records,[&]{
+   ++nested;
+   for(int id:{2,1}){assert(kernel.threads[id]->priority==100+(2-id));assert(kernel.threads[id]->cpu->context.cpu_registers[15]==0x1000);}
+   if(mode==1){kernel.threads[1]->priority=999;return true;}
+   if(mode==2)throw std::runtime_error("nested multi");
+   return true;
+  });
+  assert(error.empty()==(mode==0));assert(nested==(mode<3?1:0));
+  assert(!kernel.snapshot_restore_failed);
+  for(int id:{2,1}){
+   assert(kernel.threads[id]->priority==700+id);
+   assert(same_snapshot_cpu_values(*kernel.threads[id]->cpu, originals[mode==4?0:2-id]));
+  }
+  assert(integration_writes==(mode==4?0:4));
+  throw_write_at=-1;++cases;
+ }
+"""
+
 assert at in code;code=code.replace(at,extra+at)
 
 with tempfile.TemporaryDirectory() as d:
