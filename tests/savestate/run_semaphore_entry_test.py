@@ -5,6 +5,8 @@ p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);args=p.pa
 r=Path(__file__).resolve().parents[2]
 code=r'''
 #include <app/savestate_semaphore_entry.h>
+#include <app/savestate_semaphore_entry_queue.h>
+#include <functional>
 #include <app/savestate_cpu_probe.h>
 #include <cassert>
 #include <iostream>
@@ -74,7 +76,9 @@ integration=r'''
 using CPUState=SnapshotCpuValues;
 enum class ThreadStatus {run,wait,suspend};
 struct Thread {std::shared_ptr<CPUState> cpu;ThreadStatus status=ThreadStatus::wait;};
-struct KernelState {bool snapshot_restore_failed=false;std::map<int,std::shared_ptr<Thread>> threads;};
+struct Entry {std::shared_ptr<Thread> thread;int signal=2,priority=100;uint32_t snapshot_timeout_present=0,snapshot_timeout_us=0;void *semaphore_wait_control=nullptr;bool *was_canceled=nullptr;};
+struct Object {uint32_t attr=0;std::shared_ptr<std::vector<Entry>> waiting_threads=std::make_shared<std::vector<Entry>>();};
+struct KernelState {bool snapshot_restore_failed=false;std::map<int,std::shared_ptr<Thread>> threads;std::map<int,std::shared_ptr<Object>> semaphores;};
 struct MemState {std::map<uint32_t,uint32_t> words;};
 template<class T> struct Ptr {uint32_t a;explicit Ptr(uint32_t v):a(v){}bool valid(MemState &m)const{return m.words.count(a);}T *get(MemState &m)const{return &m.words.at(a);}};
 struct ThreadRecord {int id;SnapshotSemaphoreWait semaphore_wait;SnapshotWaitTargets wait_targets;uint32_t wait_nid;CPUContext ctx;uint32_t tpidruro;};
@@ -89,24 +93,55 @@ template<class...T>void ignore(T&&...){}
 code=code.replace('int main(){',integration+'int main(){')
 at=' std::cout<<"PASS "'
 extra=r'''
- for(int mode=0;mode<6;++mode){
+ for(int mode=0;mode<10;++mode){
   KernelState kernel;MemState mem{words};auto thread=std::make_shared<Thread>();
   thread->cpu=std::make_shared<CPUState>();thread->cpu->context=base;thread->cpu->context.cpu_registers[0]=999;thread->cpu->tpidruro=99;
   const auto before=*thread->cpu;kernel.threads[1]=thread;
   SnapshotWaitTargets t{};t.count=1;t.targets[0]={1,7};
   ThreadRecord rec{1,basewait,t,0x0C7B834B,base,42};
+  auto object=std::make_shared<Object>();object->waiting_threads->push_back(Entry{thread});kernel.semaphores[7]=object;
   if(mode==1){rec.semaphore_wait.timeout_present=rec.semaphore_wait.deadline_known=1;rec.semaphore_wait.timeout_us=100;rec.semaphore_wait.remaining_us=40;rec.ctx.cpu_registers[2]=0x2000;}
   if(mode==2)mem.words.clear();
   if(mode==3)thread->status=ThreadStatus::run;
   if(mode==5)rec.semaphore_wait={};
   integration_writes=0;fail_rollback=mode==4;
-  auto error=probe_saved_semaphore_entries(kernel,mem,{rec});
-  assert(error.empty()==(mode!=3&&mode!=4));
+  if(mode==6)object->waiting_threads->front().signal++;
+  int nested=0;
+  auto error=probe_saved_semaphore_entries(kernel,mem,{rec},[&]{
+    ++nested;
+    if(mode==0||mode>=7)assert(thread->cpu->context.cpu_registers[15]==0x1000);
+    if(mode==7)return false;
+    if(mode==8)throw std::runtime_error("nested failure");
+    if(mode==9)object->waiting_threads->front().signal++;
+    return true;
+  });
+  assert(nested==((mode==3||mode==6)?0:1));
+  assert(error.empty()==(mode<3||mode==5));
   assert(kernel.snapshot_restore_failed==(mode==4));
-  assert(integration_writes==((mode==0||mode==4)?2:0));
+  assert(integration_writes==((mode==0||mode==4||mode>=7)?2:0));
   if(mode!=4)assert(same_snapshot_cpu_values(*thread->cpu,before));
   if(mode==4){auto writes=integration_writes;assert(!probe_saved_semaphore_entries(kernel,mem,{rec}).empty());assert(writes==integration_writes);}
   ++cases;
+ }
+'''
+extra+=r'''
+ for(int mode=0;mode<12;++mode){
+  KernelState kernel;auto thread=std::make_shared<Thread>();kernel.threads[1]=thread;
+  auto object=std::make_shared<Object>();object->waiting_threads->push_back(Entry{thread});kernel.semaphores[7]=object;
+  SnapshotWaitTargets t{};t.count=1;t.targets[0]={1,7};ThreadRecord rec{1,basewait,t,0x0C7B834B,base,42};
+  auto &e=object->waiting_threads->front();bool canceled=false;
+  if(mode==1)e.semaphore_wait_control=&canceled;
+  if(mode==2)e.was_canceled=&canceled;
+  if(mode==3)e.priority++;
+  if(mode==4)e.signal++;
+  if(mode==5)e.snapshot_timeout_present=1;
+  if(mode==6)e.snapshot_timeout_us=1;
+  if(mode==7)object->attr++;
+  if(mode==8)e.thread.reset();
+  if(mode==9)object->waiting_threads->push_back(e);
+  if(mode==10)kernel.threads.clear();
+  if(mode==11)kernel.semaphores.clear();
+  assert(snapshot_semaphore_entry_queue_matches(kernel,rec)==(mode==0));++cases;
  }
 '''
 assert at in code;code=code.replace(at,extra+at)

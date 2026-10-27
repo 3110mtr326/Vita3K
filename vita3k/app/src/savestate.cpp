@@ -103,6 +103,7 @@
 #include <app/savestate_delay_wait.h>
 #include <app/savestate_semaphore_wait.h>
 #include <app/savestate_semaphore_entry.h>
+#include <app/savestate_semaphore_entry_queue.h>
 #include <app/savestate_semaphore_queue.h>
 #include <app/savestate_semaphore_rebind.h>
 #include <app/savestate_simple_event_rebind.h>
@@ -629,9 +630,10 @@ static std::string probe_saved_cpu_contexts(KernelState &kernel,const std::vecto
 // Guard owns all kernel/primitive/thread locks. Only CPU candidates are applied;
 // no guest instructions, queue changes or timeout-pointer writes occur here.
 static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &mem,
-    const std::vector<ThreadRecord> &records) {
+    const std::vector<ThreadRecord> &records, const std::function<bool()> &during = {}) {
     if (kernel.snapshot_restore_failed) return "Previous rollback failed; restart the app";
     std::vector<SnapshotCpuTarget<CPUState>> targets;
+    std::vector<const ThreadRecord *> bindings;
     size_t deferred = 0;
     for (const auto &record : records) {
         if (!record.semaphore_wait.uid) continue;
@@ -648,21 +650,31 @@ static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &
         LOG_INFO("Savestate semaphore entry: thread {}, NID 0x{:08X}, result {}; candidate preparation only, no saved call executed",
             record.id, record.wait_nid, candidate.reason);
         if (!candidate.plan || candidate.plan->timeout_address) { ++deferred; continue; }
+        if (!snapshot_semaphore_entry_queue_matches(kernel, record))
+            return "Semaphore entry does not match temporary saved queue";
+        bindings.push_back(&record);
         targets.push_back({found->second->cpu.get(), {candidate.plan->context, record.tpidruro}});
     }
     if (targets.empty()) {
         LOG_INFO("Savestate semaphore entry probe: 0 untimed candidates, {} deferred; CPU probe skipped; no saved continuation", deferred);
-        return {};
+        return (!during || during()) ? std::string{} : "Nested checkpoint refused without entry candidates";
     }
     const auto result = probe_snapshot_cpu_values<CPUState>(targets,
         [](CPUState &cpu) { return SnapshotCpuValues{save_context(cpu), read_tpidruro(cpu)}; },
-        [](CPUState &cpu, const SnapshotCpuValues &v) { load_context(cpu, v.context); write_tpidruro(cpu, v.tpidruro); });
+        [](CPUState &cpu, const SnapshotCpuValues &v) { load_context(cpu, v.context); write_tpidruro(cpu, v.tpidruro); }, [&] {
+            for (const auto *record : bindings)
+                if (!snapshot_semaphore_entry_queue_matches(kernel, *record)) return false;
+            if (during && !during()) return false;
+            for (const auto *record : bindings)
+                if (!snapshot_semaphore_entry_queue_matches(kernel, *record)) return false;
+            return true;
+        });
     if (result == SnapshotCpuProbe::RollbackFailed) {
         kernel.snapshot_restore_failed = true;
         return "Semaphore entry CPU rollback failed; restart without Resume";
     }
     if (result != SnapshotCpuProbe::Passed) return "Semaphore entry CPU verification refused";
-    LOG_INFO("Savestate semaphore entry probe: {} untimed candidates, {} deferred; entry registers MATCH; rollback MATCH; no instructions executed, no timeout writeback or saved continuation",
+    LOG_INFO("Savestate semaphore entry probe: {} untimed candidates, {} deferred; entry registers/temporary queue bindings MATCH; nested checkpoint MATCH; rollback MATCH; no instructions executed, no timeout writeback or saved continuation",
         targets.size(), deferred);
     return {};
 }
@@ -2359,7 +2371,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-semaphore-entry/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-semaphore-joint-entry/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
@@ -2539,8 +2551,6 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 return wait_error;
             if (const auto sema_error = audit_saved_semaphore_waits(kernel, thread_records); !sema_error.empty())
                 return sema_error;
-            if (const auto entry_error = probe_saved_semaphore_entries(kernel, mem, thread_records); !entry_error.empty())
-                return entry_error;
             auto mismatch = compare_object_sets(saved_object_sets, collect_kernel_object_sets(kernel, true));
             if (!mismatch.empty()) return mismatch;
             if (!records_match_object_set(sema_records, "semaphores", saved_object_sets)
@@ -2565,6 +2575,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             std::string joint_error;
             std::string ngs_error;
             std::string semaphore_queue_error;
+            std::string semaphore_entry_error;
             bool simultaneous_check = false;
             std::string ram_probe;
             const auto file_result = probe_saved_file_positions(emuenv, saved_io_files,
@@ -2575,17 +2586,21 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                         joint_error = probe_saved_sync_values(kernel,sema_records,mutex_records,lwmutex_records,
                             eventflag_records,simple_event_records,[&] {
                                 const auto queue_result = probe_snapshot_semaphore_queues(kernel, thread_records, [&] {
-                                    std::vector<NgsVoiceRecord> current_ngs;
-                                    std::vector<NgsPcmRecord> current_pcm;
-                                    ngs_error = snapshot_ngs_voices(emuenv,current_ngs,&saved_ngs_records,[&] {
-                                        simultaneous_check = graphics_checkpoint([&] { return verify_ram() && verify_files(); });
-                                        return simultaneous_check;
-                                    },true,&current_pcm,&saved_ngs_pcm); // RAM continuously owns metadata locks.
-                                    if (!ngs_error.empty()) {
-                                        LOG_WARN("Savestate NGS joint probe refused: {}",ngs_error);
-                                        simultaneous_check = false;
-                                    }
-                                    return ngs_error.empty() && simultaneous_check;
+                                    semaphore_entry_error = probe_saved_semaphore_entries(kernel, mem, thread_records, [&] {
+                                        std::vector<NgsVoiceRecord> current_ngs;
+                                        std::vector<NgsPcmRecord> current_pcm;
+                                        ngs_error = snapshot_ngs_voices(emuenv,current_ngs,&saved_ngs_records,[&] {
+                                            simultaneous_check = graphics_checkpoint([&] { return verify_ram() && verify_files(); });
+                                            return simultaneous_check;
+                                        },true,&current_pcm,&saved_ngs_pcm); // RAM continuously owns metadata locks.
+                                        if (!ngs_error.empty()) {
+                                            LOG_WARN("Savestate NGS joint probe refused: {}",ngs_error);
+                                            simultaneous_check = false;
+                                        }
+                                        return ngs_error.empty() && simultaneous_check;
+                                    });
+                                    if (!semaphore_entry_error.empty()) simultaneous_check = false;
+                                    return semaphore_entry_error.empty();
                                 });
                                 semaphore_queue_error = queue_result.error;
                                 if (!semaphore_queue_error.empty()) {
@@ -2607,10 +2622,11 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             if (!file_result.empty()) return file_result + (ram_probe.empty() ? "" : "; " + ram_probe)
                 + (joint_error.empty() ? "" : "; " + joint_error)
                 + (ngs_error.empty() ? "" : "; " + ngs_error)
-                + (semaphore_queue_error.empty() ? "" : "; " + semaphore_queue_error);
+                + (semaphore_queue_error.empty() ? "" : "; " + semaphore_queue_error)
+                + (semaphore_entry_error.empty() ? "" : "; " + semaphore_entry_error);
             if (!ram_probe.empty()) return joint_error.empty() ? ram_probe : ram_probe + "; " + joint_error;
             if (!simultaneous_check) return "Joint files/RAM/CPU/sync/context checkpoint was not reached";
-            LOG_INFO("Savestate joint probe: files/RAM/CPU/sync/semaphore-queues/NGS/context/GPU saved values coexisted; all rollbacks MATCH; no guest instructions, wait replay or game rewind.");
+            LOG_INFO("Savestate joint probe: files/RAM/CPU-entry/sync/semaphore-queues/NGS/context/GPU diagnostic values coexisted; all rollbacks MATCH; no guest instructions, wait replay or game rewind.");
             // All saved host values have rolled back. Retain only equivalent
             // CURRENT queue nodes with the same live invocation ownership.
             const auto rebound = rebind_current_semaphore_queues(kernel);

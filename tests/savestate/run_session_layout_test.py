@@ -50,7 +50,13 @@ template<class E,class R,class F>std::string probe_saved_ram(E&,std::istream&,co
 bool host_scope=false;
 template<class E,class F>std::string probe_saved_file_positions(E&,int,F f){host_scope=true;bool ok=f([]{return true;});host_scope=false;return ok?"":"files failed";}
 int ngs_mode=0;
-bool queue_active=false;
+bool queue_active=false, entry_active=false;
+template<class F>std::string probe_saved_semaphore_entries(Kernel&,Mem&,const std::vector<Thread>&,F f){
+ assert(host_scope&&queue_active&&!entry_active);
+ if(ngs_mode==29)return "entry refused";
+ entry_active=true;bool ok=f();entry_active=false;
+ return ok&&ngs_mode!=30?"":"entry failed";
+}
 int timer_rebind_calls=0;int rwlock_rebind_calls=0;int thread_end_rebind_calls=0;
 int rebind_calls=0,event_rebind_calls=0,condvar_rebind_calls=0,mutex_rebind_calls=0,eventflag_rebind_calls=0;
 struct RebindResult {std::string error;int queues=1,waiters=1;};
@@ -69,14 +75,14 @@ template<class F>QueueResult probe_snapshot_semaphore_queues(Kernel&,const std::
  return {ok&&ngs_mode!=20?"":"queue failed"};
 }
 struct NgsVoiceRecord{};struct NgsPcmRecord{};
-template<class E,class F>std::string snapshot_ngs_voices(E&,std::vector<NgsVoiceRecord>&,const std::vector<NgsVoiceRecord>*,F f,bool held,std::vector<NgsPcmRecord>*,const std::vector<NgsPcmRecord>*){assert(held&&queue_active);if(ngs_mode==16)return "NGS refused";bool ok=f();return ok&&ngs_mode!=17?"":"NGS failed";}
+template<class E,class F>std::string snapshot_ngs_voices(E&,std::vector<NgsVoiceRecord>&,const std::vector<NgsVoiceRecord>*,F f,bool held,std::vector<NgsPcmRecord>*,const std::vector<NgsPcmRecord>*){assert(held&&queue_active&&entry_active);if(ngs_mode==16)return "NGS refused";bool ok=f();return ok&&ngs_mode!=17?"":"NGS failed";}
 std::string validate(int mode){
  ngs_mode=mode;
  timer_rebind_calls=0;rwlock_rebind_calls=0;thread_end_rebind_calls=0;rebind_calls=0;event_rebind_calls=0;condvar_rebind_calls=0;mutex_rebind_calls=0;eventflag_rebind_calls=0;
  reject_semaphore=mode==18;
  std::vector<NgsVoiceRecord> saved_ngs_records;std::vector<NgsPcmRecord>saved_ngs_pcm;
  int saved_io_files=0;
- const auto graphics_checkpoint=[](const std::function<bool()> &verify){assert(queue_active);return verify();};
+ const auto graphics_checkpoint=[](const std::function<bool()> &verify){assert(queue_active&&entry_active);return verify();};
  std::istringstream in;
  Kernel kernel;Mem mem;struct {Counts gxm;} emuenv;
  std::vector<Thread> thread_records{{1}};
@@ -103,8 +109,8 @@ int main(){
    std::istringstream in(bad);assert(parse(in,true)==SaveStateResult::ErrorMismatch);
  }
  std::istringstream huge("x");assert(!skip_savestate_bytes(huge,0xffffffffu));
- for(int mode=0;mode<29;++mode){assert(validate(mode).empty()==(mode==0));assert(!queue_active&&!host_scope);assert(timer_rebind_calls==((mode==0||mode==28)?1:0));assert(rwlock_rebind_calls==((mode==0||mode==27||mode==28)?1:0));assert(thread_end_rebind_calls==((mode==0||mode==26||mode==27||mode==28)?1:0));assert(eventflag_rebind_calls==((mode==0||mode==25||mode==26||mode==27||mode==28)?1:0));assert(mutex_rebind_calls==((mode==0||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(condvar_rebind_calls==((mode==0||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(event_rebind_calls==((mode==0||mode==22||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(rebind_calls==((mode==0||mode==21||mode==22||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));}
- std::cout<<"PASS: RAM indexing, 15 session mismatch, 2 NGS failure, semaphore audit refusal, 2 queue failure cases; saved queues enclose NGS/GPU; live rebind only after complete rollback, refusal propagated\n";
+ for(int mode=0;mode<31;++mode){assert(validate(mode).empty()==(mode==0));assert(!queue_active&&!entry_active&&!host_scope);assert(timer_rebind_calls==((mode==0||mode==28)?1:0));assert(rwlock_rebind_calls==((mode==0||mode==27||mode==28)?1:0));assert(thread_end_rebind_calls==((mode==0||mode==26||mode==27||mode==28)?1:0));assert(eventflag_rebind_calls==((mode==0||mode==25||mode==26||mode==27||mode==28)?1:0));assert(mutex_rebind_calls==((mode==0||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(condvar_rebind_calls==((mode==0||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(event_rebind_calls==((mode==0||mode==22||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));assert(rebind_calls==((mode==0||mode==21||mode==22||mode==23||mode==24||mode==25||mode==26||mode==27||mode==28)?1:0));}
+ std::cout<<"PASS: RAM indexing, 15 session mismatch, 2 NGS failure, semaphore audit refusal, 2 queue failure cases; saved queues and entry CPU enclose NGS/GPU; 2 entry failure cases; live rebind only after complete rollback, refusal propagated\n";
 }
 '''.replace('RAM\n',ram).replace(' CHECK\n',check)
 with tempfile.TemporaryDirectory() as d:

@@ -4,7 +4,51 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Semaphore re-entry CPU preparation (latest checkpoint v34, format v33)
+## Joint semaphore entry and saved queue probe (latest checkpoint v35, format v33)
+
+The untimed semaphore entry CPU probe now runs INSIDE the temporary saved queue
+transaction, after file positions, RAM, original saved CPU and sync values have
+been applied. Its callback encloses NGS/context/GPU verification. Entry CPU
+candidates and their corresponding saved diagnostic queue nodes therefore coexist
+through the graphics checkpoint. Afterward entry CPU rolls back to the outer
+saved CPU, queues roll back to the originals, then outer domains roll back to
+the current session. No guest instruction executes at any stage.
+
+snapshot_semaphore_entry_queue_matches validates the selected thread, semaphore
+UID/attributes, queue size and exact position, count, priority and timeout fields.
+All nodes in that queue must be diagnostic nodes: real invocation controls or
+cancellation pointers cause refusal. Bindings are checked before CPU mutation
+and both before and after the nested checkpoint. This does NOT create runnable
+host continuations. Timed/CB/other unsupported candidates remain deferred.
+Empty candidate sets still run the inner checkpoint but explicitly skip the CPU
+probe; a successful overall diagnostic does not imply candidate coverage.
+
+Failure propagates through the existing queue/CPU/RAM/file transactions, and a
+failed CPU rollback retains the persistent Resume veto. Equivalent current queue
+rebinds occur only after successful restoration of all outer domains. Import
+stub validation observes memory visible under the temporary RAM probe, retaining
+its exclusions; it is not proof of complete saved executable mapping restoration.
+
+Marker CPU-semaphore-joint-entry; format remains33. Logs report entry registers/
+temporary queue bindings MATCH, nested checkpoint MATCH, rollback MATCH and counts.
+Full wait retirement/replay, timed pointer writeback and game rewind remain disabled.
+
+Validation: 53 host entry/planner/probe cases (including queue binding corruption,
+real-current-control refusal, nested failure/exception, rollback failure and
+persistent veto); production orchestration extracted into the session layout test
+checks entry scope encloses NGS/GPU and entry refusal blocks current rebind;
+42 saved queue transaction cases pass. Native sync_primitives.cpp and savestate.cpp
+syntax checks pass. Tests mock CPU/memory/kernel surroundings; Android compilation
+and v35 device validation remain pending.
+
+v34 device evidence (2026-10-27 13:00, PCSG00219): 4 untimed candidates, 0 deferred;
+entry CPU application and rollback MATCH, all outer rollbacks MATCH. 13 current
+waits completed: 6 semaphores, 1 untimed simple event and 5 conditions returned0;
+one timed simple event returned0x80028005 (WAIT_TIMEOUT), not success0. Post-Resume
+~29-30fps. No saved call executed and no timed semaphore coverage. User reports
+normal operation. This validates the previous standalone CPU candidate probe.
+
+## Semaphore re-entry CPU preparation (previous checkpoint v34, format v33)
 
 The new prepare_semaphore_entry helper constructs an inert CPU candidate from
 saved semaphore arguments and CPU registers. It supports the public/private
