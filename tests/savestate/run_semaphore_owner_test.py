@@ -34,14 +34,15 @@ struct KernelState {
 #include <app/savestate_semaphore_rebind.h>
 #include <app/savestate_semaphore_order.h>
 #include <app/savestate_semaphore_registration.h>
+#include <app/savestate_semaphore_terminal.h>
 struct Record {int id;uint8_t status=static_cast<uint8_t>(ThreadStatus::wait);app::SnapshotWaitTargets wait_targets{};app::SnapshotSemaphoreWait semaphore_wait{};};
 template<class M>auto lock_and_find(int id,M &m,std::mutex &mutex){std::lock_guard lock(mutex);return m.count(id)?m.at(id):typename M::mapped_type{};}
 constexpr bool LOG_SYNC_PRIMITIVES=false;
 #define LOG_DEBUG(...) ((void)0)
-struct Completion {int uid,thread;uint32_t replacements;bool timed;int result;};
+struct Completion {int uid,thread;uint32_t replacements;bool timed;int result;bool terminal;uint64_t invocation;};
 std::vector<Completion> completions;
-void completion_log(const char *,int uid,int thread,uint32_t replacements,bool timed,int result){
- completions.push_back({uid,thread,replacements,timed,result});
+void completion_log(const char *,int uid,int thread,uint32_t replacements,bool timed,int result,bool terminal,uint64_t invocation){
+ completions.push_back({uid,thread,replacements,timed,result,terminal,invocation});
 }
 #define LOG_INFO(...) completion_log(__VA_ARGS__)
 #define RET_ERROR(x) (x)
@@ -65,6 +66,8 @@ int main(){
   // 5 rebuilt+signal, 6 rebuilt+cancel, 7 rebuilt+abort, 8 rebuilt+timeout.
   std::thread worker([&]{rc=semaphore_wait(k,"test",1,1,1,(mode==2||mode==3||mode==8)?&budget:nullptr);});
   std::weak_ptr<SemaphoreWaitControl> weak;
+  std::shared_ptr<SemaphoreWaitControl> retained;
+  app::SemaphoreRegistrationEntry expected{};
   if(mode!=2){
    const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(2);
    while(true){
@@ -75,6 +78,8 @@ int main(){
       {
        std::lock_guard kl(k.mutex),tl(thread->mutex);
        auto audit=app::audit_current_semaphore_registrations(k);assert(audit.error.empty()&&audit.waiters==1);
+       retained=e.semaphore_wait_control;expected=audit.entries.front();
+       assert(app::observe_semaphore_terminal(*retained,expected,audit).status==app::SemaphoreTerminalStatus::Registered);
        const auto receipt=e.semaphore_wait_control->registration;
        assert(receipt.complete&&receipt.uid==1&&receipt.thread_id==1&&receipt.signal==1&&receipt.priority==thread->priority);
        if(!priority&&mode==0){
@@ -149,12 +154,18 @@ int main(){
   worker.join();
   assert(rc==((mode==0||mode==5||mode==9)?SCE_KERNEL_OK:(mode==1||mode==6||mode==11)?SCE_KERNEL_ERROR_WAIT_CANCEL:SCE_KERNEL_ERROR_WAIT_TIMEOUT));
   assert(sema->waiting_threads->empty()&&thread->status==ThreadStatus::run);
-  assert(weak.expired());
+  if(retained){
+   std::lock_guard sl(sema->mutex),kl(k.mutex),tl(thread->mutex);
+   const auto now=app::audit_current_semaphore_registrations(k);
+   const auto terminal=app::observe_semaphore_terminal(*retained,expected,now);
+   assert(terminal.status==app::SemaphoreTerminalStatus::Terminal&&terminal.result&&*terminal.result==rc);
+  }
+  retained.reset();assert(weak.expired());
   const bool rebound=(mode>=5&&mode<=9);
   assert(completions.size()==(rebound?1U:0U));
   if(rebound){
    const auto &c=completions.front();
-   assert(c.uid==1&&c.thread==1&&c.result==rc);
+   assert(c.uid==1&&c.thread==1&&c.result==rc&&c.terminal&&c.invocation!=0);
    assert(c.replacements==(mode==9?1U:3U)&&c.timed==(mode==8));
   }
   if(mode==2||mode==3||mode==8)assert(budget==0);
@@ -322,7 +333,7 @@ int main(){
      if(!sema->waiting_threads->empty()){
       auto now=app::audit_current_semaphore_registrations(k);assert(now.error.empty()&&now.waiters==1);
       if(call==0){first=now;first_control=(*sema->waiting_threads->begin()).semaphore_wait_control;}
-      else{assert(!app::same_semaphore_registrations(first,now));assert(app::match_semaphore_registration(now,first.entries.front())==app::SemaphoreRegistrationMatch::DifferentInvocation);}
+      else{assert(!app::same_semaphore_registrations(first,now));assert(app::match_semaphore_registration(now,first.entries.front())==app::SemaphoreRegistrationMatch::DifferentInvocation);assert(app::observe_semaphore_terminal(*first_control,first.entries.front(),now).status==app::SemaphoreTerminalStatus::Terminal);}
       admitted=true;
      }}
     if(!admitted)std::this_thread::sleep_for(std::chrono::milliseconds(1));

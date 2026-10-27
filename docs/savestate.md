@@ -4,7 +4,61 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Exact live semaphore registration checkpoints (latest checkpoint v39, format v33)
+## Semaphore terminal result receipts (latest checkpoint v40, format v33)
+
+After the normal blocked semaphore_wait finishes cleanup and resolves cancellation,
+it now records its final result in the existing invocation control, under the
+semaphore mutex. terminal_result is written before terminal_ready. This is not
+an atomic cross-thread notification: readers must own the documented locks and
+retain the original control and owning semaphore. Controls remain process-local
+and are not serialized. Uncontended calls have no queued invocation control.
+No return values, timeout calculations, wakeups or cancellation policy change.
+
+The registration audit rejects a terminal control still present in a live queue.
+A new value observer distinguishes Registered, AbsentUnresolved, Terminal,
+Changed and Invalid, requiring the original control identity, session/invocation
+token and receipt fields to match the expected registration. A missing queue
+entry alone is unresolved, not evidence of completion. A retained finalized
+control can yield its exact result even when the same thread has begun another
+invocation. A contradictory queued-and-terminal control is rejected.
+
+IMPORTANT: result finalization precedes the C++ function returning and unlocking
+its mutex. It does not acknowledge host return, import/callback completion,
+stack retirement, or permission to restore CPU/RAM and run a saved wait. Those
+remain future work. The observer is host-tested foundation code, not a running
+guest replay barrier. Device changes publish results, reject contradictory live
+controls in the existing audit, and extend completion diagnostics. No retained
+global monitor or background polling is introduced. Full rewind remains disabled.
+
+Validation: 61 production semaphore lifecycle cases with real host threads.
+Retained invocation controls now verify exact terminal results after signal,
+cancel, timeout, abort and committed current-node replacements; existing return
+codes (including abort's existing timeout result) are preserved. Controls expire
+after the test releases its last reference. Successive calls on the same thread
+do not erase the old result. 66 registration/observer cases include unresolved
+absence, terminal0/nonzero, contradictory live membership, wrong identities,
+changed queue metadata, malformed audit and newer invocations. Existing34 rebind
+cases and35 extracted orchestration modes pass. Native sync_primitives.cpp and
+savestate.cpp syntax checks pass. Android compilation and device checks pending.
+
+Marker CPU-semaphore-terminal. After Resume, existing rebound semaphore completion
+logs add terminal receipt true, invocation N, and host return not acknowledged.
+The invocation is a local counter, not a globally unique value without its session
+identity. A zero return is normal success; timed/canceled calls can return nonzero
+without indicating diagnostic corruption. No saved wait is executed. Save schema
+stays33; create a fresh Save State for this build's test.
+
+v39 device evidence: user normal. Log2026-10-27 21:25:59 has4 CURRENT receipts
+MATCH before/after rebind with exact invocation IDs/order/conditions/ownership.
+Five SAVED untimed CPU candidates,0 deferred; order/priority/temporary queues/
+nested/rollback MATCH; all joint rollbacks, GPU and preflight MATCH. Saved uid134
+had3 waiters135,138,137; uid170/thread171 and199/thread200 singleton. Current and
+registration priorities equal. Four current semaphore calls completed0 at21:26:08,
+then >30 seconds near30fps before shutdown21:26:51. Five conditions and one event
+completed during shutdown. One Load in log, no repeated-load or timed semaphore
+replay evidence. Screenshot filename21:27:08 differs from log checkpoint.
+
+## Exact live semaphore registration checkpoints (previous checkpoint v39, format v33)
 
 v38 validated each live receipt and compared waiter counts across current-node
 replacement. v39 also captures an ordered, process-local value snapshot of each

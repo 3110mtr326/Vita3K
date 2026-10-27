@@ -35,6 +35,10 @@ struct SemaphoreWaitControl {
         uint32_t attr = 0, timeout_present = 0, timeout_us = 0;
         bool complete = false;
     } registration;
+    // Final result chosen after wait cleanup, protected by the semaphore mutex.
+    // Does not prove the C++ call returned or its host stack was retired.
+    bool terminal_ready = false;
+    int32_t terminal_result = 0;
     WaitDeadline snapshot_deadline; // Protected by the semaphore mutex.
     // Immutable after publication; identifies this host invocation only.
     uint64_t session_hi = 0, session_lo = 0, invocation = 0;

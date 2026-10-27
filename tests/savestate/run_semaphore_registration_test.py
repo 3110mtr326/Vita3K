@@ -18,8 +18,9 @@ struct Entry {std::shared_ptr<Thread> thread;int signal=2,priority=100;uint32_t 
 struct Object {uint32_t attr=0;std::shared_ptr<std::vector<Entry>> waiting_threads=std::make_shared<std::vector<Entry>>();};
 struct Kernel {bool snapshot_restore_failed=false;std::map<int,std::shared_ptr<Thread>> threads;std::map<int,std::shared_ptr<Object>> semaphores;};
 #include <app/savestate_semaphore_registration.h>
+#include <app/savestate_semaphore_terminal.h>
 int main(){int cases=0;
- for(int mode=0;mode<29;++mode){
+ for(int mode=0;mode<30;++mode){
   Kernel k;auto t=std::make_shared<Thread>();k.threads[1]=t;
   auto o=std::make_shared<Object>();k.semaphores[7]=o;
   auto c=std::make_shared<SemaphoreWaitControl>();c->session_hi=1;c->invocation=1;
@@ -54,6 +55,7 @@ int main(){int cases=0;
   if(mode==26)receipt.timeout_present=e.snapshot_timeout_present=2;
   if(mode==27)receipt.timeout_us=e.snapshot_timeout_us=1; // invalid untimed metadata, even when equal
   if(mode==28)o->waiting_threads->clear(); // historical receipt is not evidence of a live registration
+  if(mode==29)c->terminal_ready=true;
   auto result=app::audit_current_semaphore_registrations(k);
   const bool valid=mode<2||mode==28;
   assert(result.error.empty()==valid);assert(result.waiters==(mode<2?1u:0u));
@@ -90,6 +92,29 @@ int main(){int cases=0;
     ++cases;
    }
    assert(app::same_semaphore_registrations(result,result));
+
+   for(int fault=0;fault<14;++fault){
+    auto now=result;auto wanted=expected;const auto original=c->registration;
+    c->terminal_ready=false;c->terminal_result=0;
+    auto status=app::SemaphoreTerminalStatus::Registered;
+    if(fault>=1&&fault<=3){now.entries.clear();now.waiters=0;status=app::SemaphoreTerminalStatus::AbsentUnresolved;}
+    if(fault==2||fault==3){c->terminal_ready=true;c->terminal_result=fault==3?-1:0;status=app::SemaphoreTerminalStatus::Terminal;}
+    if(fault==4){c->terminal_ready=true;status=app::SemaphoreTerminalStatus::Invalid;}
+    if(fault==5){wanted.invocation++;status=app::SemaphoreTerminalStatus::Invalid;}
+    if(fault==6){wanted.control=&other;status=app::SemaphoreTerminalStatus::Invalid;}
+    if(fault==7){now.error="refused";status=app::SemaphoreTerminalStatus::Invalid;}
+    if(fault==8||fault==9){now.entries.front().position++;status=app::SemaphoreTerminalStatus::Changed;}
+    if(fault==9){c->terminal_ready=true;status=app::SemaphoreTerminalStatus::Invalid;}
+    if(fault==10){now.entries.front().control=&other;status=app::SemaphoreTerminalStatus::Changed;}
+    if(fault==11){now.entries.front().invocation++;now.entries.front().control=&other;c->terminal_ready=true;c->terminal_result=-2;status=app::SemaphoreTerminalStatus::Terminal;}
+    if(fault==12){c->registration.uid++;status=app::SemaphoreTerminalStatus::Invalid;}
+    if(fault==13){now.waiters++;status=app::SemaphoreTerminalStatus::Invalid;}
+    auto observation=app::observe_semaphore_terminal(*c,wanted,now);
+    assert(observation.status==status);
+    assert(observation.result.has_value()==(status==app::SemaphoreTerminalStatus::Terminal));
+    if(observation.result)assert(*observation.result==c->terminal_result);
+    c->registration=original;c->terminal_ready=false;c->terminal_result=0;++cases;
+   }
    auto t2=std::make_shared<Thread>();k.threads[2]=t2;
    auto c2=std::make_shared<SemaphoreWaitControl>(*c);c2->registration.thread_id=2;
    o->waiting_threads->push_back({t2,2,100,0,0,c2,&c2->canceled});
