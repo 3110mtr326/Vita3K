@@ -47,6 +47,10 @@ struct SemaphoreWaitControl {
     // Still no guest resumption or saved continuation authorization.
     bool import_returned = false;
     uint32_t import_result = 0;
+    // A later CPU run reached a new SVC in the same run_loop frame.
+    // Protected by the semaphore mutex; not serialized or a saved replay grant.
+    bool guest_svc_observed = false;
+    uint32_t guest_svc_pc = 0, guest_svc_nid = 0;
     WaitDeadline snapshot_deadline; // Protected by the semaphore mutex.
     // Immutable after publication; identifies this host invocation only.
     uint64_t session_hi = 0, session_lo = 0, invocation = 0;

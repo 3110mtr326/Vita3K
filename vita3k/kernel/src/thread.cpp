@@ -190,6 +190,8 @@ void ThreadState::exit_delete(bool exit) {
 
 void ThreadState::run_loop() {
     bool guest_returned = false;
+    // Per invocation of run_loop: nested callbacks cannot consume this receipt.
+    SemaphoreGuestProgress semaphore_progress;
 
     // Set thread-local CPU state so signal handlers can access it.
     // The guard clears it on any exit so a recycled host thread never sees
@@ -228,6 +230,7 @@ void ThreadState::run_loop() {
     while (true) {
         // Check if this call-level is done (normal exit, guest return, or delete).
         if (exit_requested || guest_returned || delete_requested) {
+            semaphore_progress.reset();
             // Top-level fires the end callback and parks dormant
             if (top_level && status != ThreadStatus::dormant) {
                 run_thread_end_callback();
@@ -255,6 +258,7 @@ void ThreadState::run_loop() {
 
         // Fire the thread-start event once per start.
         if (run_start_callback) {
+            semaphore_progress.reset();
             run_start_callback = false;
             lock.unlock();
             if (kernel.thread_event_start) {
@@ -275,10 +279,16 @@ void ThreadState::run_loop() {
 
             // Single step or run
             const int res = do_step ? step(*cpu) : run(*cpu);
+            // Dynarmic clears svc_called before each run/step. A new SVC proves
+            // execution; an external stop/step without SVC does not. Discard
+            // evidence on halt/error or pending abort before any observation.
+            if (res != 0 || cpu->abort_pending.load())
+                semaphore_progress.reset();
 
             // handle svc call if this was what stopped the cpu
             if (cpu->svc_called) {
                 const uint32_t nid = *Ptr<uint32_t>(read_pc(*cpu) + 4).get(mem);
+                semaphore_progress.observe_next_svc(&kernel, id, read_pc(*cpu), nid);
                 struct ImportDiagnosticScope {
                     std::atomic<uint32_t> &active;
                     uint32_t previous;
@@ -287,12 +297,14 @@ void ThreadState::run_loop() {
                 SemaphoreImportScope semaphore_import(&kernel, id, nid);
                 kernel.call_import(*cpu, nid, id);
                 clear_exclusive(*cpu);
-                semaphore_import.finish(read_reg(*cpu, 0));
+                semaphore_import.finish(read_reg(*cpu, 0), &semaphore_progress);
             }
 
             // handle pending abort (exception handler from page fault)
-            if (cpu->abort_pending.exchange(false))
+            if (cpu->abort_pending.exchange(false)) {
+                semaphore_progress.reset();
                 dispatch_abort(*cpu);
+            }
 
             lock.lock();
 

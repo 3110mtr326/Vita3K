@@ -4,7 +4,61 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Semaphore import return acknowledgement (latest checkpoint v42, format v33)
+## Semaphore next-SVC progress evidence (latest checkpoint v43, format v33)
+
+Successful CURRENT rebound semaphore import acknowledgements can now arm one
+SemaphoreGuestProgress receipt in the containing run_loop frame. It retains the
+original semaphore/control until a later CPU run reaches a new SVC in that frame,
+or the evidence is discarded. Ordinary non-rebound calls do not arm this diagnostic.
+There is no global history. Each nested run_loop owns its own receipt, preventing
+a callback's SVC from satisfying the enclosing frame's pending observation.
+
+Dynarmic clears svc_called before run/step; only CallSVC sets it true. After the
+next run/step returns, a new SVC is observed before dispatching its import. A run
+return without SVC does not prove execution and leaves the pending receipt intact.
+The same SVC address can occur again in a loop and is not rejected. The observer
+consumes the pending receipt once, checks owning kernel/thread and original object,
+terminal/body/import result agreement and queue absence under the semaphore mutex,
+then records guest_svc_pc/nid before guest_svc_observed. These fields are not atomic
+signals or serialized state. A malformed receipt is consumed without success.
+
+Halt/error and pending abort discard evidence before observation. The abort handler
+path also discards it before dispatch; end/delete/restart and start-callback paths
+clear it. Pauses/suspension and steps without SVC do not falsely certify progress.
+No additional guest instruction, forced step, wakeup or saved wait is introduced.
+The terminal observer adds GuestSvcObserved and rejects contradictory histories.
+Current registration audits reject already-observed controls still in queues.
+
+The device marker is CPU-semaphore-guest-progress. The marker names the build, not
+proof that progress has already occurred while paused. AFTER Resume, look for:
+Savestate semaphore guest progress: ... next svc pc ..., next nid ..., observed true
+The invocation ID must match its earlier import acknowledgement. Import result0
+means success; a timed/cancelled current call can also later make guest progress.
+An absent progress log is inconclusive if the thread stops or never reaches another
+SVC. This does not prove the next import finished, correct saved-wait scheduling,
+full callback restoration, or full graphics/audio rewind. Saved replay stays off.
+
+Validation:121 production semaphore lifecycle cases, including24 added progress
+cases across FIFO/priority success/cancel/timeout, discard, identity mismatch,
+nested tracker isolation, duplicate observation, UID reuse, non-rebound calls and
+corrupt import-result rejection.79 registration/observer cases,34 current rebind
+cases and existing orchestration tests pass.16 extracted production run-loop cases
+with a scripted CPU verify next-SVC placement, no-SVC stops, single step, abort/error,
+exit/restart and nested-frame isolation. This harness does NOT execute Dynarmic;
+device testing must verify actual guest progress. Native syntax checks for
+sync_primitives.cpp, thread.cpp and savestate.cpp pass. Android build/device pending.
+
+v42 device evidence: user reports normal. One Load20:51:21-23 on2026-10-28;
+6 current registrations match before/after rebind,6 saved untimed candidates,
+0 deferred, joint rollbacks/session preflight match. At20:51:32 all6 waits record
+body return plus import result bits0/acknowledged true using NID0x0C7B834B:
+uid170/thread171, uid134/threads136,137,138,135 and uid199/thread200.
+Frame samples after Resume remain approximately30fps for over40 seconds; shutdown
+20:52:18 (~46 seconds after acknowledgements). No repeated Load, timed/cancelled
+completion, private wait NID or CB coverage established. Screenshot filename differs
+from the logged diagnostic time. Format remains33; create a fresh Save for v43.
+
+## Semaphore import return acknowledgement (previous checkpoint v42, format v33)
 
 A host-thread-local stack scope now surrounds each synchronous kernel.call_import
 in ThreadState::run. The semaphore wrapper retains its original owning object and

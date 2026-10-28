@@ -13,7 +13,7 @@ cancel=src[src.index('int semaphore_cancel('):src.index('// ********************
 header=(root/'vita3k/kernel/include/kernel/sync_primitives.h').read_text()
 entry=header[header.index('struct SemaphoreWaitControl'):header.index('// NOTE: uid')]
 thread_source=(root/'vita3k/kernel/src/thread.cpp').read_text()
-assert 'SemaphoreImportScope semaphore_import(&kernel, id, nid);\n                kernel.call_import(*cpu, nid, id);\n                clear_exclusive(*cpu);\n                semaphore_import.finish(read_reg(*cpu, 0));' in thread_source
+assert 'SemaphoreImportScope semaphore_import(&kernel, id, nid);\n                kernel.call_import(*cpu, nid, id);\n                clear_exclusive(*cpu);\n                semaphore_import.finish(read_reg(*cpu, 0), &semaphore_progress);' in thread_source
 code=r''' 
 #include <kernel/thread/wait_deadline.h>
 #include <kernel/thread/thread_data_queue.h>
@@ -23,6 +23,7 @@ code=r'''
 #include <array>
 #include <chrono>
 #include <iostream>
+#include <string_view>
 #include <map>
 #include <thread>
 using SceUID=int32_t; using SceInt32=int32_t; using SceUInt=uint32_t; using SceUInt32=uint32_t;using SceSize=uint32_t;
@@ -48,9 +49,10 @@ void completion_log(const char *,int uid,int thread,uint32_t replacements,bool t
  completions.push_back({uid,thread,replacements,timed,result,terminal,invocation,returned});
 }
 struct ImportCompletion {int uid,thread;uint64_t invocation;uint32_t nid,bits;bool acknowledged;};
-std::vector<ImportCompletion> import_completions;
-void completion_log(const char *,int uid,int thread,uint64_t invocation,uint32_t nid,uint32_t bits,bool acknowledged){
- import_completions.push_back({uid,thread,invocation,nid,bits,acknowledged});
+std::vector<ImportCompletion> import_completions, progress_completions;
+void completion_log(const char *format,int uid,int thread,uint64_t invocation,uint32_t nid,uint32_t bits,bool acknowledged){
+ auto &target=std::string_view(format).find("guest progress")!=std::string_view::npos?progress_completions:import_completions;
+ target.push_back({uid,thread,invocation,nid,bits,acknowledged});
 }
 #define LOG_INFO(...) completion_log(__VA_ARGS__)
 #define RET_ERROR(x) (x)
@@ -456,6 +458,56 @@ int main(){
    std::lock_guard sl(sema->mutex),kl(k.mutex),tl(thread->mutex);
    app::SemaphoreRegistrationAudit empty;
    assert(app::observe_semaphore_terminal(*held,expected,empty).status==(success?app::SemaphoreTerminalStatus::ImportReturned:app::SemaphoreTerminalStatus::BodyReturned));
+  }
+  std::weak_ptr<SemaphoreWaitControl> weak=held;held.reset();assert(weak.expired());++cases;
+ }
+
+
+ for(bool priority:{false,true})for(int mode=0;mode<12;++mode){
+  KernelState k;auto sema=std::make_shared<Semaphore>();sema->waiting_threads=queue(priority);sema->attr=priority?SCE_KERNEL_ATTR_TH_PRIO:0;k.semaphores[1]=sema;
+  auto thread=std::make_shared<ThreadState>();k.threads[1]=thread;
+  std::shared_ptr<SemaphoreWaitControl> held;app::SemaphoreRegistrationEntry expected;
+  progress_completions.clear();import_completions.clear();completions.clear();int rc=999;bool observed=false;uint32_t budget=200000;
+  std::thread worker([&]{
+   SemaphoreGuestProgress progress;
+   {
+    SemaphoreImportScope scope(&k,1,0x0C7B834B);
+    rc=semaphore_wait(k,"progress",1,1,1,mode==2?&budget:nullptr);
+    assert(scope.finish(static_cast<uint32_t>(rc),&progress));
+   } // scope has exited: only the per-run-loop receipt retains the owner
+   assert(!held->guest_svc_observed);
+   if(mode==3||mode==11)progress.reset(); // abort/end or no next SVC
+   if(mode==6){SemaphoreGuestProgress nested;assert(!nested.observe_next_svc(&k,1,0x2000,77));}
+   if(mode==8){std::lock_guard lock(k.mutex);k.semaphores[1]=std::make_shared<Semaphore>();}
+   if(mode==10){std::lock_guard lock(sema->mutex);held->import_result=99;}
+   if(mode!=11)observed=progress.observe_next_svc(mode==4?nullptr:&k,mode==5?2:1,0x1000,0x0C7B834B);
+   // Another SVC cannot certify the old invocation a second time.
+   assert(!progress.observe_next_svc(&k,1,0x2000,88));
+  });
+  const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+  while(!held){
+   {std::lock_guard sl(sema->mutex),kl(k.mutex),tl(thread->mutex);
+    if(!sema->waiting_threads->empty()){
+     held=(*sema->waiting_threads->begin()).semaphore_wait_control;
+     held->snapshot_rebind_count=mode==9?0:1;
+     auto audit=app::audit_current_semaphore_registrations(k);assert(audit.error.empty());expected=audit.entries.front();
+    }}
+   assert(std::chrono::steady_clock::now()<limit);std::this_thread::yield();
+  }
+  if(mode==1)assert(semaphore_cancel(k,"cancel",1,1,0,nullptr)==0);
+  else if(mode!=2)assert(semaphore_signal(k,"signal",1,1,1)==0);
+  worker.join();
+  const bool success=mode<=2||mode==6||mode==7||mode==8;
+  assert(observed==success&&held->guest_svc_observed==success);
+  assert(rc==(mode==1?-2:mode==2?-1:0));
+  if(success){assert(held->guest_svc_pc==0x1000&&held->guest_svc_nid==0x0C7B834B);}
+  if(mode==3||mode==9||mode==11)assert(progress_completions.empty());
+  else assert(progress_completions.size()==1&&progress_completions[0].acknowledged==success);
+  {
+   std::lock_guard sl(sema->mutex),kl(k.mutex),tl(thread->mutex);
+   app::SemaphoreRegistrationAudit empty;
+   auto status=app::observe_semaphore_terminal(*held,expected,empty).status;
+   assert(status==(mode==10?app::SemaphoreTerminalStatus::Invalid:success?app::SemaphoreTerminalStatus::GuestSvcObserved:app::SemaphoreTerminalStatus::ImportReturned));
   }
   std::weak_ptr<SemaphoreWaitControl> weak=held;held.reset();assert(weak.expired());++cases;
  }

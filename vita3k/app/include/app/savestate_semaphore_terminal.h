@@ -5,7 +5,7 @@
 #include <optional>
 
 namespace app {
-enum class SemaphoreTerminalStatus { Registered, AbsentUnresolved, Terminal, BodyReturned, ImportReturned, Changed, Invalid };
+enum class SemaphoreTerminalStatus { Registered, AbsentUnresolved, Terminal, BodyReturned, ImportReturned, GuestSvcObserved, Changed, Invalid };
 struct SemaphoreTerminalObservation {
     SemaphoreTerminalStatus status;
     std::optional<int32_t> result;
@@ -14,12 +14,15 @@ struct SemaphoreTerminalObservation {
 // kernel/primitive/thread locks continuously across audit and observation.
 // Terminal only means the result was finalized; BodyReturned means the inner
 // body returned. ImportReturned additionally requires normal call_import return
-// and matching CPU r0. None proves guest resumption or authorizes saved replay.
+// and matching CPU r0. GuestSvcObserved means a later CPU run reached a new SVC
+// in the same run_loop frame. None authorizes saved replay.
 template<class Control>
 SemaphoreTerminalObservation observe_semaphore_terminal(const Control &control,
     const SemaphoreRegistrationEntry &expected, const SemaphoreRegistrationAudit &current) {
     const auto invalid = SemaphoreTerminalObservation{SemaphoreTerminalStatus::Invalid, {}};
     const auto &r = control.registration;
+    if (control.guest_svc_observed && !control.import_returned)
+        return invalid;
     if (control.import_returned && (!control.body_returned
         || control.import_result != static_cast<uint32_t>(control.body_return_result)))
         return invalid;
@@ -44,7 +47,7 @@ SemaphoreTerminalObservation observe_semaphore_terminal(const Control &control,
     if (match == SemaphoreRegistrationMatch::Mismatch)
         return {SemaphoreTerminalStatus::Changed, {}};
     if (control.terminal_ready)
-        return {control.import_returned ? SemaphoreTerminalStatus::ImportReturned : control.body_returned ? SemaphoreTerminalStatus::BodyReturned : SemaphoreTerminalStatus::Terminal, control.terminal_result};
+        return {control.guest_svc_observed ? SemaphoreTerminalStatus::GuestSvcObserved : control.import_returned ? SemaphoreTerminalStatus::ImportReturned : control.body_returned ? SemaphoreTerminalStatus::BodyReturned : SemaphoreTerminalStatus::Terminal, control.terminal_result};
     return {SemaphoreTerminalStatus::AbsentUnresolved, {}};
 }
 } // namespace app

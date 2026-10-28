@@ -1310,7 +1310,7 @@ SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thr
     return result;
 }
 
-bool SemaphoreImportScope::finish(uint32_t cpu_result) {
+bool SemaphoreImportScope::finish(uint32_t cpu_result, SemaphoreGuestProgress *progress) {
     if (current != this || finished) return false;
     finished = true;
     if (!semaphore || !control) return false;
@@ -1329,10 +1329,47 @@ bool SemaphoreImportScope::finish(uint32_t cpu_result) {
     if (valid) {
         control->import_result = cpu_result;
         control->import_returned = true;
+        if (progress && control->snapshot_rebind_count) {
+            progress->reset();
+            progress->kernel = kernel;
+            progress->thread = thread;
+            progress->semaphore = semaphore;
+            progress->control = control;
+        }
     }
     if (control->snapshot_rebind_count)
         LOG_INFO("Savestate semaphore import return: uid {}, thread {}, invocation {}, nid {}, result bits {}, acknowledged {}; current invocation only, no saved continuation",
             r.uid, thread, control->invocation, nid, cpu_result, valid);
+    return valid;
+}
+
+bool SemaphoreGuestProgress::observe_next_svc(const void *owner, int32_t thread_id, uint32_t pc, uint32_t nid) {
+    // Consume once, even on mismatch. Retain the original semaphore across UID reuse.
+    auto original = std::move(semaphore);
+    auto receipt = std::move(control);
+    const bool same_owner = kernel == owner && thread == thread_id;
+    kernel = nullptr;
+    thread = 0;
+    if (!original || !receipt) return false;
+    const std::lock_guard lock(original->mutex);
+    const auto &r = receipt->registration;
+    bool valid = same_owner && r.complete && r.thread_id == thread_id && r.uid == original->uid
+        && receipt->terminal_ready && receipt->body_returned && receipt->import_returned
+        && receipt->terminal_result == receipt->body_return_result
+        && receipt->import_result == static_cast<uint32_t>(receipt->body_return_result)
+        && !receipt->guest_svc_observed && receipt->invocation
+        && (receipt->session_hi || receipt->session_lo) && original->waiting_threads;
+    if (valid) {
+        for (auto it = original->waiting_threads->begin(); it != original->waiting_threads->end(); ++it)
+            if ((*it).semaphore_wait_control == receipt) valid = false;
+    }
+    if (valid) {
+        receipt->guest_svc_pc = pc;
+        receipt->guest_svc_nid = nid;
+        receipt->guest_svc_observed = true;
+    }
+    LOG_INFO("Savestate semaphore guest progress: uid {}, thread {}, invocation {}, next svc pc {}, next nid {}, observed {}; current run-loop frame only, no saved continuation",
+        r.uid, thread_id, receipt->invocation, pc, nid, valid);
     return valid;
 }
 

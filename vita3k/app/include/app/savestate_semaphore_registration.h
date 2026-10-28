@@ -78,7 +78,7 @@ SemaphoreRegistrationAudit audit_current_semaphore_registrations(Kernel &kernel)
                 || !queued.insert(entry.thread.get()).second)
                 return fail("Invalid registered semaphore thread");
             const auto &control = entry.semaphore_wait_control;
-            if (!control || control->canceled || control->terminal_ready || control->body_returned || control->import_returned || !controls.insert(control.get()).second
+            if (!control || control->canceled || control->terminal_ready || control->body_returned || control->import_returned || control->guest_svc_observed || !controls.insert(control.get()).second
                 || entry.was_canceled != &control->canceled
                 || !control->invocation || !(control->session_hi || control->session_lo)
                 || !invocations.emplace(control->session_hi, control->session_lo, control->invocation).second)
