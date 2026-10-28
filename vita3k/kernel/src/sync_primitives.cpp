@@ -20,6 +20,7 @@
 #include <kernel/sync_primitives.h>
 #include <kernel/thread/wait_invocation_identity.h>
 #include <kernel/thread/semaphore_import_scope.h>
+#include <kernel/thread/semaphore_admission.h>
 
 #include <kernel/types.h>
 #include <util/lock_and_find.h>
@@ -1234,7 +1235,7 @@ static SceInt32 semaphore_wait_body(KernelState &kernel, const char *export_name
 
     std::unique_lock<std::mutex> semaphore_lock(semaphore->mutex);
 
-    if (semaphore->val < needCount) {
+    if (semaphore_wait_requires_queue(semaphore->val, needCount)) {
         const auto control = std::make_shared<SemaphoreWaitControl>();
         receipt = {semaphore, control};
         const auto identity = next_wait_invocation_identity();

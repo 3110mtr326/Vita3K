@@ -105,6 +105,7 @@
 #include <app/savestate_semaphore_entry.h>
 #include <app/savestate_semaphore_entry_queue.h>
 #include <app/savestate_semaphore_order.h>
+#include <app/savestate_semaphore_admission.h>
 #include <app/savestate_semaphore_priority.h>
 #include <app/savestate_semaphore_queue.h>
 #include <app/savestate_semaphore_rebind.h>
@@ -640,7 +641,8 @@ static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &
     std::vector<SemaphorePriorityTarget> priorities;
     const auto order = prepare_semaphore_order(records);
     if (!order.error.empty()) return order.error;
-    size_t deferred = 0;
+    std::vector<SemaphoreAdmissionInput> admission_inputs;
+    std::vector<std::optional<SemaphoreEntryPlan<CPUContext>>> entry_plans;
     for (const auto &step : order.steps) {
         const auto &record = records[step.record_index];
         LOG_INFO("Savestate semaphore registration order: uid {}, position {}/{}, thread {}, priority {}; preparation only, no wait dispatch",
@@ -657,14 +659,35 @@ static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &
             });
         LOG_INFO("Savestate semaphore entry: thread {}, NID 0x{:08X}, result {}; candidate preparation only, no saved call executed",
             record.id, record.wait_nid, candidate.reason);
-        if (!candidate.plan || candidate.plan->timeout_address) { ++deferred; continue; }
+        const auto object = kernel.semaphores.find(step.uid);
+        if (object == kernel.semaphores.end() || !object->second || object->second->attr != step.attr)
+            return "Semaphore admission object missing or changed";
+        const bool ready = candidate.plan && !candidate.plan->timeout_address;
+        admission_inputs.push_back({step.uid, record.id, object->second->val, record.semaphore_wait.signal,
+            step.priority, step.attr, step.position, step.queue_size, ready});
+        entry_plans.push_back(ready ? candidate.plan : std::nullopt);
+    }
+    const auto admission = prepare_semaphore_admission(admission_inputs);
+    if (!admission.error.empty()) return admission.error;
+    const size_t deferred = admission.deferred_waiters;
+    LOG_INFO("Savestate semaphore admission: {} whole queues / {} waiters would block; {} waiters deferred by whole-queue policy, {} immediate-at-saved-count; shared runtime predicate, no dispatch or counter change",
+        admission.eligible_queues, admission.eligible_waiters, admission.deferred_waiters, admission.immediate_waiters);
+    for (size_t i = 0; i < order.steps.size(); ++i) {
+        const auto &step = order.steps[i];
+        const auto &record = records[step.record_index];
+        const auto &input = admission_inputs[i];
+        LOG_INFO("Savestate semaphore admission entry: uid {}, thread {}, saved count {}, requested {}, result {}, whole queue eligible {}; inert entry probe only",
+            step.uid, record.id, input.available, input.requested,
+            semaphore_admission_name(admission.steps[i].kind), admission.steps[i].whole_queue_eligible);
+        if (!admission.steps[i].whole_queue_eligible) continue;
+        const auto found = kernel.threads.find(record.id);
         if (!snapshot_semaphore_entry_queue_matches(kernel, record))
             return "Semaphore entry does not match temporary saved queue";
         bindings.push_back(&record);
         priorities.push_back({&found->second->priority, step.priority});
         LOG_INFO("Savestate semaphore registration priority: thread {}, current {}, registration {}; temporary only, saved scheduler priority unknown",
             record.id, found->second->priority, step.priority);
-        targets.push_back({found->second->cpu.get(), {candidate.plan->context, record.tpidruro}});
+        targets.push_back({found->second->cpu.get(), {entry_plans[i]->context, record.tpidruro}});
     }
     if (targets.empty()) {
         LOG_INFO("Savestate semaphore entry probe: 0 untimed candidates, {} deferred; CPU probe skipped; no saved continuation", deferred);
@@ -2392,7 +2415,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-semaphore-guest-progress/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-semaphore-admission/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }

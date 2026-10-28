@@ -19,6 +19,8 @@ code=r'''
 #include <kernel/thread/thread_data_queue.h>
 #include <kernel/thread/wait_invocation_identity.h>
 #include <kernel/thread/semaphore_import_scope.h>
+#include <kernel/thread/semaphore_admission.h>
+#include <app/savestate_semaphore_admission.h>
 #include <cassert>
 #include <array>
 #include <chrono>
@@ -510,6 +512,39 @@ int main(){
    assert(status==(mode==10?app::SemaphoreTerminalStatus::Invalid:success?app::SemaphoreTerminalStatus::GuestSvcObserved:app::SemaphoreTerminalStatus::ImportReturned));
   }
   std::weak_ptr<SemaphoreWaitControl> weak=held;held.reset();assert(weak.expired());++cases;
+ }
+
+
+ // A valid existing queue can contain a small waiter behind an unsatisfied
+ // large head. Re-entering the small wait would bypass that saved membership.
+ for(bool priority:{false,true}){
+  KernelState k;auto sema=std::make_shared<Semaphore>();sema->waiting_threads=queue(priority);sema->attr=priority?SCE_KERNEL_ATTR_TH_PRIO:0;k.semaphores[1]=sema;
+  for(int id:{1,2,3}){auto t=std::make_shared<ThreadState>();t->priority=id*100;k.threads[id]=t;}
+  int first=99,second=99;
+  auto await_size=[&](size_t count){
+   const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+   while(true){{std::lock_guard lock(sema->mutex);if(sema->waiting_threads->size()==count)break;}
+    assert(std::chrono::steady_clock::now()<deadline);std::this_thread::yield();}
+  };
+  std::thread head([&]{first=semaphore_wait(k,"head",1,1,3,nullptr);});await_size(1);
+  std::thread tail([&]{second=semaphore_wait(k,"tail",2,1,1,nullptr);});await_size(2);
+  const std::vector<app::SemaphoreAdmissionInput> original{{1,1,0,3,100,sema->attr,0,2,true},{1,2,0,1,200,sema->attr,1,2,true}};
+  auto plan=app::prepare_semaphore_admission(original);assert(plan.error.empty()&&plan.eligible_waiters==2);
+  assert(semaphore_signal(k,"signal",3,1,2)==0); // val2 cannot satisfy head3
+  {
+   std::lock_guard lock(sema->mutex);assert(sema->val==2&&sema->waiting_threads->size()==2);
+   auto saved=original;for(auto &input:saved)input.available=sema->val;
+   plan=app::prepare_semaphore_admission(saved);
+   assert(plan.error.empty()&&plan.eligible_waiters==0&&plan.deferred_waiters==2&&plan.immediate_waiters==1);
+   assert(plan.steps[0].kind==app::SemaphoreAdmissionKind::WouldBlock&&plan.steps[1].kind==app::SemaphoreAdmissionKind::WouldComplete);
+   assert(sema->val==2&&sema->waiting_threads->size()==2); // planner is inert
+  }
+  // Exercise the REAL runtime rule: another count1 call completes immediately
+  // despite the two existing waiters, consuming exactly one unit.
+  assert(semaphore_wait(k,"new",3,1,1,nullptr)==0);
+  {std::lock_guard lock(sema->mutex);assert(sema->val==1&&sema->waiting_threads->size()==2);}
+  assert(semaphore_cancel(k,"cancel",3,1,0,nullptr)==0);head.join();tail.join();
+  assert(first==SCE_KERNEL_ERROR_WAIT_CANCEL&&second==SCE_KERNEL_ERROR_WAIT_CANCEL);++cases;
  }
 
  std::cout<<"PASS: "<<cases<<" production semaphore lifecycle cases; real host wait/signal/cancel/timeout/abort, rebuilt nodes, ownership lifetime, invocation isolation and legacy cleanup\n";

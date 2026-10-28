@@ -4,7 +4,55 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Semaphore next-SVC progress evidence (latest checkpoint v43, format v33)
+## Semaphore whole-queue admission diagnostic (latest checkpoint v44, format v33)
+
+The semaphore wait body queues only when available < requested. Otherwise it
+completes immediately, even if other waiters are already queued. A saved queue
+can therefore contain a head requesting 3 and a later waiter requesting 1 while
+the counter is 2: signalling 2 cannot satisfy the head, but re-entering the later
+wait would consume a count instead of recreating its saved queue position.
+
+The runtime comparison is now shared with the inert saved-entry planner. Under
+the continuous snapshot locks, after saved sync values have been applied, the
+planner checks complete queues at their saved count. Every member must have a
+supported untimed entry plan and would-block admission. A timed, unsupported,
+unready or immediately completing member defers the entire queue. Independent
+eligible queues can still receive inert CPU/registration-priority probes.
+This is not a sequential acquisition simulation: no count is subtracted and
+no wait is dispatched. Eligibility does not authorize saved-wait execution.
+
+The planner rejects incomplete groups, duplicate threads, inconsistent counts,
+attributes or positions, invalid identities and invalid priority ordering. On
+failure all partial steps and counters are discarded. The existing nested
+NGS/GPU diagnostics still run when no queue is eligible. CPU, priorities, queues
+and sync values retain their existing rollback requirements.
+
+Device marker: CPU-semaphore-admission. The admission summary reports eligible
+whole queues/waiters, deferred waiters and immediate-at-saved-count waiters.
+Per-entry logs report the saved count, requested count, classification and whole
+queue eligibility. A deferred group identifies a replay limitation; it does not
+itself imply that ordinary gameplay failed. CURRENT rebind/import acknowledgement
+and next-SVC observations after Resume remain enabled. Saved replay remains off.
+
+Validation: 123 production semaphore lifecycle cases, 63 saved entry cases,
+26 admission planner cases and existing orchestration tests pass. Production
+FIFO and priority tests exercise the head=3/tail=1/count=2 case, verify that a
+new wait completes immediately despite the queue, then cancel and join both
+original waiters. Entry tests verify whole-group exclusion for mixed admission,
+timed and callback entries, with zero CPU writes and unchanged live state.
+Native syntax checks for sync_primitives.cpp and savestate.cpp pass.
+Android build and v44 device validation are pending. Format remains 33.
+
+v43 device evidence (2026-10-28): user reports normal. One Load at
+22:04:32-33; six CURRENT registrations match before/after rebind, five SAVED
+untimed candidates and zero deferred. Joint rollback and preflight match.
+All six CURRENT import acknowledgements at 22:04:42 have result bits 0 and
+matching invocation next-SVC observations true. Subsequent frame samples are
+approximately 30fps; shutdown is about 17 seconds after acknowledgement.
+This log does not establish 30 seconds, repeated Load or saved replay coverage.
+The screenshot filename has a different time from the logged diagnostic.
+
+## Semaphore next-SVC progress evidence (previous checkpoint v43, format v33)
 
 Successful CURRENT rebound semaphore import acknowledgements can now arm one
 SemaphoreGuestProgress receipt in the containing run_loop frame. It retains the

@@ -7,6 +7,7 @@ code=r'''
 #include <app/savestate_semaphore_entry.h>
 #include <app/savestate_semaphore_entry_queue.h>
 #include <app/savestate_semaphore_order.h>
+#include <app/savestate_semaphore_admission.h>
 #include <app/savestate_semaphore_priority.h>
 #include <functional>
 #include <app/savestate_cpu_probe.h>
@@ -79,7 +80,7 @@ using CPUState=SnapshotCpuValues;
 enum class ThreadStatus {run,wait,suspend};
 struct Thread {int priority=777;std::shared_ptr<CPUState> cpu;ThreadStatus status=ThreadStatus::wait;};
 struct Entry {std::shared_ptr<Thread> thread;int signal=2,priority=100;uint32_t snapshot_timeout_present=0,snapshot_timeout_us=0;void *semaphore_wait_control=nullptr;bool *was_canceled=nullptr;};
-struct Object {uint32_t attr=0;std::shared_ptr<std::vector<Entry>> waiting_threads=std::make_shared<std::vector<Entry>>();};
+struct Object {int32_t val=0;uint32_t attr=0;std::shared_ptr<std::vector<Entry>> waiting_threads=std::make_shared<std::vector<Entry>>();};
 struct KernelState {bool snapshot_restore_failed=false;std::map<int,std::shared_ptr<Thread>> threads;std::map<int,std::shared_ptr<Object>> semaphores;};
 struct MemState {std::map<uint32_t,uint32_t> words;};
 template<class T> struct Ptr {uint32_t a;explicit Ptr(uint32_t v):a(v){}bool valid(MemState &m)const{return m.words.count(a);}T *get(MemState &m)const{return &m.words.at(a);}};
@@ -186,11 +187,40 @@ extra+=r"""
  }
 """
 
+
+extra+=r"""
+ // Defer a whole queue if a member would complete or lacks a safe untimed entry.
+ for(int mode=0;mode<4;++mode){
+  KernelState kernel;MemState mem{words};std::vector<ThreadRecord> records;
+  auto object=std::make_shared<Object>();object->val=mode==0||mode==1?1:0;kernel.semaphores[7]=object;
+  std::vector<SnapshotCpuValues> originals;
+  for(int id:{1,2}){
+   auto thread=std::make_shared<Thread>();thread->cpu=std::make_shared<CPUState>();thread->cpu->context=base;thread->cpu->tpidruro=99;
+   kernel.threads[id]=thread;originals.push_back(*thread->cpu);
+   auto w=basewait;w.queue_size=2;w.position=id-1;w.signal=id==1?2:1;
+   SnapshotWaitTargets t{};t.count=1;t.targets[0]={1,7};auto ctx=base;ctx.cpu_registers[1]=w.signal;
+   uint32_t nid=0x0C7B834B;
+   if(id==2&&mode==2){w.timeout_present=w.deadline_known=1;w.timeout_us=100;w.remaining_us=50;ctx.cpu_registers[2]=0x2000;}
+   if(id==2&&mode==3)nid=0x174692B4;
+   records.push_back({id,w,t,nid,ctx,42});Entry e{thread};e.signal=w.signal;object->waiting_threads->push_back(e);
+  }
+  if(mode==1)std::reverse(records.begin(),records.end());
+  integration_writes=0;fail_rollback=false;throw_write_at=-1;int nested=0;
+  auto result=probe_saved_semaphore_entries(kernel,mem,records,[&]{
+   ++nested;for(int id:{1,2})assert(same_snapshot_cpu_values(*kernel.threads[id]->cpu,originals[id-1])&&kernel.threads[id]->priority==777);
+   return true;
+  });
+  assert(result.empty()&&nested==1&&integration_writes==0&&!kernel.snapshot_restore_failed);
+  assert(object->val==(mode<=1?1:0)&&object->waiting_threads->size()==2);
+  ++cases;
+ }
+"""
+
 assert at in code;code=code.replace(at,extra+at)
 
 with tempfile.TemporaryDirectory() as d:
  tmp=Path(d);h=tmp/'cpu/common.h';h.parent.mkdir()
  h.write_text('#pragma once\n#include <array>\n#include <cstdint>\nstruct CPUContext {std::array<uint32_t,16> cpu_registers{};std::array<float,64> fpu_registers{};uint32_t cpsr=0,fpscr=0;};\n')
  f=tmp/'test.cpp';f.write_text(code);exe=tmp/'test.exe'
- subprocess.run([args.compiler,'-std=c++20','-Wall','-Wextra','-Werror','-Wno-misleading-indentation','-I',str(tmp),'-I',str(r/'vita3k/app/include'),str(f),'-o',str(exe)],check=True,timeout=60)
+ subprocess.run([args.compiler,'-std=c++20','-Wall','-Wextra','-Werror','-Wno-misleading-indentation','-I',str(tmp),'-I',str(r/'vita3k/app/include'),'-I',str(r/'vita3k/kernel/include'),str(f),'-o',str(exe)],check=True,timeout=60)
  subprocess.run([str(exe)],check=True,timeout=20)
