@@ -4,7 +4,41 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Semaphore admission checkpoint (latest checkpoint v45, format v33)
+## Semaphore entry instruction checkpoint (latest checkpoint v46, format v33)
+
+Eligible untimed entries now re-read and validate the SVC, return instruction and
+import NID immediately before and after the nested NGS/context/GPU checkpoint.
+Previously these words were checked only when preparing the initial candidate;
+later queue/CPU checks could not detect a changed instruction or unreadable stub.
+The same production entry validator and reader are reused. Invalid or unreadable
+words refuse the CPU transaction, whose original registers/priority are rolled
+back. Deferred entries are not promoted or executed by the new check.
+
+Marker: CPU-semaphore-stub-checkpoint. Successful eligible entries log:
+Savestate semaphore stub checkpoint: N untimed entry stubs MATCH before/after
+nested checkpoint; SVC/return/NID re-read; no instructions executed.
+A refusal logs the affected thread and validator reason. This verifies the
+paused memory view at two endpoints; it does not prove saved executable mapping
+restoration or unchanged bytes between endpoints. Existing admission, queue,
+CPU/priority and outer RAM rollback checks are still required. Zero eligible
+entries produce no stub-success message. Saved execution remains disabled.
+
+Validation:99 production-extracted entry cases pass. Sixteen new cases cover
+both public/private plain-wait NIDs, corruption and loss of each of the three
+stub words, unchanged stubs and unrelated memory changes. They verify refusal
+with CPU/priority rollback, without executing guest instructions. Existing
+session orchestration tests and native syntax checks pass. Android build and
+v46 device validation pending. Format remains33.
+
+v45 device evidence2026-11-12: one Load17:31:39-40; three queues/six saved waiters,
+zero deferred/immediate; six admission bindings and joint rollbacks MATCH.
+Six CURRENT import acknowledgements and matching next-SVC observations succeed
+at17:31:47. Gameplay continues about86 seconds to shutdown17:33:13.978, mainly
+28-30fps with transient21.85/23.92fps samples. User reports normal. Resource
+missing-file logs also occur; their cause is not established here. Repeated
+Load/saved replay remain unverified. Screenshot filename differs from Load time.
+
+## Semaphore admission checkpoint (previous checkpoint v45, format v33)
 
 The whole-queue admission decision is now revalidated immediately before and
 after the nested NGS/context/GPU checkpoint. Each saved waiter retains its exact

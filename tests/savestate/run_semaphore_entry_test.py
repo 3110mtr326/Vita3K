@@ -250,6 +250,33 @@ extra+=r'''
  }
 '''
 
+
+extra+=r'''
+ // Mutate each actual stub word during the extracted joint probe. The CPU and
+ // priority transaction must refuse and roll back even though queues/counts match.
+ for(uint32_t nid:{0x0C7B834Bu,0x45389B6Bu})for(int mode=0;mode<8;++mode){
+  KernelState kernel;MemState mem{words};mem.words[0x1008]=nid;
+  auto thread=std::make_shared<Thread>();thread->cpu=std::make_shared<CPUState>();
+  thread->cpu->context=base;thread->cpu->tpidruro=99;kernel.threads[1]=thread;
+  const auto before=*thread->cpu;auto object=std::make_shared<Object>();
+  object->waiting_threads->push_back(Entry{thread});kernel.semaphores[7]=object;
+  SnapshotWaitTargets t{};t.count=1;t.targets[0]={1,7};
+  ThreadRecord rec{1,basewait,t,nid,base,42};
+  integration_writes=0;fail_rollback=false;throw_write_at=-1;int nested=0;
+  auto error=probe_saved_semaphore_entries(kernel,mem,{rec},[&]{
+   ++nested;assert(thread->cpu->context.cpu_registers[15]==0x1000);
+   if(mode>=1&&mode<=3)mem.words[0x1000+(mode-1)*4]^=1;
+   if(mode>=4&&mode<=6)mem.words.erase(0x1000+(mode-4)*4);
+   if(mode==7)mem.words[0x2000]=123; // unrelated memory does not invalidate the stub
+   return true;
+  });
+  assert(nested==1&&error.empty()==(mode==0||mode==7));
+  assert(integration_writes==2&&thread->priority==777);
+  assert(same_snapshot_cpu_values(*thread->cpu,before)&&!kernel.snapshot_restore_failed);
+  ++cases;
+ }
+'''
+
 assert at in code;code=code.replace(at,extra+at)
 
 with tempfile.TemporaryDirectory() as d:
