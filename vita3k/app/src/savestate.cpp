@@ -161,7 +161,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 33; // v30: process-scoped delay invocation identity
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 34; // v34: saved thread priority, distinct from wait registration priority
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -471,6 +471,7 @@ struct ThreadRecord {
     uint8_t in_condvar;
     CPUContext ctx;
     uint32_t tpidruro;
+    int32_t priority; // Thread priority at Save, not the queued wait registration priority.
     uint64_t start_tick;
     uint64_t last_vblank_waited;
     uint32_t returned_value;
@@ -598,11 +599,15 @@ static std::string probe_saved_cpu_contexts(KernelState &kernel,const std::vecto
             LOG_INFO("Savestate wait audit: thread {}, saved wait {}, current wait {}, changed GPR mask 0x{:04X}, control {}, TLS {}, FPU {}; observation only, host continuation unverified.",
                 record.id,audit.saved_wait,audit.current_wait,audit.changed_registers,
                 audit.changed_control,audit.changed_tls,audit.changed_fpu);
+        changed_metadata += thread.priority != record.priority;
+        LOG_INFO("Savestate thread priority: thread {}, current {}, saved {}; temporary field probe, no scheduling executed",
+            record.id, thread.priority, record.priority);
         changed_metadata += thread.start_tick != record.start_tick;
         changed_metadata += thread.last_vblank_waited != record.last_vblank_waited;
         changed_metadata += thread.returned_value != record.returned_value;
         if (!metadata_targets.insert(&thread).second)
             return "Duplicate thread metadata target";
+        metadata.stage(thread.priority, static_cast<int>(record.priority));
         metadata.stage(thread.start_tick, record.start_tick);
         metadata.stage(thread.last_vblank_waited, record.last_vblank_waited);
         metadata.stage(thread.returned_value, record.returned_value);
@@ -627,7 +632,7 @@ static std::string probe_saved_cpu_contexts(KernelState &kernel,const std::vecto
         return "CPU verification failed; original CPU values retained";
     }
     LOG_INFO("Savestate CPU probe: saved registers MATCH; rollback MATCH; {} threads; no guest instructions executed.",targets.size());
-    LOG_INFO("Savestate thread metadata probe: {} threads, {} changed fields; saved start ticks/vblank waits/return values MATCH; rollback MATCH; no thread status, wait queues or host clock changed.",targets.size(),changed_metadata);
+    LOG_INFO("Savestate thread metadata probe: {} threads, {} changed fields; saved priorities/start ticks/vblank waits/return values MATCH; rollback MATCH; no thread status, wait queues or host clock changed.",targets.size(),changed_metadata);
     return {};
 }
 
@@ -706,7 +711,7 @@ static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &
             return "Semaphore entry does not match temporary saved queue";
         bindings.push_back(&record);
         priorities.push_back({&found->second->priority, step.priority});
-        LOG_INFO("Savestate semaphore registration priority: thread {}, current {}, registration {}; temporary only, saved scheduler priority unknown",
+        LOG_INFO("Savestate semaphore registration priority: thread {}, current {}, registration {}; temporary registration priority; saved thread priority restored by this inner probe",
             record.id, found->second->priority, step.priority);
         targets.push_back({found->second->cpu.get(), {entry_plans[i]->context, record.tpidruro}});
     }
@@ -2218,6 +2223,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 waiting_thread_count++;
             rec.ctx = save_context(*thread->cpu);
             rec.tpidruro = read_tpidruro(*thread->cpu);
+            rec.priority = thread->priority;
             rec.start_tick = thread->start_tick;
             rec.last_vblank_waited = thread->last_vblank_waited;
             rec.returned_value = thread->returned_value;
@@ -2462,7 +2468,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-semaphore-stub-checkpoint/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-thread-priority/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
@@ -2942,6 +2948,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
         }
         load_context(*thread->cpu, ctx);
         write_tpidruro(*thread->cpu, rec.tpidruro);
+        thread->priority = rec.priority;
         thread->start_tick = rec.start_tick;
         thread->last_vblank_waited = rec.last_vblank_waited;
         thread->returned_value = rec.returned_value;

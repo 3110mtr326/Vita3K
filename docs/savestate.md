@@ -4,7 +4,46 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Semaphore entry instruction checkpoint (latest checkpoint v46, format v33)
+## Saved thread priority (latest checkpoint v47, format v34)
+
+ThreadRecord now captures the thread's priority at Save, independently of the
+historical priority stored in a semaphore queue entry. The CPU/metadata joint
+probe stages this field alongside start ticks, vblank waits and return values.
+Nested semaphore entry probes may temporarily use the registration priority;
+their rollback returns to the saved thread priority, then the outer metadata
+rollback returns to the original current thread priority. This executes no
+scheduler, changes no queue order, and does not enable saved continuation.
+The dormant restore assignment also includes this field, but remains disabled.
+
+Format is now34. Older snapshots are refused by the existing version gate before
+thread records are read; create a fresh Save State with this build. ThreadRecord
+continues using the existing build-native POD representation, not a portable
+cross-architecture encoding. Captured integer values are preserved without
+inventing a new user-priority range for internal threads.
+
+Marker: CPU-thread-priority. Per-thread logs show current and saved priorities.
+The thread metadata success message now includes priorities. All existing
+admission, stub, queue and rollback checks still apply. This captures one missing
+thread field; it is not complete scheduler restoration or full rewind.
+
+Validation:20 production-extracted CPU/metadata cases include priority equality,
+difference, mutation refusal and nested registration override success/failure/
+exception. Values follow current120 -> saved100 -> registration80 -> saved100
+-> current120, with failure unwinding verified.99 entry cases and session
+orchestration tests pass. A production ThreadRecord/POD extraction verifies
+four priority roundtrips, distinct registration priorities, adjacent records and
+truncation with a stub CPU layout; it is not a cross-ABI file compatibility test.
+Native syntax checks pass. Android build and device validation pending.
+
+v46 evidence2026-11-12: two Loads18:15:56-57 and18:17:03-04; each has three
+saved queues/five saved waiters, no deferred/immediate entries, five admission
+and stub checkpoints MATCH and all joint rollbacks MATCH. CURRENT registrations
+four then six match before/after rebind; all acknowledge result0 and reach the
+next SVC. About63 seconds separate first Resume and next Load, and about72
+seconds separate second Resume and shutdown. User reports normal operation.
+Saved/current counts need not agree. Saved continuation remains untested.
+
+## Semaphore entry instruction checkpoint (previous checkpoint v46, format v33)
 
 Eligible untimed entries now re-read and validate the SVC, return instruction and
 import NID immediately before and after the nested NGS/context/GPU checkpoint.
