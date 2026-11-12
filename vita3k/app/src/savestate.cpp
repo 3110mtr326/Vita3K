@@ -641,6 +641,9 @@ static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &
     std::vector<SemaphorePriorityTarget> priorities;
     const auto order = prepare_semaphore_order(records);
     if (!order.error.empty()) return order.error;
+    // Retain the exact owners: UID/count equality alone cannot detect replacement.
+    // These observations are local to the continuous snapshot lock scope.
+    std::vector<std::function<bool()>> admission_checks;
     std::vector<SemaphoreAdmissionInput> admission_inputs;
     std::vector<std::optional<SemaphoreEntryPlan<CPUContext>>> entry_plans;
     for (const auto &step : order.steps) {
@@ -662,6 +665,23 @@ static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &
         const auto object = kernel.semaphores.find(step.uid);
         if (object == kernel.semaphores.end() || !object->second || object->second->attr != step.attr)
             return "Semaphore admission object missing or changed";
+        const auto semaphore = object->second;
+        const auto thread = found->second;
+        const auto queue = semaphore->waiting_threads.get();
+        if (!queue) return "Semaphore admission queue missing";
+        const auto cpu = thread->cpu.get();
+        const auto available = semaphore->val;
+        const auto attr = semaphore->attr;
+        admission_checks.push_back([&, semaphore, thread, queue, cpu, available, attr,
+                                      uid = step.uid, id = record.id] {
+            const auto live_object = kernel.semaphores.find(uid);
+            const auto live_thread = kernel.threads.find(id);
+            return live_object != kernel.semaphores.end() && live_object->second == semaphore
+                && live_thread != kernel.threads.end() && live_thread->second == thread
+                && thread->cpu.get() == cpu && thread->status != ThreadStatus::run
+                && semaphore->waiting_threads.get() == queue
+                && semaphore->val == available && semaphore->attr == attr;
+        });
         const bool ready = candidate.plan && !candidate.plan->timeout_address;
         admission_inputs.push_back({step.uid, record.id, object->second->val, record.semaphore_wait.signal,
             step.priority, step.attr, step.position, step.queue_size, ready});
@@ -689,9 +709,21 @@ static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &
             record.id, found->second->priority, step.priority);
         targets.push_back({found->second->cpu.get(), {entry_plans[i]->context, record.tpidruro}});
     }
+    const auto checkpoint = [&] {
+        const auto matches = [&] {
+            return std::all_of(admission_checks.begin(), admission_checks.end(),
+                [](const auto &check) { return check(); });
+        };
+        if (!matches()) return false;
+        const bool nested = !during || during();
+        if (!matches()) return false;
+        if (nested)
+            LOG_INFO("Savestate semaphore admission checkpoint: {} waiter bindings MATCH before/after nested checkpoint; exact objects/queues/threads/CPUs and saved counts/attributes retained; deferred groups included; no saved dispatch", admission_checks.size());
+        return nested;
+    };
     if (targets.empty()) {
         LOG_INFO("Savestate semaphore entry probe: 0 untimed candidates, {} deferred; CPU probe skipped; no saved continuation", deferred);
-        return (!during || during()) ? std::string{} : "Nested checkpoint refused without entry candidates";
+        return checkpoint() ? std::string{} : "Admission or nested checkpoint refused without entry candidates";
     }
     auto result = SnapshotCpuProbe::InvalidTargets;
     const auto priority_result = probe_semaphore_priorities(priorities, [&] {
@@ -700,7 +732,7 @@ static std::string probe_saved_semaphore_entries(KernelState &kernel, MemState &
         [](CPUState &cpu, const SnapshotCpuValues &v) { load_context(cpu, v.context); write_tpidruro(cpu, v.tpidruro); }, [&] {
             for (const auto *record : bindings)
                 if (!snapshot_semaphore_entry_queue_matches(kernel, *record)) return false;
-            if (during && !during()) return false;
+            if (!checkpoint()) return false;
             for (const auto *record : bindings)
                 if (!snapshot_semaphore_entry_queue_matches(kernel, *record)) return false;
             return true;
@@ -2415,7 +2447,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-semaphore-admission/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-semaphore-admission-checkpoint/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }

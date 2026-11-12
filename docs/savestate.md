@@ -4,7 +4,48 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Semaphore whole-queue admission diagnostic (latest checkpoint v44, format v33)
+## Semaphore admission checkpoint (latest checkpoint v45, format v33)
+
+The whole-queue admission decision is now revalidated immediately before and
+after the nested NGS/context/GPU checkpoint. Each saved waiter retains its exact
+semaphore and thread owners, and observes queue/CPU address, saved counter and
+attributes under the existing continuous snapshot locks. Missing/replaced map
+entries, a changed queue or CPU address, a running thread, or any counter or
+attribute change refuse the checkpoint, even if the new counter would still
+block. Deferred groups are included, including the zero-entry-CPU path.
+
+Queue/CPU addresses are non-owning tokens, never dereferenced by these checks.
+This relies on continuous exclusion; it is not a lifetime or ABA guarantee
+across unlocked execution. Equal endpoints cannot prove no intervening change.
+Existing eligible-queue membership and CPU/priority transaction checks remain.
+On refusal the containing diagnostic transactions still unwind; a failed
+rollback retains the existing restart requirement. No saved call is dispatched.
+
+Marker: CPU-semaphore-admission-checkpoint. The new log is:
+Savestate semaphore admission checkpoint: N waiter bindings MATCH before/after
+nested checkpoint; exact objects/queues/threads/CPUs and saved counts/attributes
+retained; deferred groups included; no saved dispatch.
+The later joint rollback result is also required; this message alone is not a
+successful restore or a guarantee that every later diagnostic succeeds.
+
+Validation: 83 saved-entry cases pass, including 20 checkpoint cases covering
+eligible and deferred paths, a changed-but-still-blocking count, attributes,
+equal-valued object replacement, queue/thread/CPU replacement, running status
+and removed map entries. Tests verify refusal and CPU/priority rollback or zero
+CPU writes for deferred paths. Existing session orchestration tests pass.
+Native syntax checks for savestate.cpp and sync_primitives.cpp pass (existing
+spdlog deprecation warning remains). Android build and device test pending.
+Format remains33; saved continuation and full rewind remain disabled.
+
+v44 device result on2026-11-12: one Load16:41:10-11, three whole queues and six
+waiters would block; zero deferred/immediate, saved counts0 and requests1.
+Joint rollback/preflight and current registration checks MATCH. Six matching
+invocations acknowledge import result0 and reach the next SVC after Resume.
+Post-pause frame samples16:41:22-36 are29.50-30.18fps. Shutdown16:41:40 is about
+20 seconds after acknowledgements, so30-second/repeated-Load coverage remains
+unconfirmed. User reports normal. Screenshot filename differs from log time.
+
+## Semaphore whole-queue admission diagnostic (previous checkpoint v44, format v33)
 
 The semaphore wait body queues only when available < requested. Otherwise it
 completes immediately, even if other waiters are already queued. A saved queue

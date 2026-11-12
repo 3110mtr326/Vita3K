@@ -216,6 +216,40 @@ extra+=r"""
  }
 """
 
+
+extra+=r'''
+ // Verify the extracted production checkpoint detects changes even when the
+ // changed value would still block, and includes deferred queues with no writes.
+ for(bool deferred:{false,true})for(int mode=0;mode<10;++mode){
+  KernelState kernel;MemState mem{words};auto thread=std::make_shared<Thread>();
+  thread->cpu=std::make_shared<CPUState>();thread->cpu->context=base;thread->cpu->tpidruro=99;
+  const auto original_cpu=thread->cpu;const auto before=*original_cpu;
+  kernel.threads[1]=thread;auto object=std::make_shared<Object>();kernel.semaphores[7]=object;
+  object->waiting_threads->push_back(Entry{thread});
+  SnapshotWaitTargets t{};t.count=1;t.targets[0]={1,7};
+  ThreadRecord rec{1,basewait,t,0x0C7B834B,base,42};
+  if(deferred)rec.wait_nid=0x174692B4;
+  integration_writes=0;fail_rollback=false;throw_write_at=-1;int nested=0;
+  auto error=probe_saved_semaphore_entries(kernel,mem,{rec},[&]{
+   ++nested;
+   if(mode==1)object->val=1; // requested 2: still blocks, but evidence is stale
+   if(mode==2)object->attr=0x2000;
+   if(mode==3)kernel.semaphores[7]=std::make_shared<Object>(*object);
+   if(mode==4)object->waiting_threads=std::make_shared<std::vector<Entry>>(*object->waiting_threads);
+   if(mode==5)kernel.threads[1]=std::make_shared<Thread>(*thread);
+   if(mode==6)thread->cpu=std::make_shared<CPUState>(*original_cpu);
+   if(mode==7)thread->status=ThreadStatus::run;
+   if(mode==8)kernel.semaphores.erase(7);
+   if(mode==9)kernel.threads.erase(1);
+   return true;
+  });
+  assert(nested==1&&error.empty()==(mode==0));
+  assert(integration_writes==(deferred?0:2));
+  assert(thread->priority==777&&same_snapshot_cpu_values(*original_cpu,before));
+  assert(!kernel.snapshot_restore_failed);++cases;
+ }
+'''
+
 assert at in code;code=code.replace(at,extra+at)
 
 with tempfile.TemporaryDirectory() as d:
