@@ -26,11 +26,11 @@ uint32_t read_tpidruro(CPUState &c){return c.values.tpidruro;}
 void write_tpidruro(CPUState &c,uint32_t v){c.values.tpidruro=v;}
 void load_context(CPUState &c,const CPUContext &v){if(++c.writes==2&&c.fail_undo)throw std::runtime_error("undo failed");c.values.context=v;}
 enum class ThreadStatus{run,wait,suspend};
-struct Thread {int priority=120;uint64_t start_tick=10,last_vblank_waited=20;uint32_t returned_value=30;ThreadStatus status=ThreadStatus::wait;std::unique_ptr<CPUState> cpu=std::make_unique<CPUState>();};
+struct Thread {int32_t affinity_mask=7;int priority=120;uint64_t start_tick=10,last_vblank_waited=20;uint32_t returned_value=30;ThreadStatus status=ThreadStatus::wait;std::unique_ptr<CPUState> cpu=std::make_unique<CPUState>();};
 struct KernelState {bool snapshot_restore_failed=false;std::map<int,std::shared_ptr<Thread>>threads{{1,std::make_shared<Thread>()}};};
-struct ThreadRecord{int32_t priority=100;uint8_t status=static_cast<uint8_t>(ThreadStatus::wait);uint64_t start_tick=40,last_vblank_waited=50;uint32_t returned_value=60;int id=1;CPUContext ctx{};uint32_t tpidruro=123;};
+struct ThreadRecord{int32_t affinity_mask=1;int32_t priority=100;uint8_t status=static_cast<uint8_t>(ThreadStatus::wait);uint64_t start_tick=40,last_vblank_waited=50;uint32_t returned_value=60;int id=1;CPUContext ctx{};uint32_t tpidruro=123;};
 METHOD
-int main(){for(int mode=0;mode<20;++mode){KernelState kernel;auto thread=kernel.threads[1];
+int main(){for(int mode=0;mode<24;++mode){KernelState kernel;auto thread=kernel.threads[1];
  if(mode==1)kernel.snapshot_restore_failed=true;
  if(mode==2)thread->status=ThreadStatus::run;
  if(mode==3)kernel.threads.clear();
@@ -41,6 +41,9 @@ int main(){for(int mode=0;mode<20;++mode){KernelState kernel;auto thread=kernel.
  if(mode==10){saved.start_tick=10;saved.last_vblank_waited=20;saved.returned_value=30;}
  if(mode==14)saved.priority=120;
  if(mode==15)saved.priority=64;
+ if(mode==20)saved.affinity_mask=7;
+ if(mode==21)saved.affinity_mask=0;
+ if(mode==22)saved.affinity_mask=static_cast<int32_t>(0x80000000u);
  std::vector<ThreadRecord> records{saved};
  if(mode==8)records.push_back(saved);
  if(mode==12){kernel.threads[2]=std::make_shared<Thread>();auto second=saved;second.id=2;records.push_back(second);}
@@ -49,12 +52,13 @@ int main(){for(int mode=0;mode<20;++mode){KernelState kernel;auto thread=kernel.
  auto error=probe_saved_cpu_contexts(kernel,records,[&]{
    ++calls;
    for(const auto &rec:records){const auto &v=*kernel.threads.at(rec.id);
+     assert(v.affinity_mask==rec.affinity_mask);
      assert(v.priority==rec.priority);
      assert(v.start_tick==rec.start_tick&&v.last_vblank_waited==rec.last_vblank_waited&&v.returned_value==rec.returned_value);
      assert(v.cpu->values.context.cpu_registers[0]==321&&v.cpu->values.tpidruro==123);
      assert(v.status==ThreadStatus::wait);
    }
-   if(mode>=17){
+   if(mode>=17&&mode<=19){
      std::vector<SemaphorePriorityTarget> priorities{{&thread->priority,80}};
      const auto result=probe_semaphore_priorities(priorities,[&]{
        assert(thread->priority==80);
@@ -65,13 +69,15 @@ int main(){for(int mode=0;mode<20;++mode){KernelState kernel;auto thread=kernel.
      assert(thread->priority==saved.priority);
      return result==SemaphorePriorityProbe::Passed;
    }
+   if(mode==23)thread->affinity_mask=4;
    if(mode==16)thread->priority=180;
    if(mode==5)throw std::runtime_error("nested GPU failure");
    if(mode==6){thread->start_tick=999;thread->last_vblank_waited=888;thread->returned_value=777;}
    return mode!=7;
  });
- assert(error.empty()==(mode==0||mode==9||mode==10||mode==12||mode==14||mode==15||mode==17));
+ assert(error.empty()==(mode==0||mode==9||mode==10||mode==12||mode==14||mode==15||mode==17||mode==20||mode==21||mode==22));
  assert(kernel.snapshot_restore_failed==(mode==1||mode==4));
+ assert(thread->affinity_mask==7);
  assert(thread->priority==120);
  assert(thread->start_tick==10&&thread->last_vblank_waited==20&&thread->returned_value==30);
  if(mode==12){const auto &second=*kernel.threads[2];assert(second.start_tick==10&&second.last_vblank_waited==20&&second.returned_value==30);}
@@ -81,7 +87,7 @@ int main(){for(int mode=0;mode<20;++mode){KernelState kernel;auto thread=kernel.
    if(mode!=4)assert(thread->cpu->values.context.cpu_registers[0]==0&&thread->cpu->values.tpidruro==0);
  }
  }
- std::cout<<"PASS: 20 production CPU/thread-metadata cases; saved and registration priorities, nested rollback, failure/mutation, duplicates and persistent veto\n";
+ std::cout<<"PASS: 24 production CPU/thread-metadata cases; affinity equality/zero/high-bit/mutation/rollback, saved and registration priorities, nested rollback, failure/mutation, duplicates and persistent veto\n";
 }
 '''.replace('METHOD',t[a:b])
 includes=[]

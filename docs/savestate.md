@@ -4,7 +4,43 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Saved thread priority (latest checkpoint v47, format v34)
+## Saved thread CPU affinity (latest checkpoint v48, format v35)
+
+ThreadRecord now captures affinity_mask in addition to priority. This is guest
+kernel metadata used by thread-info/affinity queries; it does not bind the host
+OS thread to a CPU. The CPU metadata transaction stages and verifies the saved
+mask under the existing guard, then restores the current value on success,
+refusal or exception. The disabled full-restore assignment includes it too.
+No saved guest instructions or scheduler continuation are enabled.
+
+The guest TLS copy of affinity is memory: sceKernelChangeThreadCpuAffinityMask
+normally updates both this field and TLS. This change covers the missing host
+metadata field only. It does not invoke that API, independently write TLS, or
+prove that existing bounded RAM coverage includes every TLS byte. Full restore
+must still establish consistency of both copies before enabling execution.
+
+Format35 rejects older snapshots through the existing version gate; create a
+fresh Save State. The existing native POD representation is retained, not a
+portable cross-architecture format. Preserve captured signed 32-bit values,
+including zero; do not reinterpret zero as a host affinity operation.
+
+Marker: CPU-thread-affinity. Logs show each current/saved affinity value and
+metadata success includes affinity. Validation: 24 production-extracted CPU
+metadata cases, including different/equal/zero/high-bit masks, unexpected
+mutation, exception and nested registration-priority rollback; production POD
+roundtrip/truncation tests with stub CPU layout; 99 semaphore entry cases;
+session orchestration and native syntax checks pass. Android build and device
+validation are pending. TLS coverage and saved continuation are not certified.
+
+v47 evidence: two Loads at 21:19:41 and 21:20:42 on 2026-11-12. Each verified
+23 thread metadata targets and all joint rollbacks. Priorities were unchanged
+between Save and Load, so this is not device evidence for changed priorities.
+Three saved queues/six waiters were eligible in each probe; current waiters
+four then six all acknowledged import return and reached a subsequent SVC.
+The second Resume was followed by about53 seconds before shutdown. User
+reports normal operation; full rewind remains unavailable.
+
+## Saved thread priority (previous checkpoint v47, format v34)
 
 ThreadRecord now captures the thread's priority at Save, independently of the
 historical priority stored in a semaphore queue entry. The CPU/metadata joint
