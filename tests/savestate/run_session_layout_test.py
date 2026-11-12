@@ -46,7 +46,7 @@ auto collect_gxm_counts(Counts c){return c;}
 std::string probe_saved_cpu_contexts(Kernel&,const std::vector<Thread>&,const std::function<bool()>&f){return f()?"":"CPU failed";}
 std::string probe_saved_sync_values(Kernel&,int,int,int,int,int,const std::function<bool()>&f){return f()?"":"sync failed";}
 template<class E,class R>std::string audit_saved_ram(E&,std::istream&,const R&){return {};}
-template<class E,class R,class F>std::string probe_saved_ram(E&,std::istream&,const R&,F f){return f([]{return true;})?"":"RAM failed";}
+template<class E,class R,class F>std::string probe_saved_ram(E&,std::istream&,const R&,const std::vector<Thread>&,F f){return f([]{return true;})?"":"RAM failed";}
 bool host_scope=false;
 template<class E,class F>std::string probe_saved_file_positions(E&,int,F f){host_scope=true;bool ok=f([]{return true;});host_scope=false;return ok?"":"files failed";}
 int ngs_mode=0;

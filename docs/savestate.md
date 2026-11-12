@@ -4,7 +4,45 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Saved thread CPU affinity (latest checkpoint v48, format v35)
+## Kernel TLS affinity consistency (latest checkpoint v49, format v36)
+
+Save now records each kernel TLS base explicitly, independently of TPIDRURO.
+Before RAM mutation, Load requires the current thread to retain that base and
+the four-byte TLS_CPU_AFFINITY_MASK word to lie entirely in eligible RAM spans.
+The existing allocation, page-table and protection checks validate those spans
+first. The saved word is read from the snapshot stream and compared with saved
+thread metadata; current memory is compared with current metadata. Missing
+coverage, changed TLS identity, truncated data or disagreement refuses the probe
+without RAM writes. Split words across adjacent eligible spans are supported;
+any excluded byte refuses the word. Protected ranges are never bypassed.
+
+After saved RAM is staged, the TLS words are checked before and after the nested
+CPU/sync/NGS/GPU transaction. The existing RAM batch transaction restores the
+original memory even when the nested check fails or throws. This is a same-session
+address/coverage/value check, not an allocation-generation identity guarantee or
+proof of a resumable host stack. No instructions execute, no TLS-specific writes
+are introduced, and the dormant full-restore path remains disabled.
+
+Format36 requires a fresh Save State. Existing build-native POD limitations remain.
+Marker: CPU-tls-affinity. Success log: Savestate TLS affinity checkpoint.
+If TLS is excluded or inconsistent on the device, report the refusal and log;
+do not treat absence of a crash as a successful checkpoint.
+
+Validation: extracted production TLS preflight and span-reader tests cover missing
+thread/base changes, zero base, excluded byte, truncated stream, saved/current
+metadata mismatch, split spans, signed values and later mutation. The production
+RAM wrapper's 19 cases verify zero writes on preflight refusal and complete RAM
+rollback after nested TLS mutation. CPU metadata 24 cases, record/POD roundtrip,
+session orchestration, simultaneous-domain rollback tests and native syntax checks
+pass. Android build and device coverage are pending.
+
+v48 evidence (2026-11-12): Loads at 23:55:56 and 23:56:48 each verified 23
+threads and all joint rollbacks. Affinity values were equal at Save/Load for all
+46 observations. Current waiters five then six all acknowledged import return
+and reached a later SVC. About54 seconds elapsed from second Resume to shutdown.
+User reports normal operation; saved continuation is still unverified.
+
+## Saved thread CPU affinity (previous checkpoint v48, format v35)
 
 ThreadRecord now captures affinity_mask in addition to priority. This is guest
 kernel metadata used by thread-info/affinity queries; it does not bind the host

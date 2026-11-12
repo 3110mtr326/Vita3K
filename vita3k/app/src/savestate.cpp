@@ -120,6 +120,7 @@
 #include <app/savestate_value_probe.h>
 #include <app/savestate_ram_audit.h>
 #include <app/savestate_ram_probe.h>
+#include <app/savestate_tls_affinity.h>
 #include <app/savestate_ram_batch.h>
 #include <dialog/state.h>
 #include <functional>
@@ -161,7 +162,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 35; // v35: saved thread CPU affinity metadata
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 36; // v36: saved kernel TLS base identity
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -473,6 +474,7 @@ struct ThreadRecord {
     uint32_t tpidruro;
     int32_t priority; // Thread priority at Save, not the queued wait registration priority.
     int32_t affinity_mask; // Guest kernel metadata; not a host OS thread binding.
+    uint32_t kernel_tls_base;
     uint64_t start_tick;
     uint64_t last_vblank_waited;
     uint32_t returned_value;
@@ -1937,7 +1939,7 @@ static std::string audit_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
 // remain held by the diagnostic caller throughout. No guest instructions execute
 // between apply and undo, so the original translated-code cache remains valid.
 template<class Regions>
-static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const Regions &regions,
+static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const Regions &regions, const std::vector<ThreadRecord> &threads,
     const SnapshotRamJointCheck &joint = {}) {
     auto &mem = emuenv.mem;
     auto &kernel = emuenv.kernel;
@@ -1995,6 +1997,33 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
                     return "Untracked external page in RAM probe plan";
         }
     }
+    // Validate both copies before any RAM mutation. TLS addresses are saved
+    // explicitly: do not infer the kernel TLS base from guest-writable TPIDRURO.
+    std::vector<std::pair<uint64_t,int32_t>> tls_affinity;
+    for (const auto &record : threads) {
+        const auto it = kernel.threads.find(record.id);
+        if (it == kernel.threads.end() || !it->second || !record.kernel_tls_base
+            || it->second->tls.get() != record.kernel_tls_base)
+            return "Thread TLS identity changed; no RAM applied";
+        const uint64_t address = uint64_t(record.kernel_tls_base) + TLS_CPU_AFFINITY_MASK * sizeof(int32_t);
+        int32_t saved = 0, current = 0;
+        if (!read_snapshot_tls_affinity(in,spans,address,saved))
+            return "Thread TLS affinity not covered by eligible saved RAM; no RAM applied";
+        // Coverage above and allocation/backing checks above make this direct
+        // read safe without triggering a protected-memory callback.
+        std::memcpy(&current,mem.memory.get()+address,sizeof(current));
+        if (saved != record.affinity_mask || current != it->second->affinity_mask)
+            return "Thread TLS affinity disagrees with kernel metadata; no RAM applied";
+        tls_affinity.emplace_back(address,saved);
+    }
+    const auto verify_tls_affinity = [&] {
+        for (const auto &[address,expected] : tls_affinity) {
+            int32_t observed = 0;
+            std::memcpy(&observed,mem.memory.get()+address,sizeof(observed));
+            if (observed != expected) return false;
+        }
+        return true;
+    };
     if (!planned_bytes) return "No eligible unprotected RAM for roundtrip probe";
     LOG_INFO("Savestate RAM probe: starting {} eligible bytes; protected, external, GPU-mapped and host-object ranges excluded.",planned_bytes);
     SnapshotRamProbeStats stats;
@@ -2005,7 +2034,13 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
         }, [&](uint64_t address,const uint8_t *data,size_t size) noexcept {
             std::memcpy(mem.memory.get()+address,data,size); return true;
         }, [&] { return std::chrono::steady_clock::now()-start >= std::chrono::seconds(10); },
-        [&](const std::function<bool()> &verify_ram) { return joint ? joint(verify_ram) : verify_ram(); },stats);
+        [&](const std::function<bool()> &verify_ram) {
+            if (!verify_tls_affinity()) return false;
+            const bool checked = joint ? joint(verify_ram) : verify_ram();
+            if (!checked || !verify_tls_affinity()) return false;
+            LOG_INFO("Savestate TLS affinity checkpoint: {} threads, saved TLS identity/eligible coverage/metadata MATCH; saved bytes MATCH before/after joint checkpoint; no guest execution",tls_affinity.size());
+            return true;
+        },stats);
     if (result == SnapshotRamBatchResult::RollbackFailed) {
         kernel.snapshot_restore_failed = true;
         emuenv.renderer->render_abort.store(true);
@@ -2228,6 +2263,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 waiting_thread_count++;
             rec.ctx = save_context(*thread->cpu);
             rec.tpidruro = read_tpidruro(*thread->cpu);
+            rec.kernel_tls_base = thread->tls.get();
             rec.affinity_mask = thread->affinity_mask;
             rec.priority = thread->priority;
             rec.start_tick = thread->start_tick;
@@ -2474,7 +2510,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-thread-affinity/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-tls-affinity/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
@@ -2686,7 +2722,7 @@ SaveStateResult load_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             std::string ram_probe;
             const auto file_result = probe_saved_file_positions(emuenv, saved_io_files,
                 [&](const std::function<bool()> &verify_files) {
-                ram_probe = probe_saved_ram(emuenv,in,pending_regions,
+                ram_probe = probe_saved_ram(emuenv,in,pending_regions,thread_records,
                 [&](const std::function<bool()> &verify_ram) {
                     const auto cpu_result = probe_saved_cpu_contexts(kernel,thread_records,[&] {
                         joint_error = probe_saved_sync_values(kernel,sema_records,mutex_records,lwmutex_records,
