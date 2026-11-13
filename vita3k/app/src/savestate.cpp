@@ -2005,16 +2005,24 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
         if (it == kernel.threads.end() || !it->second || !record.kernel_tls_base
             || it->second->tls.get() != record.kernel_tls_base)
             return "Thread TLS identity changed; no RAM applied";
-        const uint64_t address = uint64_t(record.kernel_tls_base) + TLS_CPU_AFFINITY_MASK * sizeof(int32_t);
-        int32_t saved = 0, current = 0;
-        if (!read_snapshot_tls_affinity(in,spans,address,saved))
-            return "Thread TLS affinity not covered by eligible saved RAM; no RAM applied";
-        // Coverage above and allocation/backing checks above make this direct
-        // read safe without triggering a protected-memory callback.
-        std::memcpy(&current,mem.memory.get()+address,sizeof(current));
-        if (saved != record.affinity_mask || current != it->second->affinity_mask)
-            return "Thread TLS affinity disagrees with kernel metadata; no RAM applied";
-        tls_affinity.emplace_back(address,saved);
+        struct TlsField { const char *name; uint32_t index; int32_t saved, current; };
+        const TlsField fields[] = {
+            {"affinity",TLS_CPU_AFFINITY_MASK,record.affinity_mask,it->second->affinity_mask},
+            {"priority",TLS_CURRENT_PRIORITY,record.priority,it->second->priority},
+            {"thread ID",TLS_THREAD_ID,record.id,it->second->id},
+        };
+        for (const auto &field : fields) {
+            const uint64_t address = uint64_t(record.kernel_tls_base) + field.index * sizeof(int32_t);
+            int32_t saved = 0, current = 0;
+            if (!read_snapshot_tls_affinity(in,spans,address,saved))
+                return std::string("Thread TLS ") + field.name + " not covered by eligible saved RAM; no RAM applied";
+            // Coverage and pinned allocation/backing checks above permit a
+            // direct read without a protected-memory callback.
+            std::memcpy(&current,mem.memory.get()+address,sizeof(current));
+            if (saved != field.saved || current != field.current)
+                return std::string("Thread TLS ") + field.name + " disagrees with kernel metadata; no RAM applied";
+            tls_affinity.emplace_back(address,saved);
+        }
     }
     const auto verify_tls_affinity = [&] {
         for (const auto &[address,expected] : tls_affinity) {
@@ -2038,7 +2046,7 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
             if (!verify_tls_affinity()) return false;
             const bool checked = joint ? joint(verify_ram) : verify_ram();
             if (!checked || !verify_tls_affinity()) return false;
-            LOG_INFO("Savestate TLS affinity checkpoint: {} threads, saved TLS identity/eligible coverage/metadata MATCH; saved bytes MATCH before/after joint checkpoint; no guest execution",tls_affinity.size());
+            LOG_INFO("Savestate TLS metadata checkpoint: {} words (affinity/priority/thread ID), saved TLS identity/eligible coverage/metadata MATCH; saved bytes MATCH before/after joint checkpoint; no guest execution",tls_affinity.size());
             return true;
         },stats);
     if (result == SnapshotRamBatchResult::RollbackFailed) {
@@ -2510,7 +2518,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-tls-affinity/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-tls-metadata/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }

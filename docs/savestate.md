@@ -4,7 +4,39 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Kernel TLS affinity consistency (latest checkpoint v49, format v36)
+## Kernel TLS thread metadata (latest checkpoint v50, format v36 unchanged)
+
+Extend the v49 TLS affinity gate to TLS_CURRENT_PRIORITY and TLS_THREAD_ID.
+For each word, saved bytes must agree with saved metadata and current bytes with
+current metadata before any RAM write. Missing eligible coverage or disagreement
+refuses with a field-specific message. All three words are checked again before
+and after the nested transaction. Existing RAM rollback handles nested mismatch
+or exception; no special TLS write and no guest execution are introduced.
+
+Priority comparisons use the thread priority at Save/current time, not the
+historical semaphore registration priority. The inner entry probe's temporary
+registration-priority override is unwound before the final TLS check. This does
+not claim that TLS is consistent during that inert inner override; saved guest
+execution remains disabled. This checks three TLS words, not the entire TLS,
+stack layout, allocation generations, or host continuation.
+
+Marker: CPU-tls-metadata. Success log: Savestate TLS metadata checkpoint, with
+three words per thread (69 words for23 threads). Format36 is unchanged; v49
+snapshots remain format-compatible in the same supported session, though a new
+Save is recommended for the device test.
+
+Validation: 15 extracted TLS preflight cases plus word-reader boundary/signed
+value cases; 24 production RAM wrapper cases including zero writes for priority
+and ID mismatch and full rollback after priority/ID mutation; session
+orchestration and native syntax checks pass. Android/device validation pending.
+
+v49 evidence2026-11-13: TLS checkpoint23 threads passed twice, at01:21:17 and
+01:21:47, and all joint rollbacks MATCH. Six then five current waiters reached
+next SVC after Resume. First resumed interval was about25 seconds; second was
+about40 seconds until shutdown. User reports normal operation. No saved
+continuation was executed.
+
+## Kernel TLS affinity consistency (previous checkpoint v49, format v36)
 
 Save now records each kernel TLS base explicitly, independently of TPIDRURO.
 Before RAM mutation, Load requires the current thread to retain that base and

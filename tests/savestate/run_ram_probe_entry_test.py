@@ -21,10 +21,10 @@ code=r'''
 #define LOG_ERROR(...) ((void)0)
 using namespace app;
 constexpr int NO_DIALOG=0;
-constexpr int TLS_CPU_AFFINITY_MASK=9;
+constexpr int TLS_CPU_AFFINITY_MASK=9,TLS_CURRENT_PRIORITY=8,TLS_THREAD_ID=1;
 struct Block {uint32_t base=6000;uint32_t get()const{return base;}};
-struct Thread {Block tls;int32_t affinity_mask=0x42424242;};
-struct ThreadRecord {int id=1;uint32_t kernel_tls_base=6000;int32_t affinity_mask=0x41414141;};
+struct Thread {int id=1,priority=0x42424242;Block tls;int32_t affinity_mask=0x42424242;};
+struct ThreadRecord {int priority=0x41414141;int id=1;uint32_t kernel_tls_base=6000;int32_t affinity_mask=0x41414141;};
 struct Mapping {uint32_t address=0,size=0;};
 struct EmuEnvState {
  struct {std::unique_ptr<uint8_t[]> memory=std::make_unique<uint8_t[]>(65536);
@@ -54,7 +54,7 @@ auto observed_probe(std::istream &in,const std::vector<SnapshotRamSpan>&spans,Re
 PRODUCTION
 struct Region {uint32_t addr,saved_size;std::streamoff file_offset;};
 int main() {
- for(int mode=0;mode<19;++mode) {
+ for(int mode=0;mode<24;++mode) {
   EmuEnvState e;std::memset(e.mem.memory.get(),'B',65536);
   e.mem.protect_tree[8192]={8192,2};e.mem.external_mapping[1]={16384,4096};
   e.gxm.memory_mapped_regions[24576]={24576,4096};
@@ -75,17 +75,26 @@ int main() {
   if(mode==16)records[0].affinity_mask=3;
   if(mode==17)e.kernel.threads[1]->affinity_mask=4;
   if(mode==18)records[0].kernel_tls_base=7000;
+  if(mode==9)e.kernel.threads[1]->priority=0x41414141;
+  if(mode==19)records[0].priority=1;
+  if(mode==20)e.kernel.threads[1]->priority=1;
+  if(mode==21)e.kernel.threads[1]->id=2;
+  int32_t tid=1;std::memcpy(e.mem.memory.get()+6004,&tid,4);
   inject_rollback_failure=mode==10;writes=0;
   const std::string before(reinterpret_cast<char*>(e.mem.memory.get()),65536);
-  std::istringstream file(std::string(mode==11?1:61440,'A'));
+  std::string saved_bytes(mode==11?1:61440,'A');
+  if(mode!=11)std::memcpy(saved_bytes.data()+6004-4096,&tid,4);
+  std::istringstream file(saved_bytes);
   const auto result=probe_saved_ram(e,file,std::vector<Region>{{4096,61440,0}},records,[&](const auto &verify){
+   if(mode==22){e.mem.memory[6032]=1;return true;}
+   if(mode==23){e.mem.memory[6004]=2;return true;}
    if(mode==14){e.mem.memory[6036]=1;return true;}
    if(mode==12){e.kernel.snapshot_restore_failed=true;return false;}
    if(mode==13)throw std::runtime_error("joint callback");
    return verify();
   });
   assert(result.empty()==(mode==0));
-  if(mode==0||mode==12||mode==13||mode==14)assert(writes>0);else assert(writes==0);
+  if(mode==0||mode==12||mode==13||mode==14||mode==22||mode==23)assert(writes>0);else assert(writes==0);
   assert(e.kernel.snapshot_restore_failed==(mode==7||mode==10||mode==12));
   assert(e.renderer->render_abort.load()==(mode==3||mode==10||mode==12));
   assert(std::memcmp(e.mem.memory.get(),before.data(),before.size())==0);
@@ -93,7 +102,7 @@ int main() {
   assert(e.mem.generation_mutex.try_lock());e.mem.generation_mutex.unlock();
   assert(e.mem.protect_mutex.try_lock());e.mem.protect_mutex.unlock();
  }
- std::cout<<"PASS: 19 production RAM adapter cases, TLS exclusion/identity/mismatch preflight (zero writes), nested TLS mutation rollback, protected/external/GPU exclusions, page-table/allocation gates, rollback veto, lock release\n";
+ std::cout<<"PASS: 24 production RAM adapter cases, TLS exclusion/identity/mismatch preflight (zero writes), nested TLS mutation rollback, protected/external/GPU exclusions, page-table/allocation gates, rollback veto, lock release\n";
 }
 '''.replace('PRODUCTION',t[begin:end].replace('probe_snapshot_ram_batch(in,spans,','observed_probe(in,spans,'))
 with tempfile.TemporaryDirectory() as d:
