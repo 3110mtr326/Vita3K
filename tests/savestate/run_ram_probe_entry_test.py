@@ -23,8 +23,8 @@ using namespace app;
 constexpr int NO_DIALOG=0;
 constexpr int TLS_CPU_AFFINITY_MASK=9,TLS_CURRENT_PRIORITY=8,TLS_THREAD_ID=1,TLS_SP_TOP=2,TLS_SP_BOTTOM=3;
 struct Block {uint32_t base=6000;uint32_t get()const{return base;}};
-struct Thread {int id=1,priority=0x42424242;Block tls;Block stack{32768};int stack_size=4096;int32_t affinity_mask=0x42424242;};
-struct ThreadRecord {uint32_t stack_base=32768;int32_t stack_size=4096;int priority=0x41414141;int id=1;uint32_t kernel_tls_base=6000;int32_t affinity_mask=0x41414141;};
+struct Thread {uint64_t tls_alloc_size=2048;int id=1,priority=0x42424242;Block tls;Block stack{32768};int stack_size=4096;int32_t affinity_mask=0x42424242;};
+struct ThreadRecord {uint64_t tls_alloc_size=2048;uint32_t stack_base=32768;int32_t stack_size=4096;int priority=0x41414141;int id=1;uint32_t kernel_tls_base=6000;int32_t affinity_mask=0x41414141;};
 struct Mapping {uint32_t address=0,size=0;};
 struct EmuEnvState {
  struct {std::unique_ptr<uint8_t[]> memory=std::make_unique<uint8_t[]>(65536);
@@ -54,7 +54,7 @@ auto observed_probe(std::istream &in,const std::vector<SnapshotRamSpan>&spans,Re
 PRODUCTION
 struct Region {uint32_t addr,saved_size;std::streamoff file_offset;};
 int main() {
- for(int mode=0;mode<33;++mode) {
+ for(int mode=0;mode<38;++mode) {
   EmuEnvState e;std::memset(e.mem.memory.get(),'B',65536);
   e.mem.protect_tree[8192]={8192,2};e.mem.external_mapping[1]={16384,4096};
   e.gxm.memory_mapped_regions[24576]={24576,4096};
@@ -85,6 +85,11 @@ int main() {
   if(mode==30)e.gxm.memory_mapped_regions[36863]={36863,1};
   if(mode==31)e.gxm.memory_mapped_regions[8047]={8047,1};
   if(mode==32)e.gxm.memory_mapped_regions[7000]={7000,1};
+  if(mode==33)records[0].tls_alloc_size=0;
+  if(mode==34)e.kernel.threads[1]->tls_alloc_size=2052;
+  if(mode==35){records[0].tls_alloc_size=4096;e.kernel.threads[1]->tls_alloc_size=4096;} // crosses protected page
+  if(mode==36){records[0].tls_alloc_size=2052;e.kernel.threads[1]->tls_alloc_size=2052;}
+  if(mode==37){records[0].tls_alloc_size=2052;e.kernel.threads[1]->tls_alloc_size=2052;e.gxm.memory_mapped_regions[8051]={8051,1};}
   int32_t sb=32768,se=36864;
   std::memcpy(e.mem.memory.get()+6008,&sb,4);std::memcpy(e.mem.memory.get()+6012,&se,4);
   if(mode==26)e.mem.memory[6009]=0;
@@ -105,8 +110,8 @@ int main() {
    if(mode==13)throw std::runtime_error("joint callback");
    return verify();
   });
-  assert(result.empty()==(mode==0));
-  if(mode==0||mode==12||mode==13||mode==14||mode==22||mode==23||mode==27||mode==28)assert(writes>0);else assert(writes==0);
+  assert(result.empty()==(mode==0||mode==36));
+  if(mode==0||mode==36||mode==12||mode==13||mode==14||mode==22||mode==23||mode==27||mode==28)assert(writes>0);else assert(writes==0);
   assert(e.kernel.snapshot_restore_failed==(mode==7||mode==10||mode==12));
   assert(e.renderer->render_abort.load()==(mode==3||mode==10||mode==12));
   assert(std::memcmp(e.mem.memory.get(),before.data(),before.size())==0);
@@ -114,7 +119,7 @@ int main() {
   assert(e.mem.generation_mutex.try_lock());e.mem.generation_mutex.unlock();
   assert(e.mem.protect_mutex.try_lock());e.mem.protect_mutex.unlock();
  }
- std::cout<<"PASS: 33 production RAM adapter cases, TLS exclusion/identity/mismatch preflight (zero writes), nested TLS mutation rollback, protected/external/GPU exclusions, page-table/allocation gates, rollback veto, lock release\n";
+ std::cout<<"PASS: 38 production RAM adapter cases, TLS exclusion/identity/mismatch preflight (zero writes), nested TLS mutation rollback, protected/external/GPU exclusions, page-table/allocation gates, rollback veto, lock release\n";
 }
 '''.replace('PRODUCTION',t[begin:end].replace('probe_snapshot_ram_batch(in,spans,','observed_probe(in,spans,'))
 with tempfile.TemporaryDirectory() as d:

@@ -69,6 +69,7 @@ struct ThreadState {
     Block stack;
     int stack_size;
     Block tls;
+    uint64_t tls_alloc_size = 0; // Actual size requested at thread creation, including guest TLS.
 
     int priority;
     SceInt32 affinity_mask;

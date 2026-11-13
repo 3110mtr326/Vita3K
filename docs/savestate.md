@@ -4,7 +4,34 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Complete declared thread RAM coverage (latest checkpoint v52, format v37)
+## Full per-thread TLS allocation coverage (latest checkpoint v53, format v38)
+
+ThreadState now records the actual TLS allocation size requested by init
+(0x800-byte kernel prefix plus guest TLS template memory size). Save persists
+that per-thread extent rather than inferring it from today's global template.
+The RAM preflight rejects extents below0x800, current/saved size disagreement,
+32-bit address overflow, and any missing/excluded byte in the full allocation.
+The existing declared stack coverage and five TLS metadata word checks remain.
+No allocation is resized and no protected/GPU/host-object exclusion is removed.
+
+This is address/extent consistency and eligible RAM coverage, not allocation
+generation identity, alternate stack certification, host continuation recovery,
+or executed saved waits. Full rewind remains disabled. Format38 requires a
+fresh Save; native POD portability limitations remain. Marker: CPU-full-tls.
+Success log: Savestate full TLS checkpoint (normally115 words for23 threads).
+
+Validation:35 extracted preflight cases plus range boundary assertions;
+38 production RAM wrapper cases covering guest TLS tail exclusion with zero
+writes and successful extended TLS; production record/POD roundtrip and
+truncation; session orchestration; native syntax checks for thread.cpp,
+sync_primitives.cpp and savestate.cpp pass. Android/device validation pending.
+
+v52 evidence2026-11-14: three Loads passed115 words and all joint rollbacks.
+Current waiter counts5,6,6, with subsequent next-SVC progress. User reports
+normal. Last resumed interval before shutdown was about15 seconds, so this
+does not establish a30-second stability observation for the last Load.
+
+## Complete declared thread RAM coverage (previous checkpoint v52, format v37)
 
 Before any RAM writes, every declared stack byte and the fixed 0x800-byte
 kernel TLS prefix must be covered by eligible saved RAM spans. Adjacent spans

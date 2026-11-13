@@ -90,6 +90,7 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
     alloc_name = fmt::format("TLS for thread {} (#{})", name, id);
     const size_t tls_size = KERNEL_TLS_SIZE + kernel.tls_msize;
     tls = alloc_block(mem, tls_size, alloc_name.c_str());
+    tls_alloc_size = tls_size;
     const Ptr<uint8_t> base_tls_ptr = tls.get_ptr<uint8_t>();
     memset(base_tls_ptr.get(mem), 0, tls_size);
 

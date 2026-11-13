@@ -162,7 +162,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 37; // v37: saved thread stack layout
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 38; // v38: actual full TLS allocation extent
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -475,6 +475,7 @@ struct ThreadRecord {
     int32_t priority; // Thread priority at Save, not the queued wait registration priority.
     int32_t affinity_mask; // Guest kernel metadata; not a host OS thread binding.
     uint32_t kernel_tls_base;
+    uint64_t tls_alloc_size;
     uint32_t stack_base;
     int32_t stack_size;
     uint64_t start_tick;
@@ -2013,10 +2014,12 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
         if (!record.stack_base || record.stack_size <= 0 || stack_end > UINT32_MAX
             || it->second->stack.get() != record.stack_base || it->second->stack_size != record.stack_size)
             return "Thread stack layout changed or invalid; no RAM applied";
-        // ThreadState::init reserves 0x800 bytes for kernel TLS. Guest TLS
-        // beyond that prefix and alternate stacks are not certified here.
-        if (!snapshot_ram_covers(spans, record.kernel_tls_base, 0x800))
-            return "Thread kernel TLS range not fully covered by eligible saved RAM; no RAM applied";
+        // Use the actual per-thread allocation extent, not today's global
+        // kernel TLS template size, which is not allocation provenance.
+        if (record.tls_alloc_size < 0x800 || record.tls_alloc_size != it->second->tls_alloc_size)
+            return "Thread TLS allocation size changed or invalid; no RAM applied";
+        if (!snapshot_ram_covers(spans, record.kernel_tls_base, record.tls_alloc_size))
+            return "Thread full TLS range not fully covered by eligible saved RAM; no RAM applied";
         if (!snapshot_ram_covers(spans, record.stack_base, uint64_t(record.stack_size)))
             return "Thread stack range not fully covered by eligible saved RAM; no RAM applied";
         struct TlsField { const char *name; uint32_t index; int32_t saved, current; };
@@ -2062,7 +2065,7 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
             if (!verify_tls_affinity()) return false;
             const bool checked = joint ? joint(verify_ram) : verify_ram();
             if (!checked || !verify_tls_affinity()) return false;
-            LOG_INFO("Savestate thread coverage checkpoint: {} words (affinity/priority/thread ID/stack bounds), full declared stacks/kernel TLS prefixes covered; saved TLS identity/metadata MATCH; saved bytes MATCH before/after joint checkpoint; no guest execution",tls_affinity.size());
+            LOG_INFO("Savestate full TLS checkpoint: {} words (affinity/priority/thread ID/stack bounds), full declared stacks/kernel and guest TLS allocations covered; saved TLS identity/metadata MATCH; saved bytes MATCH before/after joint checkpoint; no guest execution",tls_affinity.size());
             return true;
         },stats);
     if (result == SnapshotRamBatchResult::RollbackFailed) {
@@ -2290,6 +2293,7 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
             rec.stack_base = thread->stack.get();
             rec.stack_size = thread->stack_size;
             rec.kernel_tls_base = thread->tls.get();
+            rec.tls_alloc_size = thread->tls_alloc_size;
             rec.affinity_mask = thread->affinity_mask;
             rec.priority = thread->priority;
             rec.start_tick = thread->start_tick;
@@ -2536,7 +2540,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-thread-coverage/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-full-tls/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }

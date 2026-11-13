@@ -16,8 +16,8 @@ code=r'''
 using namespace app;
 constexpr int TLS_CPU_AFFINITY_MASK=9,TLS_CURRENT_PRIORITY=8,TLS_THREAD_ID=1,TLS_SP_TOP=2,TLS_SP_BOTTOM=3;
 struct Block {uint32_t base=64;uint32_t get() const{return base;}};
-struct Thread {int id=1,priority=120;Block tls;Block stack{128};int stack_size=64;int32_t affinity_mask=7;};
-struct Record {uint32_t stack_base=128;int32_t stack_size=64;int priority=100;int id=1;uint32_t kernel_tls_base=64;int32_t affinity_mask=1;};
+struct Thread {uint64_t tls_alloc_size=2048;int id=1,priority=120;Block tls;Block stack{128};int stack_size=64;int32_t affinity_mask=7;};
+struct Record {uint64_t tls_alloc_size=2048;uint32_t stack_base=128;int32_t stack_size=64;int priority=100;int id=1;uint32_t kernel_tls_base=64;int32_t affinity_mask=1;};
 struct Kernel {std::map<int,std::shared_ptr<Thread>> threads{{1,std::make_shared<Thread>()}};};
 struct Mem {std::unique_ptr<uint8_t[]> memory{new uint8_t[4096]{}};};
 std::string check(int mode){
@@ -58,6 +58,13 @@ std::string check(int mode){
  if(mode==25)spans={{64,2047,64}}; // missing final TLS byte
  if(mode==26)spans={{64,1024,64},{1089,1023,1089}};
  if(mode==27){threads[0].stack_base=3000;kernel.threads[1]->stack.base=3000;}
+ if(mode==28)threads[0].tls_alloc_size=0;
+ if(mode==29)threads[0].tls_alloc_size=2047;
+ if(mode==30)kernel.threads[1]->tls_alloc_size=2052;
+ if(mode==31){threads[0].tls_alloc_size=4096;kernel.threads[1]->tls_alloc_size=4096;}
+ if(mode==32){threads[0].tls_alloc_size=UINT64_MAX;kernel.threads[1]->tls_alloc_size=UINT64_MAX;}
+ if(mode==33){threads[0].tls_alloc_size=2052;kernel.threads[1]->tls_alloc_size=2052;spans={{64,2048,64},{2112,4,2112}};}
+ if(mode==34){threads[0].tls_alloc_size=2052;kernel.threads[1]->tls_alloc_size=2052;spans={{64,2048,64},{2113,3,2113}};}
  std::istringstream in(data);
  BLOCK
  assert(!verify_tls_affinity()); // original bytes differ from Save
@@ -85,7 +92,7 @@ int main(){
  assert(!snapshot_ram_covers({{0xfffffffeULL,2,0}},0xfffffffeULL,3));
  assert(!snapshot_ram_covers({{0xfffffffeULL,3,0}},0xfffffffeULL,2));
 
- for(int m=0;m<28;++m)assert(check(m).empty()==(m==0||m==8));
+ for(int m=0;m<35;++m)assert(check(m).empty()==(m==0||m==8||m==33));
  for(int32_t value:{0,1,458752,static_cast<int32_t>(0x80000000u)}){
    std::string bytes(8,0);std::memcpy(bytes.data()+4,&value,4);
    std::istringstream in(bytes);int32_t got=99;
@@ -94,7 +101,7 @@ int main(){
    assert(!read_snapshot_tls_affinity(in,{{100,4,4}},0,got));
    assert(!read_snapshot_tls_affinity(in,{{100,4,4}},0xffffffffULL,got));
  }
- std::cout<<"PASS: 28 TLS stack/metadata production preflight identity/missing-thread/coverage/gap/truncation/metadata rejection, split spans, signed masks and checkpoint mutation detection\n";
+ std::cout<<"PASS: 35 TLS stack/metadata production preflight identity/missing-thread/coverage/gap/truncation/metadata rejection, split spans, signed masks and checkpoint mutation detection\n";
 }
 '''.replace('BLOCK',s[a:b])
 with tempfile.TemporaryDirectory() as d:
