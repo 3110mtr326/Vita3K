@@ -42,4 +42,30 @@ inline bool read_snapshot_tls_affinity(std::istream &in,
     }
     return false;
 }
+// Minimum saved memory needed by a plain ARM semaphore entry candidate.
+// Does not certify executable permissions, the whole alternate stack, or host
+// continuation ownership. The caller keeps execution disabled.
+inline const char *snapshot_entry_memory_error(std::istream &in,
+    const std::vector<SnapshotRamSpan> &spans, uint32_t pc, uint32_t sp,
+    uint32_t lr, uint32_t nid) {
+    if (pc < 4 || pc % 4 || pc > UINT32_MAX - 7)
+        return "invalid saved semaphore stub address";
+    if (sp < 4 || sp % 4 || !snapshot_ram_covers(spans, uint64_t(sp) - 4, 4))
+        return "saved semaphore stack tip not covered";
+    const uint32_t target = lr & ~1u;
+    if (!target || (!(lr & 1u) && target % 4)
+        || !snapshot_ram_covers(spans, target, (lr & 1u) ? 2 : 4))
+        return "saved semaphore return target not covered";
+    if (!snapshot_ram_covers(spans, uint64_t(pc) - 4, 12))
+        return "saved semaphore stub not covered";
+    const uint32_t expected[] = {0xef000000u, 0xe1a0f00eu, nid};
+    for (uint32_t i = 0; i < 3; ++i) {
+        int32_t word = 0;
+        if (!read_snapshot_tls_affinity(in, spans, pc - 4 + i * 4, word))
+            return "saved semaphore stub unreadable";
+        if (static_cast<uint32_t>(word) != expected[i])
+            return "saved semaphore stub mismatch";
+    }
+    return "";
+}
 } // namespace app

@@ -17,7 +17,8 @@ using namespace app;
 constexpr int TLS_CPU_AFFINITY_MASK=9,TLS_CURRENT_PRIORITY=8,TLS_THREAD_ID=1,TLS_SP_TOP=2,TLS_SP_BOTTOM=3;
 struct Block {uint32_t base=64;uint32_t get() const{return base;}};
 struct Thread {uint64_t tls_alloc_size=2048;int id=1,priority=120;Block tls;Block stack{128};int stack_size=64;int32_t affinity_mask=7;};
-struct Record {uint64_t tls_alloc_size=2048;uint32_t stack_base=128;int32_t stack_size=64;int priority=100;int id=1;uint32_t kernel_tls_base=64;int32_t affinity_mask=1;};
+struct MockContext {uint32_t cpsr=0;std::array<uint32_t,16> cpu_registers{};};struct MockWait {int uid=0;bool timeout_present=false;};
+struct Record {MockContext ctx;MockWait semaphore_wait;uint32_t wait_nid=0;uint64_t tls_alloc_size=2048;uint32_t stack_base=128;int32_t stack_size=64;int priority=100;int id=1;uint32_t kernel_tls_base=64;int32_t affinity_mask=1;};
 struct Kernel {std::map<int,std::shared_ptr<Thread>> threads{{1,std::make_shared<Thread>()}};};
 struct Mem {std::unique_ptr<uint8_t[]> memory{new uint8_t[4096]{}};};
 std::string check(int mode){
@@ -80,6 +81,30 @@ std::string check(int mode){
  return {};
 }
 int main(){
+ for(int mode=0;mode<14;++mode){
+   std::string bytes(512,0);uint32_t stub[]={0xef000000,0xe1a0f00e,0x0C7B834B};
+   std::memcpy(bytes.data()+100,stub,12);
+   uint32_t pc=104,sp=256,lr=300;
+   std::vector<SnapshotRamSpan> ranges{{64,448,64}};
+   if(mode==1)pc=0;
+   if(mode==2)pc=105;
+   if(mode==3)sp=0;
+   if(mode==4)lr=302;
+   if(mode==5)lr=301; // Thumb return
+   if(mode==6)ranges={{64,43,64},{108,404,108}}; // stub gap
+   if(mode==7)ranges={{64,188,64},{256,256,256}}; // stack gap
+   if(mode==8)ranges={{64,236,64},{304,208,304}}; // return gap
+   if(mode==9)bytes[100]=1;
+   if(mode==10)bytes[104]=1;
+   if(mode==11)bytes[108]=1;
+   if(mode==12)bytes.resize(110); // truncated NID
+   if(mode==13)ranges={{64,42,64},{106,406,106}}; // adjacent split word
+   std::istringstream in(bytes);
+   const auto err=snapshot_entry_memory_error(in,ranges,pc,sp,lr,0x0C7B834B);
+   assert((*err==0)==(mode==0||mode==5||mode==13));
+ }
+ std::cout<<"PASS: 14 saved entry memory cases (ARM/Thumb returns, alignment, holes, altered instructions, truncation, split spans)\n";
+
  assert(snapshot_ram_covers({{100,10,0},{110,10,10}},100,20));
  assert(snapshot_ram_covers({{100,20,0}},105,10));
  assert(!snapshot_ram_covers({{100,10,0},{111,10,10}},100,20));

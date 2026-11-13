@@ -4,7 +4,33 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Full per-thread TLS allocation coverage (latest checkpoint v53, format v38)
+## Saved semaphore entry memory (latest checkpoint v54, format v38)
+
+Before RAM mutation, plain untimed ARM semaphore descriptions require eligible
+saved spans for the12-byte SVC/return/NID stub, the4 bytes immediately below SP,
+and the minimum return instruction width (ARM4 bytes, Thumb2 bytes). The saved
+file stub must contain SVC0, MOV PC,LR and the expected wait NID. Invalid address,
+alignment, holes, unreadable/truncated stub or instruction mismatch refuse the
+diagnostic before any RAM write. Adjacent eligible spans remain supported.
+Later existing entry preparation separately checks arguments, queue admission
+and the paused staged stub before/after the nested checkpoint.
+
+Timed/callback/non-ARM waits are outside this new gate and remain deferred by
+the existing entry planner. Coverage is not executable permission, instruction
+decoding at LR, a complete alternate stack, or host continuation reconstruction.
+No saved instructions execute. Full rewind remains disabled. Format stays38.
+Marker: CPU-entry-memory. Success log: Savestate entry memory checkpoint.
+
+Validation:14 saved entry helper cases;35 production TLS/preflight cases plus
+range assertions;42 production RAM wrapper cases including valid saved entry
+and rejection of bad stub/protected return/stack tip with zero writes; session
+orchestration and native syntax checks pass. Android/device validation pending.
+
+v53 evidence2026-11-14: two Loads passed115 TLS words and all joint rollbacks.
+Current waiters4 then6 progressed after Resume. The last next-SVC observation
+was over32 seconds before normal session shutdown. User reports normal.
+
+## Full per-thread TLS allocation coverage (previous checkpoint v53, format v38)
 
 ThreadState now records the actual TLS allocation size requested by init
 (0x800-byte kernel prefix plus guest TLS template memory size). Save persists
