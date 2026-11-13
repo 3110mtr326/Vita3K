@@ -4,7 +4,31 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Saved stack layout and TLS bounds (latest checkpoint v51, format v37)
+## Complete declared thread RAM coverage (latest checkpoint v52, format v37)
+
+Before any RAM writes, every declared stack byte and the fixed 0x800-byte
+kernel TLS prefix must be covered by eligible saved RAM spans. Adjacent spans
+are accepted, but a one-byte hole, excluded middle/end, absent start, empty
+range or 32-bit address overflow is rejected. Existing allocator/backing and
+protection locks remain in force. No exclusions are removed to pass this gate.
+The existing batch probe then checks saved bytes and rolls back; five TLS
+metadata words per thread still receive explicit nested checkpoint checks.
+
+This certifies eligible range coverage, not allocation-generation identity,
+variable guest TLS beyond the prefix, alternate stacks, host stack recovery,
+or saved wait execution. Full restoration remains disabled. Format stays37.
+Marker: CPU-thread-coverage; success: Savestate thread coverage checkpoint.
+
+Validation:28 extracted production TLS/preflight cases plus11 range boundary
+assertions,33 production RAM wrapper cases including protected stack and
+middle/end TLS exclusions with zero writes, orchestration tests and native
+syntax checks pass. Android build/device verification pending.
+
+v51 device evidence2026-11-13: two Loads passed115 TLS words,23 metadata targets
+and all joint rollbacks.6 saved semaphore entry candidates each,0 deferred.
+Current waiters4 then5 all reached next SVC after Resume. User reports normal.
+
+## Saved stack layout and TLS bounds (previous checkpoint v51, format v37)
 
 ThreadRecord now stores stack_base and stack_size at Save. The pre-mutation
 RAM gate rejects zero base, nonpositive size, a stack end that cannot be

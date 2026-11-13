@@ -2013,6 +2013,12 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
         if (!record.stack_base || record.stack_size <= 0 || stack_end > UINT32_MAX
             || it->second->stack.get() != record.stack_base || it->second->stack_size != record.stack_size)
             return "Thread stack layout changed or invalid; no RAM applied";
+        // ThreadState::init reserves 0x800 bytes for kernel TLS. Guest TLS
+        // beyond that prefix and alternate stacks are not certified here.
+        if (!snapshot_ram_covers(spans, record.kernel_tls_base, 0x800))
+            return "Thread kernel TLS range not fully covered by eligible saved RAM; no RAM applied";
+        if (!snapshot_ram_covers(spans, record.stack_base, uint64_t(record.stack_size)))
+            return "Thread stack range not fully covered by eligible saved RAM; no RAM applied";
         struct TlsField { const char *name; uint32_t index; int32_t saved, current; };
         const TlsField fields[] = {
             {"affinity",TLS_CPU_AFFINITY_MASK,record.affinity_mask,it->second->affinity_mask},
@@ -2056,7 +2062,7 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
             if (!verify_tls_affinity()) return false;
             const bool checked = joint ? joint(verify_ram) : verify_ram();
             if (!checked || !verify_tls_affinity()) return false;
-            LOG_INFO("Savestate TLS stack checkpoint: {} words (affinity/priority/thread ID/stack bounds), saved TLS identity/eligible coverage/metadata MATCH; saved bytes MATCH before/after joint checkpoint; no guest execution",tls_affinity.size());
+            LOG_INFO("Savestate thread coverage checkpoint: {} words (affinity/priority/thread ID/stack bounds), full declared stacks/kernel TLS prefixes covered; saved TLS identity/metadata MATCH; saved bytes MATCH before/after joint checkpoint; no guest execution",tls_affinity.size());
             return true;
         },stats);
     if (result == SnapshotRamBatchResult::RollbackFailed) {
@@ -2530,7 +2536,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-tls-stack/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-thread-coverage/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }

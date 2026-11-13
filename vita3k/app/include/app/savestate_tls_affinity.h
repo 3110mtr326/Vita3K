@@ -5,6 +5,24 @@
 #include <cstring>
 
 namespace app {
+// Spans are sorted and validated by the RAM planner. Require every byte of
+// a nonempty guest range, including across adjacent spans, before any writes.
+inline bool snapshot_ram_covers(const std::vector<SnapshotRamSpan> &spans,
+    uint64_t address, uint64_t size) {
+    constexpr uint64_t limit = 1ULL << 32;
+    if (!address || !size || address >= limit || size > limit - address) return false;
+    const uint64_t end = address + size;
+    uint64_t cursor = address;
+    for (const auto &span : spans) {
+        if (span.address >= limit || span.size > limit - span.address) return false;
+        const uint64_t span_end = span.address + span.size;
+        if (span_end <= cursor) continue;
+        if (span.address > cursor) return false;
+        cursor = std::min(end, span_end);
+        if (cursor == end) return true;
+    }
+    return false;
+}
 // Read only from validated eligible spans; split words are supported. Never
 // consult guest pointers here. The caller pins all mapping/allocator metadata.
 inline bool read_snapshot_tls_affinity(std::istream &in,

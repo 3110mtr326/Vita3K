@@ -54,7 +54,7 @@ auto observed_probe(std::istream &in,const std::vector<SnapshotRamSpan>&spans,Re
 PRODUCTION
 struct Region {uint32_t addr,saved_size;std::streamoff file_offset;};
 int main() {
- for(int mode=0;mode<29;++mode) {
+ for(int mode=0;mode<33;++mode) {
   EmuEnvState e;std::memset(e.mem.memory.get(),'B',65536);
   e.mem.protect_tree[8192]={8192,2};e.mem.external_mapping[1]={16384,4096};
   e.gxm.memory_mapped_regions[24576]={24576,4096};
@@ -81,6 +81,10 @@ int main() {
   if(mode==21)e.kernel.threads[1]->id=2;
   if(mode==24)records[0].stack_size=0;
   if(mode==25)e.kernel.threads[1]->stack.base=36864;
+  if(mode==29)e.mem.protect_tree[32768]={32768,1};
+  if(mode==30)e.gxm.memory_mapped_regions[36863]={36863,1};
+  if(mode==31)e.gxm.memory_mapped_regions[8047]={8047,1};
+  if(mode==32)e.gxm.memory_mapped_regions[7000]={7000,1};
   int32_t sb=32768,se=36864;
   std::memcpy(e.mem.memory.get()+6008,&sb,4);std::memcpy(e.mem.memory.get()+6012,&se,4);
   if(mode==26)e.mem.memory[6009]=0;
@@ -110,7 +114,7 @@ int main() {
   assert(e.mem.generation_mutex.try_lock());e.mem.generation_mutex.unlock();
   assert(e.mem.protect_mutex.try_lock());e.mem.protect_mutex.unlock();
  }
- std::cout<<"PASS: 29 production RAM adapter cases, TLS exclusion/identity/mismatch preflight (zero writes), nested TLS mutation rollback, protected/external/GPU exclusions, page-table/allocation gates, rollback veto, lock release\n";
+ std::cout<<"PASS: 33 production RAM adapter cases, TLS exclusion/identity/mismatch preflight (zero writes), nested TLS mutation rollback, protected/external/GPU exclusions, page-table/allocation gates, rollback veto, lock release\n";
 }
 '''.replace('PRODUCTION',t[begin:end].replace('probe_snapshot_ram_batch(in,spans,','observed_probe(in,spans,'))
 with tempfile.TemporaryDirectory() as d:
