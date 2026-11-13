@@ -4,7 +4,38 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Kernel TLS thread metadata (latest checkpoint v50, format v36 unchanged)
+## Saved stack layout and TLS bounds (latest checkpoint v51, format v37)
+
+ThreadRecord now stores stack_base and stack_size at Save. The pre-mutation
+RAM gate rejects zero base, nonpositive size, a stack end that cannot be
+represented as a32-bit address, or a current stack base/size different from Save.
+TLS_SP_TOP and TLS_SP_BOTTOM must match these checked bounds in both the saved
+file and current RAM. Both words must lie in eligible RAM spans. Together with
+affinity, priority and thread ID, five words per thread are verified before and
+after the nested joint checkpoint. Existing rollback restores original RAM on
+nested mismatch. Stack storage is neither reallocated nor relocated.
+
+The names TOP/BOTTOM follow ThreadState::init: TOP=base, BOTTOM=base+size.
+Do not constrain the live CPU SP to these bounds: guest alternate stacks may be
+legitimate. This is layout and TLS-bound consistency, not whole-stack coverage,
+allocation-generation identity, or proof of a resumable native host stack.
+Saved guest execution/full rewind remain disabled.
+
+Format37 requires a fresh Save State; native POD portability limitations remain.
+Marker: CPU-tls-stack. Success log: Savestate TLS stack checkpoint, normally
+115 words for23 threads. Validation:25 extracted TLS gate cases (including
+zero/negative sizes, overflow, changed base/size and both bound mismatches),
+29 production RAM wrapper cases (preflight refusals with zero writes and nested
+bound mutation rollback), production POD layout roundtrip, orchestration tests
+and native syntax checks pass. Android/device validation pending.
+
+v50 evidence2026-11-13: Loads22:14:12 and22:15:07 each passed69 TLS words,
+23 metadata targets and all joint rollbacks. Saved waiters were5 across3 queues;
+current waiters were6 for both Loads, all subsequently reached next SVC. Resumed
+intervals were approximately46 seconds until next Load and50 seconds until
+shutdown. User reports normal operation; saved continuation remains unverified.
+
+## Kernel TLS thread metadata (previous checkpoint v50, format v36 unchanged)
 
 Extend the v49 TLS affinity gate to TLS_CURRENT_PRIORITY and TLS_THREAD_ID.
 For each word, saved bytes must agree with saved metadata and current bytes with

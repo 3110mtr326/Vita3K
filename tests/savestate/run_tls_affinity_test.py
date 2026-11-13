@@ -14,10 +14,10 @@ code=r'''
 #include <cassert>
 #include <iostream>
 using namespace app;
-constexpr int TLS_CPU_AFFINITY_MASK=9,TLS_CURRENT_PRIORITY=8,TLS_THREAD_ID=1;
-struct Block {uint32_t get() const{return 64;}};
-struct Thread {int id=1,priority=120;Block tls;int32_t affinity_mask=7;};
-struct Record {int priority=100;int id=1;uint32_t kernel_tls_base=64;int32_t affinity_mask=1;};
+constexpr int TLS_CPU_AFFINITY_MASK=9,TLS_CURRENT_PRIORITY=8,TLS_THREAD_ID=1,TLS_SP_TOP=2,TLS_SP_BOTTOM=3;
+struct Block {uint32_t base=64;uint32_t get() const{return base;}};
+struct Thread {int id=1,priority=120;Block tls;Block stack{128};int stack_size=64;int32_t affinity_mask=7;};
+struct Record {uint32_t stack_base=128;int32_t stack_size=64;int priority=100;int id=1;uint32_t kernel_tls_base=64;int32_t affinity_mask=1;};
 struct Kernel {std::map<int,std::shared_ptr<Thread>> threads{{1,std::make_shared<Thread>()}};};
 struct Mem {std::unique_ptr<uint8_t[]> memory{new uint8_t[256]{}};};
 std::string check(int mode){
@@ -27,6 +27,19 @@ std::string check(int mode){
  int32_t id=1,sp=100,cp=120;
  std::memcpy(data.data()+68,&id,4);std::memcpy(mem.memory.get()+68,&id,4);
  std::memcpy(data.data()+96,&sp,4);std::memcpy(mem.memory.get()+96,&cp,4);
+ int32_t sb=128,se=192;
+ std::memcpy(data.data()+72,&sb,4);std::memcpy(mem.memory.get()+72,&sb,4);
+ std::memcpy(data.data()+76,&se,4);std::memcpy(mem.memory.get()+76,&se,4);
+ if(mode==15)threads[0].stack_base=0;
+ if(mode==16)threads[0].stack_size=0;
+ if(mode==17)threads[0].stack_size=-1;
+ if(mode==18)threads[0].stack_base=0xfffffff0u;
+ if(mode==19)kernel.threads[1]->stack.base=132;
+ if(mode==20)kernel.threads[1]->stack_size=32;
+ if(mode==21)data[72]=0;
+ if(mode==22)data[76]=0;
+ if(mode==23)mem.memory[72]=0;
+ if(mode==24)mem.memory[76]=0;
  if(mode==9)data[96]=0;
  if(mode==10)mem.memory[96]=0;
  if(mode==11)data[68]=0;
@@ -48,6 +61,8 @@ std::string check(int mode){
  std::memcpy(mem.memory.get()+100,&saved,4);
  std::memcpy(mem.memory.get()+96,&sp,4);
  assert(verify_tls_affinity());
+ mem.memory[72]=0;assert(!verify_tls_affinity());std::memcpy(mem.memory.get()+72,&sb,4);
+ mem.memory[76]=0;assert(!verify_tls_affinity());std::memcpy(mem.memory.get()+76,&se,4);
  mem.memory[68]=0;assert(!verify_tls_affinity());std::memcpy(mem.memory.get()+68,&id,4);
  mem.memory[96]=0;assert(!verify_tls_affinity());std::memcpy(mem.memory.get()+96,&sp,4);
  current=4;std::memcpy(mem.memory.get()+100,&current,4);
@@ -55,7 +70,7 @@ std::string check(int mode){
  return {};
 }
 int main(){
- for(int m=0;m<15;++m)assert(check(m).empty()==(m==0||m==8));
+ for(int m=0;m<25;++m)assert(check(m).empty()==(m==0||m==8));
  for(int32_t value:{0,1,458752,static_cast<int32_t>(0x80000000u)}){
    std::string bytes(8,0);std::memcpy(bytes.data()+4,&value,4);
    std::istringstream in(bytes);int32_t got=99;
@@ -64,7 +79,7 @@ int main(){
    assert(!read_snapshot_tls_affinity(in,{{100,4,4}},0,got));
    assert(!read_snapshot_tls_affinity(in,{{100,4,4}},0xffffffffULL,got));
  }
- std::cout<<"PASS: 15 TLS metadata production preflight identity/missing-thread/coverage/gap/truncation/metadata rejection, split spans, signed masks and checkpoint mutation detection\n";
+ std::cout<<"PASS: 25 TLS stack/metadata production preflight identity/missing-thread/coverage/gap/truncation/metadata rejection, split spans, signed masks and checkpoint mutation detection\n";
 }
 '''.replace('BLOCK',s[a:b])
 with tempfile.TemporaryDirectory() as d:

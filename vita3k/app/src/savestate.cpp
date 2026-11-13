@@ -162,7 +162,7 @@ namespace app {
 namespace {
 
 constexpr char SAVESTATE_MAGIC[8] = { 'V', '3', 'K', 'S', 'A', 'V', 'E', '1' };
-constexpr uint32_t SAVESTATE_FORMAT_VERSION = 36; // v36: saved kernel TLS base identity
+constexpr uint32_t SAVESTATE_FORMAT_VERSION = 37; // v37: saved thread stack layout
 constexpr uint32_t MAX_IMAGE_SECTION_BYTES = 256U * 1024 * 1024 + 1024;
 
 template <typename T>
@@ -475,6 +475,8 @@ struct ThreadRecord {
     int32_t priority; // Thread priority at Save, not the queued wait registration priority.
     int32_t affinity_mask; // Guest kernel metadata; not a host OS thread binding.
     uint32_t kernel_tls_base;
+    uint32_t stack_base;
+    int32_t stack_size;
     uint64_t start_tick;
     uint64_t last_vblank_waited;
     uint32_t returned_value;
@@ -2005,11 +2007,19 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
         if (it == kernel.threads.end() || !it->second || !record.kernel_tls_base
             || it->second->tls.get() != record.kernel_tls_base)
             return "Thread TLS identity changed; no RAM applied";
+        // Validate layout without constraining SP: a guest may use an alternate
+        // stack. This is address/size identity, not allocation-generation proof.
+        const uint64_t stack_end = uint64_t(record.stack_base) + uint64_t(record.stack_size);
+        if (!record.stack_base || record.stack_size <= 0 || stack_end > UINT32_MAX
+            || it->second->stack.get() != record.stack_base || it->second->stack_size != record.stack_size)
+            return "Thread stack layout changed or invalid; no RAM applied";
         struct TlsField { const char *name; uint32_t index; int32_t saved, current; };
         const TlsField fields[] = {
             {"affinity",TLS_CPU_AFFINITY_MASK,record.affinity_mask,it->second->affinity_mask},
             {"priority",TLS_CURRENT_PRIORITY,record.priority,it->second->priority},
             {"thread ID",TLS_THREAD_ID,record.id,it->second->id},
+            {"stack base",TLS_SP_TOP,static_cast<int32_t>(record.stack_base),static_cast<int32_t>(record.stack_base)},
+            {"stack end",TLS_SP_BOTTOM,static_cast<int32_t>(stack_end),static_cast<int32_t>(stack_end)},
         };
         for (const auto &field : fields) {
             const uint64_t address = uint64_t(record.kernel_tls_base) + field.index * sizeof(int32_t);
@@ -2046,7 +2056,7 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
             if (!verify_tls_affinity()) return false;
             const bool checked = joint ? joint(verify_ram) : verify_ram();
             if (!checked || !verify_tls_affinity()) return false;
-            LOG_INFO("Savestate TLS metadata checkpoint: {} words (affinity/priority/thread ID), saved TLS identity/eligible coverage/metadata MATCH; saved bytes MATCH before/after joint checkpoint; no guest execution",tls_affinity.size());
+            LOG_INFO("Savestate TLS stack checkpoint: {} words (affinity/priority/thread ID/stack bounds), saved TLS identity/eligible coverage/metadata MATCH; saved bytes MATCH before/after joint checkpoint; no guest execution",tls_affinity.size());
             return true;
         },stats);
     if (result == SnapshotRamBatchResult::RollbackFailed) {
@@ -2271,6 +2281,8 @@ SaveStateResult save_state(EmuEnvState &emuenv, const fs::path &path, std::strin
                 waiting_thread_count++;
             rec.ctx = save_context(*thread->cpu);
             rec.tpidruro = read_tpidruro(*thread->cpu);
+            rec.stack_base = thread->stack.get();
+            rec.stack_size = thread->stack_size;
             rec.kernel_tls_base = thread->tls.get();
             rec.affinity_mask = thread->affinity_mask;
             rec.priority = thread->priority;
@@ -2518,7 +2530,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-tls-metadata/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-tls-stack/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
