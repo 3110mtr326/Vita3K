@@ -4,7 +4,30 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Saved semaphore entry memory (latest checkpoint v54, format v38)
+## Saved return instruction completeness (latest checkpoint v55, format v38)
+
+v54 device result: user reports normal; two Loads on2026-11-14 at16:06:32
+and16:07:39 passed115 TLS words and all joint rollbacks.
+
+Before RAM writes, the saved semaphore return instruction is now actually read.
+ARM requires4 bytes. Thumb requires2 bytes unless first-halfword bits[15:11]
+are11101,11110 or11111, in which case all4 bytes must be eligible and readable.
+Adjacent spans are supported. The saved stack tip is also read before mutation.
+This fixes accepting a wide Thumb return with its second halfword excluded.
+Instruction width reference: Arm ARM, Thumb instruction set encoding:
+https://documentation-service.arm.com/static/606dc36485368c4c2b1bf62f?lang=en
+
+This is byte completeness, not opcode validity, executable permissions, or
+proof of a reconstructed host continuation. No saved guest instructions execute;
+full restoration remains disabled. Marker CPU-entry-instruction.
+
+Validation:24 entry helper cases including all3 wide prefixes, missing second
+halfwords, narrow boundary, split wide instruction and truncation;35 TLS
+preflight cases and range assertions;45 production RAM wrapper cases including
+narrow/wide return at a protected boundary (rejection causes zero writes);
+session orchestration and native syntax checks passed. Android/device pending.
+
+## Saved semaphore entry memory (previous checkpoint v54, format v38)
 
 Before RAM mutation, plain untimed ARM semaphore descriptions require eligible
 saved spans for the12-byte SVC/return/NID stub, the4 bytes immediately below SP,

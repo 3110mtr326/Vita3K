@@ -42,6 +42,24 @@ inline bool read_snapshot_tls_affinity(std::istream &in,
     }
     return false;
 }
+// Read a small instruction from eligible saved spans, including halfword splits.
+// The planner has already validated file offsets and sorted spans.
+inline bool read_snapshot_entry_bytes(std::istream &in,
+    const std::vector<SnapshotRamSpan> &spans, uint64_t address,
+    uint8_t *bytes, size_t size) {
+    if (!bytes || !size || size > 4 || !snapshot_ram_covers(spans, address, size)) return false;
+    size_t done = 0;
+    for (const auto &span : spans) {
+        if (span.address + span.size <= address + done) continue;
+        const auto offset = address + done - span.address;
+        const auto count = std::min<uint64_t>(size - done, span.size - offset);
+        in.clear(); in.seekg(span.file_offset + std::streamoff(offset));
+        if (!in.read(reinterpret_cast<char *>(bytes + done), count)) return false;
+        done += size_t(count);
+        if (done == size) return true;
+    }
+    return false;
+}
 // Minimum saved memory needed by a plain ARM semaphore entry candidate.
 // Does not certify executable permissions, the whole alternate stack, or host
 // continuation ownership. The caller keeps execution disabled.
@@ -56,6 +74,17 @@ inline const char *snapshot_entry_memory_error(std::istream &in,
     if (!target || (!(lr & 1u) && target % 4)
         || !snapshot_ram_covers(spans, target, (lr & 1u) ? 2 : 4))
         return "saved semaphore return target not covered";
+    uint8_t instruction[4]{};
+    if (!read_snapshot_entry_bytes(in, spans, target, instruction, (lr & 1u) ? 2 : 4))
+        return "saved semaphore return instruction unreadable";
+    // Thumb first-halfword bits[15:11] 11101/11110/11111 mean 32 bits.
+    const uint16_t first = uint16_t(instruction[0]) | (uint16_t(instruction[1]) << 8);
+    if ((lr & 1u) && (first >> 11) >= 0x1d
+        && !read_snapshot_entry_bytes(in, spans, target, instruction, 4))
+        return "saved semaphore wide Thumb return instruction not covered or unreadable";
+    int32_t stack_word = 0;
+    if (!read_snapshot_tls_affinity(in, spans, uint64_t(sp) - 4, stack_word))
+        return "saved semaphore stack tip unreadable";
     if (!snapshot_ram_covers(spans, uint64_t(pc) - 4, 12))
         return "saved semaphore stub not covered";
     const uint32_t expected[] = {0xef000000u, 0xe1a0f00eu, nid};

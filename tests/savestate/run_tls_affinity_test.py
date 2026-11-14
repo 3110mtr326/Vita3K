@@ -81,7 +81,7 @@ std::string check(int mode){
  return {};
 }
 int main(){
- for(int mode=0;mode<14;++mode){
+ for(int mode=0;mode<24;++mode){
    std::string bytes(512,0);uint32_t stub[]={0xef000000,0xe1a0f00e,0x0C7B834B};
    std::memcpy(bytes.data()+100,stub,12);
    uint32_t pc=104,sp=256,lr=300;
@@ -99,11 +99,19 @@ int main(){
    if(mode==11)bytes[108]=1;
    if(mode==12)bytes.resize(110); // truncated NID
    if(mode==13)ranges={{64,42,64},{106,406,106}}; // adjacent split word
+   if(mode>=14 && mode<=19){
+     lr=301;bytes[300]=0;bytes[301]=char(0xe8+8*((mode-14)/2));
+     if(mode%2==1)ranges={{64,238,64},{304,208,304}};
+   }
+   if(mode==20){lr=301;bytes[301]=char(0xe0);ranges={{64,238,64}};} // narrow branch at end
+   if(mode==21){lr=301;bytes[301]=char(0xf0);ranges={{64,239,64},{303,209,303}};} // split wide
+   if(mode==22)bytes.resize(302); // ARM return truncated
+   if(mode==23){lr=301;bytes[301]=char(0xf8);bytes.resize(302);} // wide tail truncated
    std::istringstream in(bytes);
    const auto err=snapshot_entry_memory_error(in,ranges,pc,sp,lr,0x0C7B834B);
-   assert((*err==0)==(mode==0||mode==5||mode==13));
+   assert((*err==0)==(mode==0||mode==5||mode==13||mode==14||mode==16||mode==18||mode==20||mode==21));
  }
- std::cout<<"PASS: 14 saved entry memory cases (ARM/Thumb returns, alignment, holes, altered instructions, truncation, split spans)\n";
+ std::cout<<"PASS: 24 saved entry memory cases (ARM/Thumb returns, alignment, holes, altered instructions, truncation, split spans)\n";
 
  assert(snapshot_ram_covers({{100,10,0},{110,10,10}},100,20));
  assert(snapshot_ram_covers({{100,20,0}},105,10));

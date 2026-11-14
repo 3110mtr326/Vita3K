@@ -2075,7 +2075,7 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
             if (!verify_tls_affinity()) return false;
             const bool checked = joint ? joint(verify_ram) : verify_ram();
             if (!checked || !verify_tls_affinity()) return false;
-            LOG_INFO("Savestate entry memory checkpoint: {} words (affinity/priority/thread ID/stack bounds), plain untimed ARM semaphore saved entry memory checked; full stacks/TLS covered; saved TLS identity/metadata MATCH; saved bytes MATCH before/after joint checkpoint; no guest execution",tls_affinity.size());
+            LOG_INFO("Savestate entry instruction checkpoint: {} words (affinity/priority/thread ID/stack bounds), plain untimed ARM semaphore saved entry memory checked; full stacks/TLS covered; saved TLS identity/metadata MATCH; saved bytes MATCH before/after joint checkpoint; no guest execution",tls_affinity.size());
             return true;
         },stats);
     if (result == SnapshotRamBatchResult::RollbackFailed) {
@@ -2550,7 +2550,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-entry-memory/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-entry-instruction/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }
