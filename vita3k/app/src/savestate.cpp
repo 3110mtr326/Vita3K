@@ -2003,6 +2003,14 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
     // Validate both copies before any RAM mutation. TLS addresses are saved
     // explicitly: do not infer the kernel TLS base from guest-writable TPIDRURO.
     std::vector<std::pair<uint64_t,int32_t>> tls_affinity;
+    struct EntryBytes { uint64_t address; std::array<uint8_t,4> bytes; size_t size; };
+    std::vector<EntryBytes> entry_bytes;
+    const auto retain_entry_bytes = [&](uint64_t address, size_t size) {
+        EntryBytes item{address, {}, size};
+        if (!read_snapshot_entry_bytes(in, spans, address, item.bytes.data(), size)) return false;
+        entry_bytes.push_back(item);
+        return true;
+    };
     for (const auto &record : threads) {
         const auto it = kernel.threads.find(record.id);
         if (it == kernel.threads.end() || !it->second || !record.kernel_tls_base
@@ -2031,6 +2039,20 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
             const char *error = snapshot_entry_memory_error(in, spans,
                 regs[15], regs[13], regs[14], record.wait_nid);
             if (*error) return std::string(error) + "; no RAM applied";
+            // Pin the exact saved bytes, not only the fact that they were readable.
+            // The enclosing allocation/protection locks cover all later reads.
+            const uint32_t target = regs[14] & ~1u;
+            uint8_t first[4]{};
+            if (!read_snapshot_entry_bytes(in, spans, target, first, 2))
+                return "Saved return instruction unreadable; no RAM applied";
+            const uint16_t halfword = uint16_t(first[0]) | (uint16_t(first[1]) << 8);
+            const size_t width = (regs[14] & 1u) && (halfword >> 11) < 0x1d ? 2 : 4;
+            if (!retain_entry_bytes(uint64_t(regs[15]) - 4, 4)
+                || !retain_entry_bytes(regs[15], 4)
+                || !retain_entry_bytes(uint64_t(regs[15]) + 4, 4)
+                || !retain_entry_bytes(uint64_t(regs[13]) - 4, 4)
+                || !retain_entry_bytes(target, width))
+                return "Saved entry checkpoint unreadable; no RAM applied";
         }
         struct TlsField { const char *name; uint32_t index; int32_t saved, current; };
         const TlsField fields[] = {
@@ -2054,6 +2076,10 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
         }
     }
     const auto verify_tls_affinity = [&] {
+        for (const auto &item : entry_bytes) {
+            if (std::memcmp(mem.memory.get()+item.address, item.bytes.data(), item.size) != 0)
+                return false;
+        }
         for (const auto &[address,expected] : tls_affinity) {
             int32_t observed = 0;
             std::memcpy(&observed,mem.memory.get()+address,sizeof(observed));
@@ -2075,7 +2101,8 @@ static std::string probe_saved_ram(EmuEnvState &emuenv, std::istream &in, const 
             if (!verify_tls_affinity()) return false;
             const bool checked = joint ? joint(verify_ram) : verify_ram();
             if (!checked || !verify_tls_affinity()) return false;
-            LOG_INFO("Savestate entry instruction checkpoint: {} words (affinity/priority/thread ID/stack bounds), plain untimed ARM semaphore saved entry memory checked; full stacks/TLS covered; saved TLS identity/metadata MATCH; saved bytes MATCH before/after joint checkpoint; no guest execution",tls_affinity.size());
+            LOG_INFO("Savestate entry checkpoint: {} words (affinity/priority/thread ID/stack bounds), plain untimed ARM semaphore saved entry memory checked; full stacks/TLS covered; saved TLS identity/metadata MATCH; saved bytes MATCH before/after joint checkpoint; no guest execution",tls_affinity.size());
+            LOG_INFO("Savestate entry byte checkpoint: {} saved ranges MATCH before/after joint checkpoint; stub/stack tip/full return instruction; no saved execution", entry_bytes.size());
             return true;
         },stats);
     if (result == SnapshotRamBatchResult::RollbackFailed) {
@@ -2550,7 +2577,7 @@ static SaveStateResult diagnose_saved_images(EmuEnvState &emuenv,
     const char *stage = image_stage();
     LOG_INFO("Savestate load diagnostic: image validation {}; no saved RAM retained or game rewind committed.", stage);
     if (out_detail) *out_detail = fmt::format(
-        "Joint files/RAM/CPU-entry-instruction/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
+        "Joint files/RAM/CPU-entry-checkpoint/sync/NGS/context/GPU roundtrip checked; saved wait continuation remains unverified; session layout checked; image preparation: {}; context preparation reason {}, capture reason {} (0x{:08X}). Diagnostic only; no saved state retained. Full graphics/audio restoration is not implemented",
         stage, static_cast<int>(contexts.error), static_cast<int>(contexts.capture_error), contexts.offending_address);
     return SaveStateResult::ErrorUnsupportedHostState;
 }

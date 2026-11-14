@@ -55,7 +55,7 @@ auto observed_probe(std::istream &in,const std::vector<SnapshotRamSpan>&spans,Re
 PRODUCTION
 struct Region {uint32_t addr,saved_size;std::streamoff file_offset;};
 int main() {
- for(int mode=0;mode<45;++mode) {
+ for(int mode=0;mode<49;++mode) {
   EmuEnvState e;std::memset(e.mem.memory.get(),'B',65536);
   e.mem.protect_tree[8192]={8192,2};e.mem.external_mapping[1]={16384,4096};
   e.gxm.memory_mapped_regions[24576]={24576,4096};
@@ -108,7 +108,7 @@ int main() {
    if(mode==39)saved_bytes[40000-4096]=1;
    if(mode==40)regs[14]=8192; // protected return target
    if(mode==41)regs[13]=12288; // protected stack tip
-   if(mode>=42){
+   if(mode>=42 && mode<=44){
     regs[14]=8191; // Thumb at8190, next halfword is protected
     saved_bytes[8190-4096]=0;saved_bytes[8191-4096]=char(mode==42?0xe0:0xf0);
     if(mode==44){regs[14]=41001;saved_bytes[41000-4096]=0;saved_bytes[41001-4096]=char(0xf0);}
@@ -116,6 +116,11 @@ int main() {
   }
   std::istringstream file(saved_bytes);
   const auto result=probe_saved_ram(e,file,std::vector<Region>{{4096,61440,0}},records,[&](const auto &verify){
+   if(mode>=45){
+    const uint32_t addresses[]={40000,40008,36860,41002};
+    e.mem.memory[addresses[mode-45]]^=1;
+    return true; // Deliberately skip verify(); outer checkpoint must reject.
+   }
    if(mode==27){e.mem.memory[6009]=0;return true;}
    if(mode==28){e.mem.memory[6013]=0;return true;}
    if(mode==22){e.mem.memory[6032]=1;return true;}
@@ -126,7 +131,7 @@ int main() {
    return verify();
   });
   assert(result.empty()==(mode==0||mode==36||mode==38||mode==42||mode==44));
-  if(mode==0||mode==36||mode==38||mode==42||mode==44||mode==12||mode==13||mode==14||mode==22||mode==23||mode==27||mode==28)assert(writes>0);else assert(writes==0);
+  if(mode==0||mode==36||mode==38||mode==42||mode==44||mode==12||mode==13||mode==14||mode==22||mode==23||mode==27||mode==28||mode>=45)assert(writes>0);else assert(writes==0);
   assert(e.kernel.snapshot_restore_failed==(mode==7||mode==10||mode==12));
   assert(e.renderer->render_abort.load()==(mode==3||mode==10||mode==12));
   assert(std::memcmp(e.mem.memory.get(),before.data(),before.size())==0);
@@ -134,7 +139,7 @@ int main() {
   assert(e.mem.generation_mutex.try_lock());e.mem.generation_mutex.unlock();
   assert(e.mem.protect_mutex.try_lock());e.mem.protect_mutex.unlock();
  }
- std::cout<<"PASS: 45 production RAM adapter cases, TLS exclusion/identity/mismatch preflight (zero writes), nested TLS mutation rollback, protected/external/GPU exclusions, page-table/allocation gates, rollback veto, lock release\n";
+ std::cout<<"PASS: 49 production RAM adapter cases, TLS exclusion/identity/mismatch preflight (zero writes), nested TLS mutation rollback, protected/external/GPU exclusions, page-table/allocation gates, rollback veto, lock release\n";
 }
 '''.replace('PRODUCTION',t[begin:end].replace('probe_snapshot_ram_batch(in,spans,','observed_probe(in,spans,'))
 with tempfile.TemporaryDirectory() as d:

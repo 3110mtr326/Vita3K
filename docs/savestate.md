@@ -4,7 +4,30 @@ The current checkpoint is a diagnostic Android device test. Full FFX game rewind
 is still unsupported. Sections below record historical work; their instructions
 apply only to their own checkpoint, not the current build.
 
-## Saved return instruction completeness (latest checkpoint v55, format v38)
+## Saved entry byte checkpoint (latest checkpoint v56, format v38)
+
+v55 device result2026-11-15: both Loads03:32:14/03:32:46 passed5 untimed
+candidates,0 deferred,115 TLS words and all joint rollbacks. User reports normal.
+
+The RAM wrapper retains exact saved bytes for each plain untimed ARM semaphore
+entry: three stub words, the stack-tip word, and the complete ARM/Thumb return
+instruction. These5 ranges per entry must match staged RAM both before and
+after the joint callback, independently of whether that callback calls its
+whole-RAM verifier. Allocation/protection metadata remains pinned throughout.
+A mutation refuses the probe and rolls back original RAM. No additional guest
+execution or host-wait retirement is enabled. Format remains38.
+
+Marker CPU-entry-checkpoint. Log: Savestate entry byte checkpoint, with range
+count. This is a consistency check only; saved wait continuation and full
+restoration remain unimplemented. Do not interpret success as rewind support.
+
+Validation:24 helper cases,35 TLS preflight cases,49 production RAM adapter
+cases and session orchestration passed. Four new mutation cases deliberately
+return true without invoking the whole-RAM verifier, corrupting SVC,NID,stack
+tip or return instruction; each is rejected and original RAM restored.
+Android build and device validation pending.
+
+## Saved return instruction completeness (previous checkpoint v55, format v38)
 
 v54 device result: user reports normal; two Loads on2026-11-14 at16:06:32
 and16:07:39 passed115 TLS words and all joint rollbacks.
